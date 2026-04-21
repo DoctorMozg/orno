@@ -1,0 +1,146 @@
+# Multi-agent PR review using a parent reviewer that delegates to three
+# read-only lens subagents (security, performance, docs) and synthesizes
+# their findings. Target shape per docs/yaml-spec.md; becomes executable
+# as Phase 6 of docs/roadmap.md lands (MCP + subagents + replay).
+
+version: 1
+
+vars:
+  pr_number: "{{ env.PR_NUMBER }}"
+  repo_root: /workspace
+  base_ref: origin/main
+
+mcp_servers:
+  filesystem:
+    transport: stdio
+    command: ["npx", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+agents:
+  pr_reviewer:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a lead PR reviewer. You do not read code directly — you
+      delegate to specialist lens subagents (security, performance, docs)
+      and synthesize their findings.
+
+      For each lens, call its subagent with a prompt that scopes the review
+      to the files present in the diff. After all three return, produce a
+      single verdict as JSON:
+
+        { "verdict": "approve|request_changes|comment",
+          "findings": [ { "severity": "high|medium|low",
+                          "lens": "security|performance|docs",
+                          "location": "file:line",
+                          "finding": "...", "suggestion": "..." } ] }
+
+      Sort findings by severity. Do not add commentary outside the JSON.
+    allowed_tools:
+      - "subagent.security_lens"
+      - "subagent.performance_lens"
+      - "subagent.docs_lens"
+    policy:
+      max_iterations: 10
+      max_total_tokens: 40000
+      max_tool_calls: 12
+      max_wall_clock: 15m
+      max_subagent_depth: 1
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  security_lens:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a security reviewer. Read the files mentioned in the prompt
+      and look for: injection (SQL, command, XSS), auth bypass, secret
+      exposure in logs/responses, unsafe deserialization, SSRF, IDOR,
+      path traversal, open redirects, weak crypto, rate-limit gaps.
+
+      Return findings as a JSON array of
+        { severity, file, line_range, finding, suggestion }.
+      Return [] if nothing found. No prose outside the array.
+    allowed_tools:
+      - Read
+      - "mcp.filesystem.search_files"
+      - "mcp.filesystem.list_directory"
+    policy:
+      max_iterations: 12
+      max_total_tokens: 30000
+      max_tool_calls: 40
+      max_wall_clock: 10m
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  performance_lens:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a performance reviewer. Read the files mentioned in the
+      prompt and look for: N+1 queries, blocking I/O in async contexts,
+      missing DB indexes on new queries, O(n^2) where O(n) is achievable,
+      unnecessary allocations in hot paths, inefficient serialization.
+
+      Return findings as a JSON array of
+        { severity, file, line_range, finding, suggestion }.
+      Return [] if nothing found. No prose outside the array.
+    allowed_tools:
+      - Read
+      - "mcp.filesystem.search_files"
+    policy:
+      max_iterations: 12
+      max_total_tokens: 30000
+      max_tool_calls: 40
+      max_wall_clock: 10m
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  docs_lens:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a documentation reviewer. Check whether public API changes
+      update docstrings, README entries, and inline comments for non-obvious
+      decisions. Missing docs on newly public items is a finding.
+
+      Return findings as a JSON array of
+        { severity, file, line_range, finding, suggestion }.
+      Return [] if nothing found. No prose outside the array.
+    allowed_tools:
+      - Read
+      - "mcp.filesystem.search_files"
+    policy:
+      max_iterations: 8
+      max_total_tokens: 20000
+      max_tool_calls: 25
+      max_wall_clock: 8m
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+nodes:
+  - id: collect_diff
+    kind: shell
+    command: git
+    args: ["diff", "--unified=3", "{{ vars.base_ref }}...HEAD"]
+
+  - id: review
+    kind: agent
+    agent: pr_reviewer
+    initial_prompt: |
+      Review PR #{{ vars.pr_number }} against {{ vars.base_ref }}.
+
+      Diff:
+      {{ nodes.collect_diff.output }}
+
+      Delegate one call each to security_lens, performance_lens, and
+      docs_lens. Scope each subagent's prompt to the files that appear in
+      the diff above. Collect their JSON arrays and synthesize into the
+      final verdict object defined in your system prompt.
+    needs: [collect_diff]

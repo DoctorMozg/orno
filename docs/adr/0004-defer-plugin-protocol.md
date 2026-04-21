@@ -1,6 +1,6 @@
 # ADR 0004 — Defer the plugin protocol; design the wire format now
 
-- Status: accepted
+- Status: accepted; node-kind set and extension model clarified by ADRs 0008–0009
 - Date: 2026-04-21
 
 ## Context
@@ -37,3 +37,24 @@ inflicts version-skew debugging.
 - If real user demand points at in-process plugins (hot-path tokenizers,
   custom budget enforcers), this ADR is revisited — but in-process plugins
   without a stable Rust ABI are rejected by default.
+
+## Amendments
+
+ADRs 0008 (builtin tool set) and 0009 (single agent node kind) clarify
+the v0.1.0 node-kind set and what "extensibility" means in practice.
+
+- The v0.1.0 node-kind set is now **`agent`, `shell`, `external`**.
+  `llm` has been collapsed into `agent` (ADR 0009). `http`, `parse`,
+  and `assert` are not v0.1.0 node kinds — their former
+  responsibilities live inside agent tooling (`WebFetch`, `Bash`
+  pipelines, agent assertion prompts).
+- `ToolHandler`, `SubagentHandler`, and `McpHandler` (ADRs 0006–0008)
+  are **not plugins**. They live in-process in `orno-core` and
+  implement builtin behavior. Extending tools at v0.1.0 happens by
+  authoring an MCP server (ADR 0007), not by loading a node-kind
+  plugin. The whole-node-plugin deferral in the original decision
+  stands; the extension-via-tool-handler path in ADRs 0006–0008 is
+  not a plugin path.
+- `NodeKind::External` remains a stub and still reserves the
+  subprocess-plugin slot for post-v0.1. The wire format for that
+  slot is unchanged.

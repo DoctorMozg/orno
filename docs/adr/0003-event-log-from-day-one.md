@@ -1,6 +1,6 @@
 # ADR 0003 — Typed event log and four trait seams from day one
 
-- Status: accepted
+- Status: accepted; seam set extended by ADRs 0005–0008
 - Date: 2026-04-21
 
 ## Context
@@ -47,3 +47,29 @@ decisions.
 - The `RecordingTransport<T>` pattern means an integration test can run any
   real provider once, commit the replay NDJSON, and re-run deterministically
   in CI with zero network.
+
+## Amendments
+
+ADRs 0005–0008 extend the seam set and the `Event` enum; none revise
+any of the four original seams.
+
+- **ADR 0005** (strict agentic loops) adds event variants for each
+  strictness violation (`IterationLimitExceeded`,
+  `BudgetExceeded { kind }`, `UnknownToolCalled`,
+  `MutatingCallBlocked`, `NetworkBlocked`, `DomainBlocked`) and the
+  loop-progress events (`LlmRequestStarted`, `LlmResponseReceived`,
+  `ToolCallStarted`, `ToolCallCompleted`, `ToolCallFailed`,
+  `AgentCompleted`).
+- **ADR 0006** (subagent as tool-call) introduces `trait Agent` as
+  a fifth seam and adds `SubagentStarted`, `SubagentCompleted`,
+  `SubagentFailed`, `SubagentDepthExceeded`.
+- **ADR 0007** (MCP via rmcp) introduces `trait McpClient` as a
+  sixth seam and adds the `McpServer*` and `McpToolCall*` variants.
+- **ADR 0008** (builtin tool set) introduces `trait ToolHandler` as
+  a seventh seam. Concrete impls: `BashHandler`, `ReadHandler`,
+  `EditHandler`, `WriteHandler`, `WebFetchHandler`, `McpHandler`,
+  `SubagentHandler`.
+
+Seam count: four → seven. The discipline is unchanged — every
+executor routes through a trait, the event log is the record/replay
+seam, and `#[non_exhaustive]` still governs the on-the-wire enum.

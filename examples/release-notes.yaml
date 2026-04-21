@@ -1,0 +1,120 @@
+# Release-notes generation as a three-node DAG: a shell step collects the
+# commit range, a networked enricher fetches PR metadata via WebFetch (with
+# a tight domain allowlist), and a mutating synthesizer writes CHANGELOG.md.
+# Demonstrates heterogeneous node kinds, upstream output templating, and
+# per-agent policy separation. Target shape per docs/yaml-spec.md; becomes
+# executable as Phase 7 of docs/roadmap.md lands (DAG scheduler + polish).
+
+version: 1
+
+vars:
+  prev_tag: "{{ env.PREV_TAG }}"
+  curr_tag: "{{ env.CURR_TAG }}"
+  repo: "{{ env.GITHUB_REPO }}"
+  output_path: CHANGELOG.md
+
+agents:
+  issue_enricher:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are an issue enricher. You receive a raw git log and produce a
+      structured list of merged PRs.
+
+      Method:
+      1. Extract every PR number from the log (patterns: `#NNNN`, `(#NNNN)`,
+         trailing `Merge pull request #NNNN`).
+      2. For each unique PR number, fetch
+         https://api.github.com/repos/{{ vars.repo }}/pulls/NNNN via WebFetch.
+      3. Emit a single JSON array of
+           { pr_number, title, author, labels, merged_at }.
+
+      Do not categorize or comment. The next stage handles that.
+    allowed_tools:
+      - WebFetch
+    policy:
+      max_iterations: 30
+      max_total_tokens: 80000
+      max_tool_calls: 150
+      max_wall_clock: 20m
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: true
+      allowed_domains:
+        - api.github.com
+      on_parse_error: retry_once
+
+  notes_synthesizer:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a release-notes synthesizer. You receive an enriched PR list
+      and produce a user-facing changelog.
+
+      Format:
+        ## {{ vars.curr_tag }} ({date})
+
+        ### Features
+        - <title> (#NNNN, @author)
+
+        ### Fixes
+        - ...
+
+        ### Breaking changes
+        - ...
+
+        ### Internal
+        - ...
+
+      Categorize by the PR's labels when present (`feat`/`feature` → Features,
+      `fix`/`bug` → Fixes, `breaking` → Breaking changes, else Internal).
+      Preserve author attribution. Use a factual tone. Skip empty sections.
+
+      When the markdown is final, write it to {{ vars.output_path }} using Write.
+    allowed_tools:
+      - Read
+      - Write
+    policy:
+      max_iterations: 6
+      max_total_tokens: 40000
+      max_tool_calls: 10
+      max_wall_clock: 5m
+      max_subagent_depth: 0
+      allow_mutations: true
+      allow_network: false
+      on_parse_error: fail
+
+nodes:
+  - id: collect_commits
+    kind: shell
+    command: git
+    args:
+      - log
+      - "--pretty=format:%h %s"
+      - "--no-merges"
+      - "{{ vars.prev_tag }}..{{ vars.curr_tag }}"
+
+  - id: enrich
+    kind: agent
+    agent: issue_enricher
+    initial_prompt: |
+      Enrich the git log below for repo {{ vars.repo }}, range
+      {{ vars.prev_tag }}..{{ vars.curr_tag }}.
+
+      Git log:
+      {{ nodes.collect_commits.output }}
+
+      Follow the method in your system prompt and return the JSON array.
+    needs: [collect_commits]
+
+  - id: synthesize
+    kind: agent
+    agent: notes_synthesizer
+    initial_prompt: |
+      Version: {{ vars.curr_tag }}
+      Enriched PR list:
+      {{ nodes.enrich.output }}
+
+      Produce the changelog in the format defined in your system prompt
+      and write it to {{ vars.output_path }}.
+    needs: [enrich]

@@ -1,0 +1,98 @@
+# Single-agent flaky-test triager with a broad tool surface: filesystem
+# reads and edits, local test execution via Bash, GitHub search via MCP,
+# and constrained WebFetch for linked references. Demonstrates the full
+# effect model (allow_mutations + allow_network + domain allowlist) on
+# a single agent. Target shape per docs/yaml-spec.md; becomes executable
+# as Phase 6 of docs/roadmap.md lands.
+
+version: 1
+
+vars:
+  test_path: "{{ env.TEST_PATH }}"
+  ci_log_url: "{{ env.CI_LOG_URL }}"
+  repo: "{{ env.GITHUB_REPO }}"
+  max_reruns: 5
+
+mcp_servers:
+  filesystem:
+    transport: stdio
+    command: ["npx", "@modelcontextprotocol/server-filesystem", "/workspace"]
+
+  github:
+    transport: stdio
+    command: ["npx", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "{{ env.GITHUB_TOKEN }}"
+
+agents:
+  triager:
+    model: claude-sonnet-4-5
+    provider: anthropic
+    system: |
+      You are a flaky-test triager. Given a failing test path and a CI log,
+      diagnose the failure and write a triage report.
+
+      Method:
+      1. Read the test file and the code it exercises.
+      2. Run the test locally up to {{ vars.max_reruns }} times via Bash to
+         confirm flakiness. Note pass/fail ratio.
+      3. Search the repo's issue tracker for prior reports of the same test
+         or similar symptoms via mcp.github.search_issues.
+      4. If a stack frame or error message references an external doc, fetch
+         it via WebFetch.
+      5. If adding one or two targeted log lines to the test would narrow
+         the cause, do so via Edit. Keep edits minimal and reversible.
+
+      Produce a triage report as JSON:
+        { "root_cause_category": "race|env|ordering|timing|assertion|other",
+          "confidence": "high|medium|low",
+          "pass_fail_observed": "P/N",
+          "reproduction_steps": [ ... ],
+          "prior_issues": [ { "url": ..., "relevance": ... } ],
+          "suggested_fix": "..." }
+
+      When the JSON is final, save it to
+      reports/triage-{{ vars.test_path | replace('/', '_') }}.json using Write.
+    allowed_tools:
+      - Read
+      - Edit
+      - Write
+      - Bash
+      - WebFetch
+      - "mcp.filesystem.*"
+      - "mcp.github.search_issues"
+      - "mcp.github.get_issue"
+    policy:
+      max_iterations: 25
+      max_total_tokens: 90000
+      max_tool_calls: 80
+      max_wall_clock: 30m
+      max_subagent_depth: 0
+      allow_mutations: true
+      allow_network: true
+      allowed_domains:
+        - api.github.com
+        - raw.githubusercontent.com
+        - docs.python.org
+        - doc.rust-lang.org
+      blocked_domains: []
+      on_parse_error: retry_once
+
+nodes:
+  - id: fetch_ci_log
+    kind: shell
+    command: curl
+    args: ["-sSL", "--fail", "{{ vars.ci_log_url }}"]
+
+  - id: triage
+    kind: agent
+    agent: triager
+    initial_prompt: |
+      Triage the flaky test `{{ vars.test_path }}` in repo `{{ vars.repo }}`.
+
+      CI log (truncated to the failing run):
+      {{ nodes.fetch_ci_log.output }}
+
+      Follow the method in your system prompt and save the triage JSON to
+      the reports directory.
+    needs: [fetch_ci_log]
