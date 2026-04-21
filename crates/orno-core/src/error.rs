@@ -38,6 +38,9 @@ pub enum PipelineError {
         #[source]
         source: minijinja::Error,
     },
+
+    #[error("pipeline graph is invalid: {reason}")]
+    InvalidGraph { reason: String },
 }
 
 #[derive(Debug, Error)]

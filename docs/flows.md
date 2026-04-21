@@ -1,9 +1,11 @@
 # Flows
 
 Mermaid diagrams describing what's wired today in `crates/orno-core/src/**` and
-`crates/orno-cli/src/**`. This is a snapshot of the skeleton — seams are in
-place, but most execution paths are deliberate stubs. ADR targets live in
-`docs/arch.md` and the ADRs; this document only describes what the code does.
+`crates/orno-cli/src/**`. This is a snapshot of what the live code does.
+Seams are in place and the execution path (Engine → walker → NodeRegistry →
+NodeExecutor) is wired end-to-end for `shell` nodes; the agent loop is still
+a stub pending LLM transport work. ADR targets live in `docs/arch.md` and the
+ADRs; this document only describes what the code does.
 
 Every diagram below points at specific file paths. When code moves, update
 the diagram in the same commit.
@@ -51,7 +53,8 @@ graph TD
     pipe_load["pipeline::load"]
     pipe_tpl["pipeline::template"]
     exec[execution]
-    exec_dag["execution::dag"]
+    exec_walker["execution::walker"]
+    exec_context["execution::context"]
     exec_sched["execution::scheduler"]
     telemetry[telemetry]
 
@@ -85,19 +88,24 @@ graph TD
     pipe_load --> error
     pipe_tpl --> error
 
-    exec --> exec_dag
+    exec --> exec_walker
+    exec --> exec_context
     exec --> exec_sched
-    exec_dag --> pipeline
-    exec_dag --> error
+    exec_walker --> pipeline
+    exec_walker --> events
+    exec_walker --> error
     exec_sched --> events
     exec_sched --> pipeline
     exec_sched --> error
-    exec_sched --> exec_dag
+    exec_sched --> exec_walker
+    exec_sched --> exec_context
+    exec_sched --> node
+    exec_sched --> node_reg
 ```
 
-Note the gap: `exec_sched` does **not** depend on `node` or `node::registry`
-yet. Node kinds and their executors are unreachable from the live
-scheduler — they exist as pre-built seams.
+`exec_sched` drives the walker and resolves each ready node through
+`NodeRegistry`, then merges per-node `Context` snapshots before template
+rendering.
 
 ## CLI command dispatch
 
@@ -166,46 +174,64 @@ flowchart TD
 
 `commands::run::run` composes the pieces. The `Engine` records lifecycle
 events into an `InMemorySink`; after the engine returns, the CLI drains
-the sink and prints each envelope as NDJSON. Node execution itself is not
-wired — the scheduler emits synthetic `NodeStarted`/`NodeFinished{ok:true}`
-for every node in source order (`execution/scheduler.rs:42-66`).
+the sink and prints each envelope as NDJSON. `Engine::run` drives a
+`DagWalker`: `next_ready` hands out nodes whose `needs:` have completed,
+each is rendered against its per-node `Context` and dispatched through
+`NodeRegistry::get(kind_str).execute(id, req)`, the result feeds back via
+`walker.complete(id, ok)`, and on failure the walker returns the
+transitively-dependent node ids to emit as `NodeSkipped` (see ADR 0021).
 
 ```mermaid
 sequenceDiagram
     actor User
     participant CLI as orno-cli commands run
     participant Load as pipeline load
+    participant Reg as NodeRegistry
+    participant Tpl as TemplateEngine
     participant Sink as InMemorySink
     participant Eng as Engine
-    participant Plan as dag plan
+    participant Walker as DagWalker
+    participant Exec as NodeExecutor
 
     User->>CLI: orno run hello.yaml
     CLI->>Load: load_from_path(path)
     Load-->>CLI: Pipeline
+    CLI->>Reg: register shell + agent
+    CLI->>Tpl: TemplateEngine::new
     CLI->>Sink: Arc new InMemorySink
-    CLI->>Eng: Engine new (sink clone)
+    CLI->>Eng: Engine::new(sink, registry, templates)
     CLI->>Eng: run(run_id, pipeline)
     Eng->>Sink: record RunStarted
-    Eng->>Plan: plan(pipeline)
-    Plan-->>Eng: Vec of node_id (source order)
-    loop for each node_id
+    Eng->>Walker: DagWalker::new(pipeline)
+    loop while next_ready
+        Walker-->>Eng: Some(&Node)
+        Eng->>Tpl: render_request with per-node Context
+        Tpl-->>Eng: NodeRequest
         Eng->>Sink: record NodeStarted
-        Note right of Eng: Skeleton — no executor dispatch yet
-        Eng->>Sink: record NodeFinished ok=true
+        Eng->>Reg: get(kind_str)
+        Reg-->>Eng: Arc NodeExecutor
+        Eng->>Exec: execute(id, req)
+        Exec-->>Eng: NodeResponse or NodeError
+        Eng->>Sink: record NodeFinished(ok)
+        Eng->>Walker: complete(id, ok)
+        Walker-->>Eng: Vec of skipped (id, reason)
+        loop for each skipped
+            Eng->>Sink: record NodeSkipped
+        end
     end
-    Eng->>Sink: record RunFinished ok=true
+    Eng->>Sink: record RunFinished(ok)
     Eng-->>CLI: Ok
     CLI->>Sink: snapshot
     Sink-->>CLI: Vec of EventEnvelope
     loop for each envelope
-        CLI->>User: println JSON to stdout (NDJSON)
+        CLI->>User: println JSON (NDJSON)
     end
 ```
 
-What is **not** wired yet (reflected in the diagram's `Note`): the scheduler
-never calls `NodeRegistry::get`, `NodeExecutor::execute`, or any
-`LlmTransport`. Budget enforcement, MCP, subagents, and the agent loop are
-all absent from this path.
+What remains stubbed: the `AgentExecutor` still returns `NotImplemented`;
+`LlmTransport`, budget enforcement, MCP, and subagents are absent from the
+path. Shell nodes dispatch through the real `ShellExecutor`; agent nodes
+compile and dispatch but fail at execute time until Phase 4 lands.
 
 ## Seams and implementors
 
@@ -258,19 +284,23 @@ classDiagram
 
     class Engine {
         -sink
+        -registry
+        -templates
+        +new(sink, registry, templates)
         +run(run_id, pipeline)
     }
     Engine ..> EventSink
+    Engine ..> NodeRegistry
 ```
 
 Concrete implementor locations:
 
 - `DummyTransport` — `crates/orno-core/src/llm/dummy.rs:11`
 - `AgentExecutor` — `crates/orno-core/src/node/agent.rs:11` (stateless stub; the real loop composes `LlmTransport` + tool handlers per ADRs 0005, 0008)
-- `ShellExecutor` — `crates/orno-core/src/node/shell.rs:11`
+- `ShellExecutor` — `crates/orno-core/src/node/shell.rs:16` (real `tokio::process::Command` dispatch; ADR 0013 effects-declaration deferred)
 - `InMemorySink` — `crates/orno-core/src/events/in_memory_sink.rs:13`
 - `NoopEnforcer` — `crates/orno-core/src/budget/mod.rs:22` (no-op; stays alongside the trait per the Rust-idioms rule in `CLAUDE.md`)
-- `Engine` — `crates/orno-core/src/execution/scheduler.rs:11`
+- `Engine` — `crates/orno-core/src/execution/scheduler.rs:24`
 
 Seams that ADRs 0005–0008 call for but are **not yet in the code**: `Agent`,
 `ToolHandler`, `McpClient`. Do not add these without a working consumer.
@@ -364,7 +394,6 @@ classDiagram
         max_iterations u32
         max_total_tokens u64
         max_tool_calls u32
-        max_wall_clock String
         max_subagent_depth u32
         allow_mutations bool
         allow_network bool
@@ -406,12 +435,16 @@ internal-tag pattern on `transport:` for `stdio` vs `http`.
 
 `crates/orno-core/src/events/mod.rs`. `schema_version` on the envelope and
 `#[non_exhaustive]` on `Event` are the forward-compatibility hinges.
+`timestamp` is a human-readable RFC 3339 UTC correlator (ADR 0018) that
+lets stdout event lines and stderr tracing lines be joined on wall
+clock without a decoder.
 
 ```mermaid
 classDiagram
     class EventEnvelope {
         schema_version u32
         seq u64
+        timestamp OffsetDateTime
         event Event
     }
     class Event {
@@ -429,6 +462,15 @@ classDiagram
         node_id String
         ok bool
     }
+    class NodeSkipped {
+        run_id String
+        node_id String
+        reason SkipReason
+    }
+    class SkipReason {
+        <<enum>>
+        DependencyFailed(upstream)
+    }
     class BudgetExceeded {
         run_id String
         reason String
@@ -441,26 +483,33 @@ classDiagram
     Event <|-- RunStarted
     Event <|-- NodeStarted
     Event <|-- NodeFinished
+    Event <|-- NodeSkipped
     Event <|-- BudgetExceeded
     Event <|-- RunFinished
+    NodeSkipped --> SkipReason
 ```
 
 `Event` is serialized with `#[serde(tag = "type", rename_all =
-"snake_case")]` (`events/mod.rs:22`), so lifecycle events on the wire
+"snake_case")]` (`events/mod.rs:50`), so lifecycle events on the wire
 carry `"type": "run_started" | "node_started" | ...`. `CURRENT_SCHEMA_VERSION
-= 1` is the value written into every envelope today.
+= 1` is the value written into every envelope today. `timestamp` is
+serialized via `time::serde::rfc3339` — wire form is a JSON string like
+`"2026-04-21T18:31:54.387860Z"`. `EventEnvelope::new(seq, event)` is
+the single construction site; no scheduler path builds an envelope by
+hand.
 
 Emission today: the engine emits `RunStarted`, `NodeStarted`/`NodeFinished`
-pairs, and `RunFinished`. `BudgetExceeded` has no emitter yet — it exists
-for the budget seam to wire into.
+pairs, and `RunFinished`. `NodeSkipped` is emitted for every transitively-
+dependent node of a failed node; `upstream` names the originating failure,
+not the direct parent (ADR 0021). `BudgetExceeded` has no emitter yet — it
+exists for the budget seam to wire into.
 
-## NodeExecutor dispatch (designed but not wired)
+## NodeExecutor dispatch — live path
 
-`AgentExecutor::execute` (`node/agent.rs:15`) and `ShellExecutor::execute`
-(`node/shell.rs:14`) are both `NotImplemented` stubs today. `NodeRegistry`
-(`node/registry.rs`) already keys executors by kind. None of them are
-called from `Engine::run`. This is the shape the dispatch will take once
-the scheduler is wired:
+`Engine::run` calls `NodeRegistry::get(kind_str).execute(id, req)` for each
+ready node (`execution/scheduler.rs`). `ShellExecutor::execute` runs a
+subprocess via `tokio::process::Command`; `AgentExecutor::execute` still
+returns `NotImplemented` pending the Phase 4 agent loop.
 
 ```mermaid
 sequenceDiagram
@@ -475,7 +524,7 @@ sequenceDiagram
     Reg-->>Eng: Some executor
     Eng->>Ex: execute(id, NodeRequest)
     alt NodeRequest Agent
-        Note over Ex: AgentExecutor owns the ADR 0005 loop
+        Note over Ex: AgentExecutor returns NotImplemented today; the ADR 0005 loop lands in Phase 4
         Ex->>Tx: complete(LlmRequest) per iteration
         Tx-->>Ex: LlmResponse
         Ex-->>Eng: NodeResponse (final assistant msg, usage)
@@ -486,21 +535,20 @@ sequenceDiagram
     Eng->>Sink: record NodeFinished
 ```
 
-Mapping gap to close when wiring: `pipeline::schema::NodeKind` (YAML-side)
-and `node::NodeRequest` (executor-side) are parallel enums today with no
-conversion between them. The scheduler will need a translator — either a
-`From<&Node> for NodeRequest` impl or an explicit builder — before the
-dispatch above can run. For `kind: agent`, the translator also has to
-resolve `AgentNode.agent` against `Pipeline.agents` to materialize the
-`AgentConfig` + policy the loop needs.
+Kind translation lives in `node::mod.rs` (`from_kind`, `kind_str`,
+`render_request`); the scheduler delegates to those helpers without
+matching on `NodeKind` itself.
 
 ## Template rendering
 
 `pipeline::template::TemplateEngine` (`pipeline/template.rs`) wraps
-MiniJinja with `auto_escape` forced to `None`. It is constructed nowhere
-in the live call path yet; it exists for the agent loop to render
-`prompt:` and other user-supplied templates with pipeline `vars` as
-context.
+MiniJinja with `auto_escape` forced to `None`. The CLI constructs it in
+`commands::run::run` and passes it to `Engine::new`; the scheduler
+renders each node's `NodeRequest` through `node::render_request` against
+the per-node `Context` snapshot before dispatching. `vars`, `env`, and
+`nodes.<id>.output` are the in-scope namespaces (yaml-spec.md). Agent
+`prompt:` templates will consume the same engine once the Phase 4 agent
+loop lands.
 
 ```mermaid
 flowchart LR

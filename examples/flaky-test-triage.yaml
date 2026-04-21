@@ -13,6 +13,14 @@ vars:
   repo: "{{ env.GITHUB_REPO }}"
   max_reruns: 5
 
+pass_env:
+  - TEST_PATH
+  - CI_LOG_URL
+  - GITHUB_REPO
+
+secrets:
+  - GITHUB_TOKEN
+
 mcp_servers:
   filesystem:
     transport: stdio
@@ -22,7 +30,7 @@ mcp_servers:
     transport: stdio
     command: ["npx", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_TOKEN: "{{ env.GITHUB_TOKEN }}"
+      GITHUB_TOKEN: "{{ secrets.GITHUB_TOKEN }}"
 
 agents:
   triager:
@@ -66,7 +74,6 @@ agents:
       max_iterations: 25
       max_total_tokens: 90000
       max_tool_calls: 80
-      max_wall_clock: 30m
       max_subagent_depth: 0
       allow_mutations: true
       allow_network: true

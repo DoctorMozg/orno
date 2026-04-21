@@ -46,3 +46,76 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeMap;
+
+    use crate::pipeline::schema::{Node, NodeKind, Pipeline, ShellNode};
+
+    fn shell_node(id: &str, needs: &[&str]) -> Node {
+        Node {
+            id: id.to_string(),
+            kind: NodeKind::Shell(ShellNode {
+                command: "true".to_string(),
+                args: Vec::new(),
+            }),
+            needs: needs.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    fn pipeline(nodes: Vec<Node>) -> Pipeline {
+        Pipeline {
+            version: 1,
+            vars: BTreeMap::new(),
+            pass_env: Vec::new(),
+            secrets: Vec::new(),
+            agents: BTreeMap::new(),
+            mcp_servers: BTreeMap::new(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn empty_pipeline_is_rejected() {
+        let Err(PipelineError::Validation(msg)) = validate(&pipeline(Vec::new())) else {
+            panic!("expected Validation error on empty pipeline");
+        };
+        assert!(
+            msg.contains("no nodes"),
+            "error message should explain the empty case: {msg}",
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let p = pipeline(vec![shell_node("a", &[]), shell_node("a", &[])]);
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error on duplicate ids");
+        };
+        assert!(
+            msg.contains("duplicate") && msg.contains('a'),
+            "error message should name the duplicate id: {msg}",
+        );
+    }
+
+    #[test]
+    fn unknown_needs_is_rejected() {
+        let p = pipeline(vec![shell_node("b", &["nowhere"])]);
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error on unknown dep");
+        };
+        assert!(
+            msg.contains("nowhere"),
+            "error message should name the missing dep: {msg}",
+        );
+    }
+
+    #[test]
+    fn well_formed_pipeline_is_accepted() {
+        let p = pipeline(vec![shell_node("a", &[]), shell_node("b", &["a"])]);
+        assert!(validate(&p).is_ok(), "valid pipeline should pass");
+    }
+}

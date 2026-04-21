@@ -52,7 +52,7 @@ Seven traits constrain the architecture. Every executor path routes through one 
 1. **`LlmTransport`** (`orno-core/src/llm/mod.rs`) — every LLM call. Concrete impl wraps `genai` (ADR 0002); record/replay lands as a decorator. Do NOT expose `genai` types on orno's public surface.
 2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds (ADR 0017 §3 supersedes the earlier `NodeKind::External` stub from ADR 0004).
 3. **`EventSink`** (`orno-core/src/events/sink.rs`) — every lifecycle event. `InMemorySink` today; feature-gated `SqliteSink` plugs in without scheduler changes.
-4. **`EventEnvelope { schema_version, seq, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format.
+4. **`EventEnvelope { schema_version, seq, timestamp, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format. `timestamp` is RFC 3339 UTC (ADR 0018); `seq` stays the strict-ordering key for replay. `Event::NodeSkipped` is part of the wire format; its `reason` field is a `#[non_exhaustive]` `SkipReason` enum (ADR 0021).
 
 **Planned by ADRs 0005–0008, not yet implemented:**
 
@@ -67,7 +67,7 @@ Every `agent` node enforces these at runtime (ADR 0005). They are user-facing gu
 1. **Bounded iteration** — `max_iterations` mandatory; overrun → `IterationLimitExceeded` → terminate.
 2. **Bounded tool surface** — only explicitly-listed builtins + MCP tools are callable. Unknown tool → `UnknownToolCalled` → terminate.
 3. **Bounded effects** — `allow_mutations` + `allow_network` booleans plus `allowed_domains` / `blocked_domains`. Each tool has a declared effect class (ADR 0008 table).
-4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`, `max_wall_clock`. Breach → `BudgetExceeded { kind }` → terminate.
+4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`. Breach → `BudgetExceeded { kind }` → terminate. Wall-clock is handled separately by the universal node-level `timeout:` attribute (ADR 0017) which emits `NodeTimedOut` and applies to every kind, not only agents.
 5. **Bounded non-determinism** — every LLM request and tool call recorded; replay reproduces bit-for-bit.
 
 Parallel tool calls are executed **serially** in declaration order. Parallelism is a DAG-level concern, not an agent-internal one.
@@ -89,12 +89,14 @@ Two distinct serde tag conventions are intentional:
 
 Both are `#[non_exhaustive]`. v0.1.0 node kinds are `agent` and `shell` (ADR 0009 collapsed `llm` into `agent`; ADR 0017 §1 removed the former `external` variant entirely — it returns post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind). `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
 
+Execution model: `Engine::run` drives a generator-style `DagWalker` (`execution::walker`) over the pipeline's DAG, dispatches each ready node through `NodeRegistry::get(kind_str).execute(id, req)` against a per-node `Context` (`execution::context`), and on node failure emits `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` for every transitively-dependent node (ADR 0021). Disjoint branches keep running.
+
 Stream separation in `orno run`:
 
 - **stdout**: `EventEnvelope` NDJSON (consumed by downstream tools).
 - **stderr**: `tracing` JSON logs (consumed by log pipelines).
 
-Do not cross the streams. `init_tracing` in `orno-cli/src/main.rs` enforces the split.
+Do not cross the streams. `init_tracing` in `orno-cli/src/main.rs` enforces the split. Both streams use the same RFC 3339 UTC timestamp format so a run's stdout and stderr are trivially joinable on wall clock (ADR 0018).
 
 ## Dependency discipline
 
@@ -147,7 +149,7 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 ## Testing patterns
 
 - **CLI integration tests use `assert_cmd` + `predicates`.** They live in `crates/orno-cli/tests/` and invoke `orno` as a subprocess. `tests/cli.rs` is the template — copy its pattern rather than starting a parallel one.
-- **Event-stream assertions use `insta` YAML snapshots.** Snapshots contain `run-<nanos>` ids and wall-clock timestamps; redact with `insta::with_settings! { filters => vec![(regex, replacement)] }` alongside the test. Keep redactions next to the test, not in a shared helper — it makes the snapshot self-describing.
+- **Event-stream assertions use `insta` YAML snapshots.** Snapshots contain `run_<ULID>` ids (ADR 0019) and RFC 3339 timestamps (ADR 0018); redact with `insta::with_settings! { filters => vec![(regex, replacement)] }` alongside the test. The run_id redaction regex is `run_[0-9A-HJKMNP-TV-Z]{26}`; the timestamp regex matches the RFC 3339 form. Snapshots now also contain `node_skipped` envelopes (ADR 0021); `reason.upstream` is the originating failure, not the direct parent. Keep redactions next to the test, not in a shared helper — it makes the snapshot self-describing.
 - **Parametric tests use `rstest`.** Each strictness dimension (iteration limit, unknown tool, mutation denied, network denied, budget exceeded) lands as an `#[rstest]` + `#[case]` table. Async cases combine `#[rstest]` with `#[tokio::test]` and mark fixture args with `#[future]`.
 - **Hand-rolled fakes, not `mockall`.** The seam count is small enough that a fake struct in a `mod tests` block is clearer than derived mocks. `mockall` adds proc-macro latency and obscures intent.
 - **One test per terminal `AgentError` variant.** Every strictness dimension must have at least one test that asserts termination with the exact expected variant. The loop's contract is "bounded" — only a test that checks the bound actually proves it.
@@ -165,6 +167,10 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 - `docs/adr/0008-builtin-tool-set.md` — `Bash`/`Read`/`Edit`/`Write`/`WebFetch` + MCP; WebSearch deferred.
 - `docs/adr/0009-single-agent-node-kind.md` — collapse `llm` into `agent`.
 - `docs/adr/0017-node-attributes-over-new-kinds.md` — v0.1 `NodeKind` = `Agent, Shell` (no `External`); universal `retry:` / `timeout:` attributes; shell output splits to `.stdout` / `.stderr` / `.exit_code`.
+- `docs/adr/0018-event-envelope-timestamp.md` — RFC 3339 UTC `timestamp` field on `EventEnvelope`; matching stderr tracing timer so both streams join on wall clock.
+- `docs/adr/0019-run-id-ulid.md` — run identifiers are `run_<ULID>`; generator lives in `orno-core::execution::new_run_id`.
+- `docs/adr/0020-env-and-secrets-namespaces.md` — two template namespaces (`env.*` opt-in inputs, `secrets.*` redacted credentials) with distinct precedence rules; CLI adds `-e`, `--env-file`, `--secrets-file`.
+- `docs/adr/0021-dag-execution-model.md` — generator-style `DagWalker` with Kahn cycle detection; per-node `Context` with vars/env/nodes namespaces; transitive skip cascade via `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` naming the originator; Engine drives walker + `NodeRegistry` serially.
 
 Never revise an accepted ADR. Add an `## Amendments` section pointing to a newer ADR, or supersede with a new ADR. Historical decisions must remain readable.
 

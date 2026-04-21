@@ -50,8 +50,8 @@ decisions.
 
 ## Amendments
 
-ADRs 0005–0008 extend the seam set and the `Event` enum; none revise
-any of the four original seams.
+ADRs 0005–0008 extend the seam set and the `Event` enum; ADR 0018
+extends the envelope shape. None revise any of the four original seams.
 
 - **ADR 0005** (strict agentic loops) adds event variants for each
   strictness violation (`IterationLimitExceeded`,
@@ -69,6 +69,12 @@ any of the four original seams.
   a seventh seam. Concrete impls: `BashHandler`, `ReadHandler`,
   `EditHandler`, `WriteHandler`, `WebFetchHandler`, `McpHandler`,
   `SubagentHandler`.
+- **ADR 0018** (event envelope timestamp) adds a required RFC 3339
+  `timestamp: OffsetDateTime` field to `EventEnvelope`, alongside
+  `schema_version` and `seq`. `seq` remains the determinism-load-bearing
+  ordering key; `timestamp` is a human-readable correlator that makes
+  the stdout event stream and stderr tracing stream joinable on wall
+  clock.
 
 Seam count: four → seven. The discipline is unchanged — every
 executor routes through a trait, the event log is the record/replay

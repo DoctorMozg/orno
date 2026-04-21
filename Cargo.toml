@@ -31,6 +31,7 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
     "signal",
+    "process",
 ] }
 
 # CLI
@@ -51,7 +52,24 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "json",
     "std",
+    "time",
 ] }
+
+# Time — RFC 3339 timestamps on the event envelope and stderr tracing stream.
+# Pinned with minimal features; `serde-well-known` is what unlocks
+# `time::serde::rfc3339`.
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "formatting",
+    "parsing",
+    "serde",
+    "serde-well-known",
+] }
+
+# ULID — sortable, opaque run identifiers. 128-bit, Crockford base32,
+# first 48 bits are ms since epoch so ids are lexicographically
+# time-ordered. Default features are already minimal.
+ulid = "1"
 
 # Testing
 assert_cmd = "2"

@@ -25,6 +25,22 @@
         "$ref": "#/$defs/Node"
       }
     },
+    "pass_env": {
+      "description": "Names pulled from the process environment into the `env.*`\ntemplate namespace at run start (ADR 0020). Opt-in only — the\nprocess environment is not auto-inherited. Names not present via\n`pass_env`, `-e`, or `--env-file` are a template-render error.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "secrets": {
+      "description": "User-declared credential names, routed into the redacted\n`secrets.*` template namespace (ADR 0020). Provider-known names\n(e.g. `OPENROUTER_API_KEY`) are auto-pulled by the transport and\ndo not need to appear here; this list is for additional secrets\nsuch as MCP server tokens.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "vars": {
       "type": "object",
       "additionalProperties": true,
@@ -55,7 +71,7 @@
           }
         },
         "model": {
-          "description": "Provider-side model identifier. For OpenRouter this is the\nslash-prefixed route (`openai/gpt-5`); for direct-vendor\nproviders this is the vendor's own model name.",
+          "description": "Provider-side model identifier. For `OpenRouter` this is the\nslash-prefixed route (`openai/gpt-5`); for direct-vendor\nproviders this is the vendor's own model name.",
           "type": "string"
         },
         "policy": {
@@ -99,7 +115,7 @@
       ]
     },
     "AgentPolicy": {
-      "description": "Agent-loop strictness knobs (ADR 0005). Every field is required;\ndefaults belong in docs and examples, not silently in code.",
+      "description": "Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017). Every\nfield is required; defaults belong in docs and examples, not silently\nin code. Wall-clock is **not** here — ADR 0017 promotes it to a\nuniversal node-level `timeout:` attribute applicable to every\n`NodeKind`; the attribute is not yet modeled on `Node` and lands with\nthe Phase 4–5 executor work.",
       "type": "object",
       "properties": {
         "allow_mutations": {
@@ -142,10 +158,6 @@
           "format": "uint64",
           "minimum": 0
         },
-        "max_wall_clock": {
-          "description": "Wall-clock budget for the agent loop, expressed as a humantime\nduration string (`30s`, `5m`, `1h`). Parsed by the loop\nimplementation, not by serde.",
-          "type": "string"
-        },
         "on_parse_error": {
           "$ref": "#/$defs/OnParseError"
         }
@@ -154,7 +166,6 @@
         "max_iterations",
         "max_total_tokens",
         "max_tool_calls",
-        "max_wall_clock",
         "max_subagent_depth",
         "allow_mutations",
         "allow_network",

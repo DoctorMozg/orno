@@ -1,28 +1,59 @@
-//! `orno run <pipeline.yaml>` — skeleton dispatcher.
+//! `orno run <pipeline.yaml>` — load, resolve env/secrets, dispatch, stream.
 //!
-//! Loads the pipeline, builds an `Engine` over an `InMemorySink`, and
-//! prints every recorded `EventEnvelope` to stdout as NDJSON. Node
-//! execution itself is a no-op until the scheduler is wired to
-//! executors in a later phase.
+//! Assembles a `NodeRegistry` over `ShellExecutor` (real) and
+//! `AgentExecutor` (stub), threads them plus a `TemplateEngine`
+//! into `Engine::run`, and prints every recorded envelope as
+//! NDJSON on stdout.
+//!
+//! Env and secrets resolution lives in this module (ADR 0020):
+//! process env, `--env-file`, `--secrets-file`, and `-e` flags
+//! combine into the two disjoint namespaces the engine sees.
+//! Classification follows the pipeline's `secrets:` declaration,
+//! never the source file — a secret name in `--env-file` is still
+//! routed to `secrets.*`.
 
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use orno_core::events::InMemorySink;
-use orno_core::execution::Engine;
+use orno_core::execution::{Engine, RunInputs, new_run_id};
+use orno_core::node::NodeRegistry;
+use orno_core::node::agent::AgentExecutor;
+use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
+use orno_core::pipeline::Pipeline;
+use orno_core::pipeline::template::TemplateEngine;
 
-pub async fn run(path: &Path) -> Result<()> {
+/// Parsed CLI flags consumed by the env/secrets resolver.
+#[derive(Debug, Default)]
+pub struct RunFlags {
+    pub inline_env: Vec<String>,
+    pub env_files: Vec<PathBuf>,
+    pub secrets_files: Vec<PathBuf>,
+}
+
+pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     let pipeline = pipeline::load::load_from_path(path)
         .with_context(|| format!("loading pipeline `{}`", path.display()))?;
 
+    let inputs = resolve_inputs(&pipeline, &flags)?;
+
     let sink = Arc::new(InMemorySink::new());
-    let engine = Engine::new(sink.clone());
+
+    let mut registry = NodeRegistry::new();
+    registry.register("shell", Arc::new(ShellExecutor));
+    registry.register("agent", Arc::new(AgentExecutor));
+    let registry = Arc::new(registry);
+
+    let templates = Arc::new(TemplateEngine::new());
+
+    let engine = Engine::new(sink.clone(), registry, templates);
     let run_id = new_run_id();
 
-    engine.run(&run_id, &pipeline).await?;
+    engine.run(&run_id, &pipeline, inputs).await?;
 
     for envelope in sink.snapshot() {
         let line = serde_json::to_string(&envelope)?;
@@ -31,12 +62,101 @@ pub async fn run(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Minimal unique id for a run. Real impl will switch to ULID once the
-/// scheduler needs durable ordering guarantees.
-fn new_run_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("run-{nanos}")
+/// Resolve `env` and `secrets` per ADR 0020 precedence.
+///
+/// - `env.*`: `pass_env:` (process env) < `--env-file` (later files
+///   shadow earlier) < `-e KEY=VAL` (last flag wins).
+/// - `secrets.*`: process env for names in `secrets:` <
+///   `--secrets-file` (later files shadow earlier).
+///
+/// Classification is by name. A binding whose key is declared in the
+/// pipeline's `secrets:` block always lands in `secrets.*`, even when
+/// it arrives via an env file. A secret on `-e` is refused outright —
+/// `argv` leaks into `HISTFILE` and `ps`.
+fn resolve_inputs(pipeline: &Pipeline, flags: &RunFlags) -> Result<RunInputs> {
+    let declared_secrets: HashSet<&str> = pipeline.secrets.iter().map(String::as_str).collect();
+
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let mut secrets: BTreeMap<String, String> = BTreeMap::new();
+
+    for name in &pipeline.pass_env {
+        if let Ok(val) = std::env::var(name) {
+            env.insert(name.clone(), val);
+        }
+    }
+
+    for name in &pipeline.secrets {
+        if let Ok(val) = std::env::var(name) {
+            secrets.insert(name.clone(), val);
+        }
+    }
+
+    for file in &flags.env_files {
+        for (k, v) in parse_dotenv(file)? {
+            if declared_secrets.contains(k.as_str()) {
+                secrets.insert(k, v);
+            } else {
+                env.insert(k, v);
+            }
+        }
+    }
+
+    for file in &flags.secrets_files {
+        for (k, v) in parse_dotenv(file)? {
+            secrets.insert(k, v);
+        }
+    }
+
+    for item in &flags.inline_env {
+        let (k, v) = parse_inline_env(item)?;
+        if declared_secrets.contains(k.as_str()) {
+            bail!(
+                "refusing to accept secret `{k}` via `-e`; use `--secrets-file` instead (ADR 0020)",
+            );
+        }
+        env.insert(k, v);
+    }
+
+    Ok(RunInputs { env, secrets })
+}
+
+fn parse_inline_env(s: &str) -> Result<(String, String)> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow!("expected `KEY=VAL`, got `{s}`"))?;
+    if k.is_empty() {
+        bail!("empty key in `-e {s}`");
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// Minimal dotenv parser: `KEY=VAL` per line, `#` comments, blank
+/// lines skipped. No quoting, no variable expansion — ADR 0020
+/// keeps the v0.1 surface intentionally narrow. Later duplicate
+/// keys within the same file win on the consumer side via
+/// `BTreeMap::insert`.
+fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading env file `{}`", path.display()))?;
+    let mut out = Vec::new();
+    for (lineno, raw) in contents.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "`{}` line {}: expected `KEY=VAL`, got `{}`",
+                path.display(),
+                lineno + 1,
+                line,
+            )
+        })?;
+        let key = k.trim();
+        if key.is_empty() {
+            bail!("`{}` line {}: empty key", path.display(), lineno + 1);
+        }
+        out.push((key.to_string(), v.trim().to_string()));
+    }
+    Ok(out)
 }

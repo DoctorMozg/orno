@@ -1,6 +1,6 @@
 # Orno Architecture
 
-This document synthesizes the 16 accepted and proposed ADRs into a
+This document synthesizes the accepted and proposed ADRs into a
 single readable whole. It is the orientation read for someone new to
 the project; ADRs carry the load-bearing arguments and remain
 authoritative for individual decisions.
@@ -97,6 +97,20 @@ message. `orno run` exits `0` on all-pass, `2` if any uncovered node
 failed, `1` on load/infra error. Per-node `continue_on_error: true`
 opts out of failure propagation.
 
+Execution is driven by a generator-style `DagWalker` (`orno_core::execution::walker`).
+The walker validates the graph at construction (Kahn's algorithm — cycles and unknown
+`needs:` raise `PipelineError::InvalidGraph`), hands `next_ready()` nodes to the
+Engine, and on a reported failure returns a BFS-ordered list of transitively-dependent
+nodes to skip. Each skipped node is emitted as
+`NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` where `upstream`
+names the originating failure, not the direct parent — the event stream tells one
+causal story per failure cone. Disjoint branches are untouched. Each node executes
+against a per-node `Context` (`execution::context`) holding `vars`, `env` (snapshotted
+at Context construction to preserve bounded non-determinism, ADR 0005), and
+`nodes.<id>` output namespaces; `Context::merge` folds diamond-convergence parents
+with a last-writer-wins + `ContextConflict` advisory. Parallelism is deferred — the
+walker supports it, the v0.1 Engine does not use it (ADR 0021).
+
 Stream discipline in `orno run`:
 
 - **stdout** — `EventEnvelope` NDJSON for downstream tool consumption.
@@ -116,8 +130,15 @@ v0.1 defaults.
 | 1 | Bounded iteration        | hard-fail    | `IterationLimitExceeded { iteration, limit }`  | terminate node |
 | 2 | Bounded tool surface     | hard-fail    | `UnknownToolCalled { name }`                   | terminate node |
 | 3 | Bounded effects          | tool-fail    | `MutatingCallBlocked` / `NetworkBlocked` / `DomainBlocked` | tool-call failure (model may recover) |
-| 4 | Bounded resources        | hard-fail    | `BudgetExceeded { kind: Tokens \| ToolCalls \| WallClock }` | terminate node |
+| 4 | Bounded resources        | hard-fail    | `BudgetExceeded { kind: Tokens \| ToolCalls }` | terminate node |
 | 5 | Bounded non-determinism  | recorded     | —                                              | every call is on the event log; replay reproduces bit-for-bit |
+
+Wall-clock is no longer part of dimension 4 (ADR 0017 amendment to
+ADR 0005). It is handled by the universal node-level `timeout:`
+attribute — a hard terminator on every `NodeKind` — emitting
+`NodeTimedOut { limit, elapsed }` on breach and settling the node
+with `NodeStatus::TimedOut`. Enforcement is always hard-fail and is
+not a strictness-mode dimension in the ADR 0016 trajectory table.
 
 Dimensions 1, 2, and 4 are the load-bearing guarantees. ADR 0016
 forbids user config from downgrading them below hard-fail; attempts
@@ -238,10 +259,12 @@ Events are produced by nodes, sent through an `mpsc` channel to an
 event-log actor, and fanned out to `broadcast` subscribers that
 implement `EventSink` (ADRs 0003, 0012).
 
-- `EventEnvelope { schema_version: u32, seq: u64, event: Event }` is
-  the wire format. `Event` is `#[serde(tag = "type")]` and
-  `#[non_exhaustive]` — additions are append-only; existing replays
-  stay readable.
+- `EventEnvelope { schema_version: u32, seq: u64, timestamp:
+  OffsetDateTime, event: Event }` is the wire format. `Event` is
+  `#[serde(tag = "type")]` and `#[non_exhaustive]` — additions are
+  append-only; existing replays stay readable. `timestamp` is RFC 3339
+  UTC (ADR 0018); `seq` stays the strict-ordering key that replay
+  fidelity depends on.
 - The `mpsc` producer side uses `send().await` (block-on-full), so
   slow sinks create visible stalls instead of silent drops.
 - The `broadcast` side is bounded with configurable capacity
@@ -273,7 +296,7 @@ side-steps them; additions are append-only.
 | 1 | `LlmTransport`  | every LLM call                              | 0002       | `DummyTransport`, `GenAiTransport`, future `Recording`/`Replay` |
 | 2 | `NodeExecutor`  | every node kind                             | 0003, 0004 | `AgentExecutor`, `ShellExecutor`, (`ExternalExecutor` deferred) |
 | 3 | `EventSink`     | every lifecycle event                       | 0003, 0012 | `InMemorySink`; feature-gated `SqliteSink` follow-up    |
-| 4 | `EventEnvelope` | versioned wire format (not a trait proper)  | 0003       | one concrete struct; `#[non_exhaustive]` `Event` enum   |
+| 4 | `EventEnvelope` | versioned wire format (not a trait proper)  | 0003, 0018 | one concrete struct; `#[non_exhaustive]` `Event` enum including `NodeSkipped` (ADR 0021); RFC 3339 `timestamp` |
 | 5 | `Agent`         | agent-loop trait                            | 0006       | `LoopAgent` implements the five dimensions              |
 | 6 | `ToolHandler`   | one impl per builtin + dispatch for MCP/subagent | 0008  | `BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`, `McpHandler`, `SubagentHandler` |
 | 7 | `McpClient`     | MCP protocol client                         | 0007       | `RmcpClient` wrapping `rmcp`                            |
@@ -334,6 +357,11 @@ target phase in `docs/roadmap.md`; some are explicitly post-v0.1.
 - WASM plugins — explicitly out of scope for v1.x (ADR 0004).
 - Auto-inferred `needs:` from template references — declare
   explicitly (`docs/yaml-spec.md`).
+- DAG-level parallelism — the walker is generator-shaped and ready for it, but the
+  v0.1 Engine dispatches serially to keep a single event-stream interleaving per run
+  (ADR 0021).
+- `continue_on_error: true` per-node opt-out of failure propagation — today a failed
+  node hard-propagates skips to its full dependent cone (ADR 0021).
 
 ## ADR index
 
@@ -356,6 +384,10 @@ target phase in `docs/roadmap.md`; some are explicitly post-v0.1.
 | 0015 | proposed | Crate-budget rule — three justifications for any new crate |
 | 0016 | proposed | Per-dimension enforcement modes with declared trajectory   |
 | 0017 | accepted | Node attributes over new kinds; remove `external`; shell stdout/stderr split |
+| 0018 | accepted | RFC 3339 `timestamp` on `EventEnvelope`; matching stderr tracing timer |
+| 0019 | accepted | Run identifiers are `run_<ULID>`; generator in `orno-core::execution` |
+| 0020 | accepted | Env and secrets as two template namespaces; redacted credentials            |
+| 0021 | accepted | DAG execution model: generator walker, per-node Context, skip cascade       |
 
 Never revise an accepted ADR. Add an `## Amendments` section pointing
 to a newer ADR, or supersede with a new ADR. Historical decisions must

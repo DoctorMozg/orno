@@ -18,7 +18,6 @@ agents:
       max_iterations: 1
       max_total_tokens: 1000
       max_tool_calls: 0
-      max_wall_clock: 30s
       max_subagent_depth: 0
       allow_mutations: false
       allow_network: false

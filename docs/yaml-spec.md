@@ -9,6 +9,8 @@ The canonical JSON Schema lives at `schemas/pipeline.schema.json` and is regener
 ```yaml
 version: 1                     # required; current is 1
 vars: { ... }                  # optional; template variables
+pass_env: [ ... ]              # optional; names to pull from process env into env.*
+secrets: [ ... ]               # optional; names to classify as secrets.*
 agents: { ... }                # optional; named agent configurations
 mcp_servers: { ... }           # optional; MCP server declarations
 nodes: [ ... ]                 # required; the DAG
@@ -28,6 +30,69 @@ vars:
   project: orno
   max_age_days: 7
 ```
+
+## Environment and secrets
+
+Pipelines reference two external-value namespaces from templates — `env.*` for visible inputs and `secrets.*` for redacted credentials. ADR 0020 is the normative source; the rules below are the prose summary.
+
+### `env.*` — pipeline inputs, opt-in
+
+Sources, highest precedence wins:
+
+1. `-e KEY=VAL` CLI flag (repeatable).
+2. `--env-file <path>` (repeatable; later files shadow earlier ones; dotenv format).
+3. `pass_env: [NAMES]` top-level YAML block — pulls the named keys from the process env at run start.
+
+```yaml
+pass_env:
+  - PR_NUMBER
+  - CI_BUILD_ID
+```
+
+The process environment does **not** auto-populate `env.*`. A name not listed via one of the three sources above is a hard template-render error (`TemplateError::UnknownVariable`), never a silent empty string. This keeps runs reproducible across machines: nothing flows into template context without an explicit declaration.
+
+Values in `env.*` are visible:
+
+- Expand into prompts, shell args, `initial_prompt`s, and the `command` / `args` / `env` / `url` fields on MCP server configs.
+- Appear verbatim in emitted events.
+- Logged at any tracing level without redaction.
+
+### `secrets.*` — credentials, ambient + file override
+
+Sources, highest precedence wins:
+
+1. **Process env** for two populations:
+   - **Provider-known names** — auto-pulled when a pipeline references the provider (`OPENROUTER_API_KEY` for `provider: openrouter`, `ANTHROPIC_API_KEY` for `provider: anthropic`, etc.). No YAML declaration required.
+   - **User-declared names** — `secrets: [NAMES]` at the top level adds names to the set. Typical use is MCP server `env:` blocks that pass a token through to the server subprocess.
+2. **`--secrets-file <path>`** (repeatable; later files shadow earlier ones; dotenv format).
+
+```yaml
+secrets:
+  - GITHUB_TOKEN
+  - SLACK_BOT_TOKEN
+```
+
+There is no CLI flag for individual secret values — `argv` leaks into shell history, `ps aux`, and some exec-tracing facilities. Use `--secrets-file` for ad-hoc overrides.
+
+Classification follows the **name**, not the source. If someone writes `OPENROUTER_API_KEY=sk-...` into `.env.inputs`, orno routes that binding into `secrets.*` anyway — a name's sensitivity cannot be downgraded by choice of source file.
+
+Values in `secrets.*` are protected:
+
+- Expand into templated strings only when the template explicitly references `{{ secrets.FOO }}`.
+- Value-redacted to `***` in every event body, tracing line, and replay tape where they appear.
+- The internal secrets handle is not `Debug`-printable and does not implement `Serialize`, so accidental inclusion in a diagnostic artifact fails at compile time.
+
+### CLI surface
+
+```
+orno run pipeline.yaml \
+  -e PR_NUMBER=482 \
+  -e RUN_LABEL=nightly \
+  --env-file .env.inputs \
+  --secrets-file .env.secrets
+```
+
+All three flags are repeatable. Missing files are a hard error — no silent fallback to default paths.
 
 ## `agents`
 
@@ -60,13 +125,14 @@ my_agent:
     max_iterations: 10
     max_total_tokens: 50000
     max_tool_calls: 20
-    max_wall_clock: 10m
     max_subagent_depth: 3
     allow_mutations: false
     allow_network: false
     allowed_domains: []
     blocked_domains: []
     on_parse_error: fail       # fail | retry_once
+  # Wall-clock deadline is a node-level attribute (`timeout: 10m`)
+  # per ADR 0017, not an agent-policy field.
 ```
 
 ### `allowed_tools` grammar
@@ -91,7 +157,6 @@ See ADR 0005 for full definitions. Brief reference:
 - `max_iterations` — agent-loop cap. Overrun → `IterationLimitExceeded` → terminate node.
 - `max_total_tokens` — sum across all LLM calls in this agent's loop (not including subagent tokens; subagents have their own caps, bounded from above by the parent's remaining budget).
 - `max_tool_calls` — counts every attempted tool call including blocked and subagent calls.
-- `max_wall_clock` — duration string (`30s`, `5m`, `1h`). Clock starts at `AgentStarted`.
 - `max_subagent_depth` — 0 disables subagents entirely.
 - `allow_mutations` / `allow_network` — gate tool calls by declared effect class (ADR 0008).
 - `allowed_domains` / `blocked_domains` — domain name list for `WebFetch` and network-capable MCP tools. Blocklist wins on overlap. Subdomain matching: `"api.github.com"` matches exactly; `".github.com"` matches any subdomain; `"github.com"` matches both the bare host and any subdomain.
@@ -109,7 +174,7 @@ mcp_servers:
     transport: stdio
     command: ["npx", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_TOKEN: "{{ env.GITHUB_TOKEN }}"
+      GITHUB_TOKEN: "{{ secrets.GITHUB_TOKEN }}"
 
   filesystem:
     transport: stdio
@@ -189,8 +254,8 @@ MiniJinja (auto-escape disabled) renders the following strings:
 Template context:
 
 - `vars.<name>` — values from the top-level `vars:` block.
-- `env.<NAME>` — environment variables (must be listed in a top-level `env_passthrough:` allowlist; undeclared env → template error; allowlist syntax finalized in Phase 5).
-- `secrets.<name>` — secrets loaded from a side-file (v0.1.0 treats these identically to env vars).
+- `env.<NAME>` — pipeline inputs. See [Environment and secrets](#environment-and-secrets); undeclared names are a template-render error, never a silent empty string.
+- `secrets.<NAME>` — redacted credentials. See [Environment and secrets](#environment-and-secrets); values are replaced with `***` in every event and trace.
 - `nodes.<id>.output` — final assistant message from a completed upstream `kind: agent` node. Available in nodes whose `needs:` includes `<id>`.
 - `nodes.<id>.stdout` / `.stderr` / `.exit_code` — per-channel results from a completed upstream `kind: shell` node (ADR 0017 §2). Shell nodes do **not** expose `.output`; referencing it is a template-render error.
 - `nodes.<id>.status` — terminal `NodeStatus` for any completed upstream node (`completed | failed | timed_out | skipped`).
@@ -251,7 +316,6 @@ agents:
       max_iterations: 1
       max_total_tokens: 1000
       max_tool_calls: 0
-      max_wall_clock: 30s
       max_subagent_depth: 0
       allow_mutations: false
       allow_network: false

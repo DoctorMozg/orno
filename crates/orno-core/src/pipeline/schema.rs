@@ -18,6 +18,19 @@ pub struct Pipeline {
     pub version: u32,
     #[serde(default)]
     pub vars: BTreeMap<String, serde_json::Value>,
+    /// Names pulled from the process environment into the `env.*`
+    /// template namespace at run start (ADR 0020). Opt-in only — the
+    /// process environment is not auto-inherited. Names not present via
+    /// `pass_env`, `-e`, or `--env-file` are a template-render error.
+    #[serde(default)]
+    pub pass_env: Vec<String>,
+    /// User-declared credential names, routed into the redacted
+    /// `secrets.*` template namespace (ADR 0020). Provider-known names
+    /// (e.g. `OPENROUTER_API_KEY`) are auto-pulled by the transport and
+    /// do not need to appear here; this list is for additional secrets
+    /// such as MCP server tokens.
+    #[serde(default)]
+    pub secrets: Vec<String>,
     /// Named agent configurations, referenced from `kind: agent` nodes
     /// by `agent: <name>` (ADR 0009).
     #[serde(default)]
@@ -95,17 +108,17 @@ pub struct AgentConfig {
     pub policy: AgentPolicy,
 }
 
-/// Agent-loop strictness knobs (ADR 0005). Every field is required;
-/// defaults belong in docs and examples, not silently in code.
+/// Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017). Every
+/// field is required; defaults belong in docs and examples, not silently
+/// in code. Wall-clock is **not** here — ADR 0017 promotes it to a
+/// universal node-level `timeout:` attribute applicable to every
+/// `NodeKind`; the attribute is not yet modeled on `Node` and lands with
+/// the Phase 4–5 executor work.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentPolicy {
     pub max_iterations: u32,
     pub max_total_tokens: u64,
     pub max_tool_calls: u32,
-    /// Wall-clock budget for the agent loop, expressed as a humantime
-    /// duration string (`30s`, `5m`, `1h`). Parsed by the loop
-    /// implementation, not by serde.
-    pub max_wall_clock: String,
     pub max_subagent_depth: u32,
     pub allow_mutations: bool,
     pub allow_network: bool,
