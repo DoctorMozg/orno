@@ -50,7 +50,7 @@ Seven traits constrain the architecture. Every executor path routes through one 
 **Existing in the skeleton:**
 
 1. **`LlmTransport`** (`orno-core/src/llm/mod.rs`) — every LLM call. Concrete impl wraps `genai` (ADR 0002); record/replay lands as a decorator. Do NOT expose `genai` types on orno's public surface.
-2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins (ADR 0004) will implement this via `NodeKind::External`.
+2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds (ADR 0017 §3 supersedes the earlier `NodeKind::External` stub from ADR 0004).
 3. **`EventSink`** (`orno-core/src/events/sink.rs`) — every lifecycle event. `InMemorySink` today; feature-gated `SqliteSink` plugs in without scheduler changes.
 4. **`EventEnvelope { schema_version, seq, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format.
 
@@ -87,7 +87,7 @@ Two distinct serde tag conventions are intentional:
 - `Event` uses `#[serde(tag = "type")]` — lifecycle events.
 - `NodeKind` / `NodeRequest` use `#[serde(tag = "kind")]` — pipeline node discriminator.
 
-Both are `#[non_exhaustive]`. v0.1.0 node kinds are `agent`, `shell`, `external` (ADRs 0008, 0009; `llm` was collapsed into `agent`; `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling). After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
+Both are `#[non_exhaustive]`. v0.1.0 node kinds are `agent` and `shell` (ADR 0009 collapsed `llm` into `agent`; ADR 0017 §1 removed the former `external` variant entirely — it returns post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind). `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
 
 Stream separation in `orno run`:
 
@@ -118,9 +118,10 @@ Use `#[error(transparent)]` on pass-through variants that wrap a foreign error (
 
 - **`async-trait` on every seam.** `orno-core` passes its trait objects as `Arc<dyn Trait>` (`LlmTransport`, `NodeExecutor`, `EventSink`, plus the planned `Agent`, `ToolHandler`, `McpClient`). Native `async fn` in traits (stable since 1.75) is not dyn-compatible, so `#[async_trait]` stays on every seam. Dropping it breaks trait-object dispatch with an opaque lifetime error — the macro is not optional here.
 - **`#[non_exhaustive]` on every public enum.** Already on `Event`, `NodeKind`, `NodeRequest`, and each error enum. Adding a variant must stay non-breaking. Internal-only enums may skip it; enums reachable through serde or the public API must carry it.
-- **Map-shaped variants only on tag-serialized enums.** Serde internal tagging (`tag = "type"`, `tag = "kind"`) needs each variant to serialize as a map. Named-field struct variants (`RunStarted { run_id }`) and newtype variants wrapping a struct (`Llm(LlmNode)`) both qualify; plain multi-field tuple variants do not. `Event` uses the first form, `NodeKind` / `NodeRequest` use the second.
+- **Map-shaped variants only on tag-serialized enums.** Serde internal tagging (`tag = "type"`, `tag = "kind"`) needs each variant to serialize as a map. Named-field struct variants (`RunStarted { run_id }`) and newtype variants wrapping a struct (`Agent(AgentNode)`) both qualify; plain multi-field tuple variants do not. `Event` uses the first form, `NodeKind` / `NodeRequest` use the second.
 - **Borrow in parameters, own in fields.** `&str` / `&Path` in function signatures, `String` / `PathBuf` in storage. Tool-handler return types are the exception: they own their output strings because they cross async boundaries.
 - **Keep transport-library types off the public surface.** `genai::*` and `rmcp::*` live behind `LlmTransport` and `McpClient`. If a helper needs them, make it `pub(crate)` and translate at the trait boundary. This is the load-bearing rule behind ADRs 0002 and 0007 — breaking it forces every downstream crate to track `genai`/`rmcp` versions.
+- **Traits live in files separate from their non-trivial implementations.** A trait file holds the contract plus the request/response types at its boundary. Concrete impls with real logic go in sibling files (`llm/dummy.rs`, `events/in_memory_sink.rs`). Zero-logic placeholders — `NoopEnforcer`-style impls whose methods return `Ok(())` or are empty — may stay alongside the trait because reading them does not distract from the contract. Re-export the moved type from the parent `mod.rs` so consumer paths don't break.
 - **`#[must_use]` on constructors returning `Result`** and on builder methods that consume state. Catches silently-dropped errors and half-built configs at compile time.
 
 ## Tracing and logging
@@ -163,6 +164,7 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 - `docs/adr/0007-mcp-via-rmcp.md` — MCP via `rmcp`, wrapped behind `McpClient`.
 - `docs/adr/0008-builtin-tool-set.md` — `Bash`/`Read`/`Edit`/`Write`/`WebFetch` + MCP; WebSearch deferred.
 - `docs/adr/0009-single-agent-node-kind.md` — collapse `llm` into `agent`.
+- `docs/adr/0017-node-attributes-over-new-kinds.md` — v0.1 `NodeKind` = `Agent, Shell` (no `External`); universal `retry:` / `timeout:` attributes; shell output splits to `.stdout` / `.stderr` / `.exit_code`.
 
 Never revise an accepted ADR. Add an `## Amendments` section pointing to a newer ADR, or supersede with a new ADR. Historical decisions must remain readable.
 

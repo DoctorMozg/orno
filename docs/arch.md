@@ -75,7 +75,7 @@ A pipeline file (`examples/pr-review.yaml`, etc.) declares:
   run (ADR 0007).
 - `nodes:` — the DAG. Each node has `id`, `kind`, optional `needs`.
 
-Three node kinds are defined; two are user-facing in v0.1.0.
+Two node kinds ship in v0.1.0 (ADR 0017 §1).
 
 - **`agent`** — runs the strict loop from ADR 0005. Every LLM-facing
   work lives here; single-shot completion is the degenerate case
@@ -84,9 +84,11 @@ Three node kinds are defined; two are user-facing in v0.1.0.
 - **`shell`** — deterministic subprocess. Declares effects explicitly
   (network, fs, env passthrough, domain rules) — ADR 0013 — so SRE can
   deny pipelines by effect class without reading each command.
-- **`external`** — reserved slot for subprocess plugins (ADR 0004).
-  Accepting `kind: external` YAML requires `--unstable-plugins` until
-  the stabilization ADR lands (ADR 0014).
+
+The former `external` kind was removed entirely by ADR 0017 §3,
+superseding ADR 0014's `--unstable-plugins` gate. Subprocess plugins
+return post-v0.1 as a `transport:` axis on the existing kinds, not as
+a third kind.
 
 Every node produces `NodeResult { status: Ok | Failed, output: String }`
 (ADR 0010). Shell status comes from exit code; agent status comes from
@@ -309,8 +311,9 @@ target phase in `docs/roadmap.md`; some are explicitly post-v0.1.
   Bash (ADR 0008).
 - User-authored tool JSON schemas — Architecture A is rejected for
   v0.1; MCP is the extension seam (ADR 0008).
-- `kind: external` subprocess plugins — behind `--unstable-plugins`
-  only until the stabilization ADR lands (ADRs 0004, 0014).
+- Subprocess plugins as a distinct node kind — removed entirely in
+  v0.1 (ADR 0017 §3, superseding ADR 0014). Return post-v0.1 as a
+  `transport:` axis on `agent` / `shell` rather than a third kind.
 - `SqliteSink` — planned as a feature-gated module inside
   `orno-core`; `InMemorySink` only ships (ADRs 0003, 0015).
 - MCP server restart policies — server crash terminates the owning
@@ -349,9 +352,10 @@ target phase in `docs/roadmap.md`; some are explicitly post-v0.1.
 | 0011 | accepted | Prompt composition via MiniJinja `{% include %}`           |
 | 0012 | proposed | Bounded event log with explicit backpressure (amends 0003) |
 | 0013 | proposed | Shell nodes declare effects (extends 0005)                 |
-| 0014 | proposed | `NodeKind::External` gated behind `--unstable-plugins`     |
+| 0014 | superseded by 0017 | `NodeKind::External` gated behind `--unstable-plugins` |
 | 0015 | proposed | Crate-budget rule — three justifications for any new crate |
 | 0016 | proposed | Per-dimension enforcement modes with declared trajectory   |
+| 0017 | accepted | Node attributes over new kinds; remove `external`; shell stdout/stderr split |
 
 Never revise an accepted ADR. Add an `## Amendments` section pointing
 to a newer ADR, or supersede with a new ADR. Historical decisions must

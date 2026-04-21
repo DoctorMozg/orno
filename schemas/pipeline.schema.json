@@ -1,0 +1,380 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pipeline",
+  "type": "object",
+  "properties": {
+    "agents": {
+      "description": "Named agent configurations, referenced from `kind: agent` nodes\nby `agent: <name>` (ADR 0009).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/AgentConfig"
+      },
+      "default": {}
+    },
+    "mcp_servers": {
+      "description": "MCP servers spawned at run start, torn down at run end (ADR 0007).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/McpServerConfig"
+      },
+      "default": {}
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Node"
+      }
+    },
+    "vars": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "version": {
+      "description": "Schema version. Incremented whenever the schema changes in a\nbackwards-incompatible way.",
+      "type": "integer",
+      "format": "uint32",
+      "default": 1,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "nodes"
+  ],
+  "$defs": {
+    "AgentConfig": {
+      "description": "Named agent configuration. Referenced by `kind: agent` nodes and by\n`subagent.<name>` entries in another agent's `allowed_tools`.",
+      "type": "object",
+      "properties": {
+        "allowed_tools": {
+          "description": "Tool allowlist. Builtin names (`Bash`, `Read`, `Edit`, `Write`,\n`WebFetch`), `mcp.<server>.<tool>` / `mcp.<server>.*`, and\n`subagent.<agent-name>`. Empty list means the agent has no tools.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "model": {
+          "description": "Provider-side model identifier. For OpenRouter this is the\nslash-prefixed route (`openai/gpt-5`); for direct-vendor\nproviders this is the vendor's own model name.",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/AgentPolicy"
+        },
+        "provider": {
+          "description": "`LlmTransport` provider key. Default in v0.1 is `openrouter`.",
+          "type": "string"
+        },
+        "system": {
+          "description": "Optional system prompt. Rendered with the same template context\nas `initial_prompt`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "model",
+        "provider",
+        "policy"
+      ]
+    },
+    "AgentNode": {
+      "description": "Agent node — references a named entry in `Pipeline.agents`. Inline\nagent configuration at the node level is a v0.2+ convenience and is\nnot in the v0.1 schema (see `docs/yaml-spec.md`).",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "description": "Name of an entry in the top-level `agents` map.",
+          "type": "string"
+        },
+        "initial_prompt": {
+          "description": "First user message sent to the agent loop. Rendered with the\n`nodes.<id>.*` / `vars.*` / `env.*` template context.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "initial_prompt"
+      ]
+    },
+    "AgentPolicy": {
+      "description": "Agent-loop strictness knobs (ADR 0005). Every field is required;\ndefaults belong in docs and examples, not silently in code.",
+      "type": "object",
+      "properties": {
+        "allow_mutations": {
+          "type": "boolean"
+        },
+        "allow_network": {
+          "type": "boolean"
+        },
+        "allowed_domains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "blocked_domains": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_iterations": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_subagent_depth": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_tool_calls": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_total_tokens": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_wall_clock": {
+          "description": "Wall-clock budget for the agent loop, expressed as a humantime\nduration string (`30s`, `5m`, `1h`). Parsed by the loop\nimplementation, not by serde.",
+          "type": "string"
+        },
+        "on_parse_error": {
+          "$ref": "#/$defs/OnParseError"
+        }
+      },
+      "required": [
+        "max_iterations",
+        "max_total_tokens",
+        "max_tool_calls",
+        "max_wall_clock",
+        "max_subagent_depth",
+        "allow_mutations",
+        "allow_network",
+        "on_parse_error"
+      ]
+    },
+    "McpAuthConfig": {
+      "description": "MCP HTTP authentication. `bearer` takes a single token; `basic`\ntakes `user`/`password`; `none` is the absence-of-auth sentinel and\nis equivalent to omitting the `auth` block.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "bearer"
+            },
+            "token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "token"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "basic"
+            },
+            "password": {
+              "type": "string"
+            },
+            "user": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "user",
+            "password"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "McpHttpConfig": {
+      "type": "object",
+      "properties": {
+        "auth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpAuthConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
+    "McpServerConfig": {
+      "description": "MCP server declaration. Two transports in v0.1: stdio subprocess and\nHTTP. See ADR 0007.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "transport": {
+              "type": "string",
+              "const": "stdio"
+            }
+          },
+          "$ref": "#/$defs/McpStdioConfig",
+          "required": [
+            "transport"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "transport": {
+              "type": "string",
+              "const": "http"
+            }
+          },
+          "$ref": "#/$defs/McpHttpConfig",
+          "required": [
+            "transport"
+          ]
+        }
+      ]
+    },
+    "McpStdioConfig": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "argv vector. Not passed through a shell.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "required": [
+        "command"
+      ]
+    },
+    "Node": {
+      "description": "Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell` —\nper ADR 0017 §1. The former `Llm` variant was collapsed into `Agent`\n(ADR 0009); the former `External` variant was removed entirely and\nwill return as a `transport:` axis on existing kinds post-v0.1\n(ADR 0017 §3).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "needs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "$ref": "#/$defs/AgentNode",
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "shell"
+            }
+          },
+          "$ref": "#/$defs/ShellNode",
+          "required": [
+            "kind"
+          ]
+        }
+      ],
+      "required": [
+        "id"
+      ]
+    },
+    "OnParseError": {
+      "description": "What the loop does when the model returns malformed JSON for a\ntool-call argument payload.",
+      "oneOf": [
+        {
+          "description": "Terminate the node with `AgentError::ParseFailed`.",
+          "type": "string",
+          "const": "fail"
+        },
+        {
+          "description": "Feed the parse error back as a tool-result message and loop once\nmore. Further parse errors terminate.",
+          "type": "string",
+          "const": "retry_once"
+        }
+      ]
+    },
+    "ShellNode": {
+      "type": "object",
+      "properties": {
+        "args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "command": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ]
+    }
+  }
+}

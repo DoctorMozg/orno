@@ -3,11 +3,13 @@
 //! The `schema_version` on the envelope and `#[non_exhaustive]` on `Event`
 //! together let us grow the enum without breaking existing replay files.
 
+pub mod in_memory_sink;
 pub mod sink;
 
 use serde::{Deserialize, Serialize};
 
-pub use sink::{EventSink, InMemorySink};
+pub use in_memory_sink::InMemorySink;
+pub use sink::EventSink;
 
 /// Wire envelope for every event persisted or broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]

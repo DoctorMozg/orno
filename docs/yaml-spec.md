@@ -141,10 +141,10 @@ mcp_servers:
 Array of `Node` entries. Each node:
 
 - `id: string` — required; unique within the pipeline.
-- `kind: agent | shell | external` — required; determines which fields follow.
+- `kind: agent | shell` — required; determines which fields follow.
 - `needs: [string]` — optional; IDs of nodes this node depends on. Drives DAG scheduling.
 
-(`llm` was collapsed into `agent` per ADR 0009. `external` is reserved for post-v0.1 subprocess plugins — ADR 0004 — and is rejected by `orno validate` in v0.1.0.)
+(`llm` was collapsed into `agent` per ADR 0009. The former `external` kind is removed in v0.1 per ADR 0017 §3 — `kind: external` is a serde "unknown variant" parse error at load. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind.)
 
 ### `kind: agent`
 
@@ -176,10 +176,6 @@ Non-agentic subprocess invocation. Not subject to agent policy.
 
 For subprocess invocations **inside** an agent loop, use the `Bash` tool (which *is* policy-gated). `kind: shell` exists for deterministic pipeline steps that don't need a model.
 
-### `kind: external`
-
-Stub. Not implemented in v0.1.0. Reserved for ADR 0004 subprocess plugins; validation rejects `kind: external` at load.
-
 ## Templates
 
 MiniJinja (auto-escape disabled) renders the following strings:
@@ -195,7 +191,9 @@ Template context:
 - `vars.<name>` — values from the top-level `vars:` block.
 - `env.<NAME>` — environment variables (must be listed in a top-level `env_passthrough:` allowlist; undeclared env → template error; allowlist syntax finalized in Phase 5).
 - `secrets.<name>` — secrets loaded from a side-file (v0.1.0 treats these identically to env vars).
-- `nodes.<id>.output` — output of a completed upstream node. Available in nodes whose `needs:` includes `<id>`.
+- `nodes.<id>.output` — final assistant message from a completed upstream `kind: agent` node. Available in nodes whose `needs:` includes `<id>`.
+- `nodes.<id>.stdout` / `.stderr` / `.exit_code` — per-channel results from a completed upstream `kind: shell` node (ADR 0017 §2). Shell nodes do **not** expose `.output`; referencing it is a template-render error.
+- `nodes.<id>.status` — terminal `NodeStatus` for any completed upstream node (`completed | failed | timed_out | skipped`).
 
 ## Effect-class reference
 
@@ -273,7 +271,7 @@ See `examples/pr-review.yaml`, `examples/flaky-test-triage.yaml`, and `examples/
 - `WebSearch` tool (ADR 0008 deferral).
 - Generic HTTP tool handler (use MCP instead).
 - User-authored tool JSON Schemas (Architecture A from `docs/chat.md` is not a v0.1.0 feature).
-- `kind: external` node execution (ADR 0004).
+- `kind: external` node execution (removed from v0.1 per ADR 0017; returns as a `transport:` axis on existing kinds in a later release).
 - Inline agent config at the node level.
 - Streaming LLM responses.
 - `EventSink` impls beyond `InMemorySink` (SQLite is planned, not shipped).

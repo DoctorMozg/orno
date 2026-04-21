@@ -43,7 +43,7 @@ graph TD
     llm[llm]
     budget[budget]
     node[node]
-    node_llm["node::llm"]
+    node_agent["node::agent"]
     node_shell["node::shell"]
     node_reg["node::registry"]
     pipeline[pipeline]
@@ -72,11 +72,10 @@ graph TD
     budget --> llm
 
     node --> error
-    node --> node_llm
+    node --> node_agent
     node --> node_shell
     node --> node_reg
-    node_llm --> llm
-    node_llm --> error
+    node_agent --> error
     node_shell --> error
 
     pipeline --> pipe_schema
@@ -227,13 +226,10 @@ classDiagram
         <<trait>>
         +execute(id, req) NodeResponse
     }
-    class LlmExecutor {
-        -transport
-    }
+    class AgentExecutor
     class ShellExecutor
-    NodeExecutor <|.. LlmExecutor
+    NodeExecutor <|.. AgentExecutor
     NodeExecutor <|.. ShellExecutor
-    LlmExecutor ..> LlmTransport
 
     class NodeRegistry {
         -map
@@ -269,11 +265,11 @@ classDiagram
 
 Concrete implementor locations:
 
-- `DummyTransport` — `crates/orno-core/src/llm/mod.rs:50`
-- `LlmExecutor` — `crates/orno-core/src/node/llm.rs:23`, composes `Arc<dyn LlmTransport>`
-- `ShellExecutor` — `crates/orno-core/src/node/shell.rs:13`
-- `InMemorySink` — `crates/orno-core/src/events/sink.rs:37`
-- `NoopEnforcer` — `crates/orno-core/src/budget/mod.rs:25`
+- `DummyTransport` — `crates/orno-core/src/llm/dummy.rs:11`
+- `AgentExecutor` — `crates/orno-core/src/node/agent.rs:11` (stateless stub; the real loop composes `LlmTransport` + tool handlers per ADRs 0005, 0008)
+- `ShellExecutor` — `crates/orno-core/src/node/shell.rs:11`
+- `InMemorySink` — `crates/orno-core/src/events/in_memory_sink.rs:13`
+- `NoopEnforcer` — `crates/orno-core/src/budget/mod.rs:22` (no-op; stays alongside the trait per the Rust-idioms rule in `CLAUDE.md`)
 - `Engine` — `crates/orno-core/src/execution/scheduler.rs:11`
 
 Seams that ADRs 0005–0008 call for but are **not yet in the code**: `Agent`,
@@ -337,6 +333,8 @@ classDiagram
     class Pipeline {
         version u32
         vars BTreeMap~String,Value~
+        agents BTreeMap~String,AgentConfig~
+        mcp_servers BTreeMap~String,McpServerConfig~
         nodes Vec~Node~
     }
     class Node {
@@ -347,36 +345,62 @@ classDiagram
     class NodeKind {
         <<enum>>
     }
-    class LlmNode {
-        provider String
-        model String
-        prompt String
-        temperature Option~f32~
-        max_tokens Option~u32~
+    class AgentNode {
+        agent String
+        initial_prompt String
     }
     class ShellNode {
         command String
         args Vec~String~
     }
-    class ExternalNode {
-        command String
-        args Vec~String~
+    class AgentConfig {
+        model String
+        provider String
+        system Option~String~
+        allowed_tools Vec~String~
+        policy AgentPolicy
+    }
+    class AgentPolicy {
+        max_iterations u32
+        max_total_tokens u64
+        max_tool_calls u32
+        max_wall_clock String
+        max_subagent_depth u32
+        allow_mutations bool
+        allow_network bool
+        allowed_domains Vec~String~
+        blocked_domains Vec~String~
+        on_parse_error OnParseError
+    }
+    class McpServerConfig {
+        <<enum>>
+    }
+    class McpStdioConfig {
+        command Vec~String~
+        env BTreeMap~String,String~
+    }
+    class McpHttpConfig {
+        url String
+        auth Option~McpAuthConfig~
+        headers BTreeMap~String,String~
     }
     Pipeline "1" o-- "*" Node
+    Pipeline "1" o-- "*" AgentConfig
+    Pipeline "1" o-- "*" McpServerConfig
     Node --> NodeKind
-    NodeKind <|-- LlmNode
+    NodeKind <|-- AgentNode
     NodeKind <|-- ShellNode
-    NodeKind <|-- ExternalNode
+    AgentConfig --> AgentPolicy
+    McpServerConfig <|-- McpStdioConfig
+    McpServerConfig <|-- McpHttpConfig
 ```
 
 `NodeKind` is serialized with `#[serde(tag = "kind", rename_all =
-"snake_case")]`, so the YAML discriminator is `kind: llm|shell|external`.
-`Node` flattens its `NodeKind` variant via `#[serde(flatten)]`
-(`schema.rs:27`).
-
-Drift note: ADR 0009 collapses `llm` into `agent`. The current skeleton
-still ships `NodeKind::Llm`. When the migration lands, this diagram and
-`schemas/pipeline.schema.json` move together.
+"snake_case")]`, so the YAML discriminator is `kind: agent|shell` (ADR
+0009 collapsed `llm` into `agent`; ADR 0017 §3 removed the former
+`external` variant entirely). `Node` flattens its `NodeKind` variant via
+`#[serde(flatten)]` (`schema.rs:40`). `McpServerConfig` uses the same
+internal-tag pattern on `transport:` for `stdio` vs `http`.
 
 ## Data model — event envelope
 
@@ -432,10 +456,11 @@ for the budget seam to wire into.
 
 ## NodeExecutor dispatch (designed but not wired)
 
-`LlmExecutor::execute` (`node/llm.rs:24-58`) already delegates through
-`LlmTransport`. `NodeRegistry` (`node/registry.rs`) already keys executors
-by kind. They are simply not called from `Engine::run`. This is the shape
-the dispatch will take once the scheduler is wired:
+`AgentExecutor::execute` (`node/agent.rs:15`) and `ShellExecutor::execute`
+(`node/shell.rs:14`) are both `NotImplemented` stubs today. `NodeRegistry`
+(`node/registry.rs`) already keys executors by kind. None of them are
+called from `Engine::run`. This is the shape the dispatch will take once
+the scheduler is wired:
 
 ```mermaid
 sequenceDiagram
@@ -449,14 +474,14 @@ sequenceDiagram
     Eng->>Reg: get(kind_str)
     Reg-->>Eng: Some executor
     Eng->>Ex: execute(id, NodeRequest)
-    alt NodeRequest Llm
-        Ex->>Tx: complete(LlmRequest)
+    alt NodeRequest Agent
+        Note over Ex: AgentExecutor owns the ADR 0005 loop
+        Ex->>Tx: complete(LlmRequest) per iteration
         Tx-->>Ex: LlmResponse
-        Ex-->>Eng: NodeResponse (content, usage)
+        Ex-->>Eng: NodeResponse (final assistant msg, usage)
     else NodeRequest Shell
-        Ex-->>Eng: NodeError NotImplemented
-    else NodeRequest External
-        Note over Ex: not implemented yet
+        Note over Ex: ShellExecutor spawns subprocess (ADR 0013)
+        Ex-->>Eng: NodeResponse (stdout, stderr, exit_code)
     end
     Eng->>Sink: record NodeFinished
 ```
@@ -465,7 +490,9 @@ Mapping gap to close when wiring: `pipeline::schema::NodeKind` (YAML-side)
 and `node::NodeRequest` (executor-side) are parallel enums today with no
 conversion between them. The scheduler will need a translator — either a
 `From<&Node> for NodeRequest` impl or an explicit builder — before the
-dispatch above can run.
+dispatch above can run. For `kind: agent`, the translator also has to
+resolve `AgentNode.agent` against `Pipeline.agents` to materialize the
+`AgentConfig` + policy the loop needs.
 
 ## Template rendering
 

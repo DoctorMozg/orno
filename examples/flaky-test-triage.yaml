@@ -91,7 +91,7 @@ nodes:
       Triage the flaky test `{{ vars.test_path }}` in repo `{{ vars.repo }}`.
 
       CI log (truncated to the failing run):
-      {{ nodes.fetch_ci_log.output }}
+      {{ nodes.fetch_ci_log.stdout }}
 
       Follow the method in your system prompt and save the triage JSON to
       the reports directory.

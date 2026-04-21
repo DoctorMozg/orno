@@ -1,15 +1,31 @@
 # yaml-language-server: $schema=../schemas/pipeline.schema.json
-# Minimal skeleton pipeline. No real execution — nodes emit lifecycle
-# events only. Generate and commit the schema with: `orno schema > schemas/pipeline.schema.json`.
+# Minimal skeleton pipeline. Node execution is still a no-op today —
+# lifecycle events fire but the agent loop isn't wired yet. Regenerate
+# the schema after NodeKind changes: `orno schema > schemas/pipeline.schema.json`.
 
 version: 1
 
 vars:
   target: README.md
 
+agents:
+  greeter:
+    model: openai/gpt-5
+    provider: openrouter
+    system: "You are friendly."
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1000
+      max_tool_calls: 0
+      max_wall_clock: 30s
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+
 nodes:
   - id: greet
-    kind: llm
-    provider: openrouter
-    model: openai/gpt-5
-    prompt: "Say hello to {{ vars.target }}."
+    kind: agent
+    agent: greeter
+    initial_prompt: "Say hello to {{ vars.target }} in one sentence."

@@ -102,7 +102,7 @@ nodes:
       {{ vars.prev_tag }}..{{ vars.curr_tag }}.
 
       Git log:
-      {{ nodes.collect_commits.output }}
+      {{ nodes.collect_commits.stdout }}
 
       Follow the method in your system prompt and return the JSON array.
     needs: [collect_commits]

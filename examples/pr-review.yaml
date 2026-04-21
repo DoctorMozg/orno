@@ -137,7 +137,7 @@ nodes:
       Review PR #{{ vars.pr_number }} against {{ vars.base_ref }}.
 
       Diff:
-      {{ nodes.collect_diff.output }}
+      {{ nodes.collect_diff.stdout }}
 
       Delegate one call each to security_lens, performance_lens, and
       docs_lens. Scope each subagent's prompt to the files that appear in

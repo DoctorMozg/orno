@@ -1,10 +1,12 @@
 //! Node executor trait and shared wire types.
 //!
-//! `NodeRequest` and `NodeResponse` are the serde-tagged contracts that the
-//! future subprocess plugin protocol will cross (ADR 0004). Built-in
-//! executors implement the same trait.
+//! `NodeRequest` and `NodeResponse` are the serde-tagged contracts that
+//! every node kind flows through. Built-in executors implement the same
+//! trait; the subprocess plugin transport (deferred past v0.1 per ADR
+//! 0017) will reuse the same wire format without reintroducing a
+//! sibling kind.
 
-pub mod llm;
+pub mod agent;
 pub mod registry;
 pub mod shell;
 
@@ -19,20 +21,19 @@ use crate::error::NodeError;
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum NodeRequest {
-    Llm(LlmNodeRequest),
+    Agent(AgentNodeRequest),
     Shell(ShellNodeRequest),
-    External(ExternalNodeRequest),
 }
 
+/// Runtime payload for a `kind: agent` node. Agents are referenced by
+/// name in YAML; the scheduler resolves the name against
+/// `Pipeline.agents` before dispatch and materializes the policy + tool
+/// allowlist here. Templated fields (`initial_prompt`, `system`) are
+/// already rendered by the time they reach this struct.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmNodeRequest {
-    pub provider: String,
-    pub model: String,
-    pub prompt: String,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
+pub struct AgentNodeRequest {
+    pub agent: String,
+    pub initial_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,15 +41,6 @@ pub struct ShellNodeRequest {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalNodeRequest {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
