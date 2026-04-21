@@ -1,0 +1,25 @@
+[package]
+name = "orno-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface for the orno orchestrator."
+
+[[bin]]
+name = "orno"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+
+[dependencies]
+orno-core = { workspace = true }
+
+[dev-dependencies]

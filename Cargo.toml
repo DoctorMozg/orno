@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = ["crates/orno-core", "crates/orno-cli"]
+
+[workspace.package]
+version = "0.0.1-dev"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/drmozg/orno"
+authors = ["Stanislav Gonorovskii"]
+
+[workspace.dependencies]
+# Intra-workspace
+orno-core = { path = "crates/orno-core", version = "0.0.1-dev" }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Serde stack
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+
+# Async runtime — enumerate features explicitly, never use "full"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# Templating & schema
+minijinja = { version = "2", default-features = false, features = ["loader", "builtins"] }
+schemars = "1"
+
+# Config
+figment = { version = "0.10", default-features = false, features = ["yaml", "env"] }
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "env-filter",
+    "fmt",
+    "json",
+    "std",
+] }
+
+# Testing
+assert_cmd = "2"
+insta = { version = "1", features = ["yaml"] }
+predicates = "3"
+rstest = "0.23"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
