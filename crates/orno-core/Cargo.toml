@@ -16,7 +16,22 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# Config structs legitimately enumerate many boolean capability flags;
+# wire-shape fields mirror provider APIs and can't be renamed freely;
+# skeleton stubs return Result to preserve the future signature.
+struct_excessive_bools = "allow"
+struct_field_names = "allow"
+unnecessary_wraps = "allow"
 
 [dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+schemars = { workspace = true }
+minijinja = { workspace = true }
+tracing = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
+rstest = { workspace = true }

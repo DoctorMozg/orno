@@ -38,7 +38,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 
 # Templating & schema
-minijinja = { version = "2", default-features = false, features = ["loader", "builtins"] }
+minijinja = { version = "2", default-features = false, features = ["loader", "builtins", "serde"] }
 schemars = "1"
 
 # Config
