@@ -15,3 +15,11 @@ pub mod pipeline;
 pub mod telemetry;
 
 pub use error::{CoreError, LlmError, NodeError, PipelineError};
+
+/// Render the pipeline JSON Schema as a pretty-printed string. Used by the
+/// `orno schema` subcommand; IDEs can reference the committed file via a
+/// `# yaml-language-server: $schema=...` comment.
+pub fn pipeline_json_schema_string() -> Result<String, serde_json::Error> {
+    let schema = schemars::schema_for!(pipeline::Pipeline);
+    serde_json::to_string_pretty(&schema)
+}

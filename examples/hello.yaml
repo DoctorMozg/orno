@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../schemas/pipeline.schema.json
+# Minimal skeleton pipeline. No real execution — nodes emit lifecycle
+# events only. Generate and commit the schema with: `orno schema > schemas/pipeline.schema.json`.
+
+version: 1
+
+vars:
+  target: README.md
+
+nodes:
+  - id: greet
+    kind: llm
+    provider: openai
+    model: gpt-5
+    prompt: "Say hello to {{ vars.target }}."
