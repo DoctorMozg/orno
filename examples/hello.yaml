@@ -10,6 +10,6 @@ vars:
 nodes:
   - id: greet
     kind: llm
-    provider: openai
-    model: gpt-5
+    provider: openrouter
+    model: openai/gpt-5
     prompt: "Say hello to {{ vars.target }}."

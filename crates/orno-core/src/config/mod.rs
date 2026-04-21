@@ -39,6 +39,7 @@ pub struct Capabilities {
 /// Which field name the provider uses for reasoning tokens, if any.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ReasoningField {
     ReasoningContent,
     Reasoning,
@@ -47,6 +48,7 @@ pub enum ReasoningField {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SseDialect {
     #[default]
     OpenAi,

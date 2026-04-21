@@ -1,6 +1,6 @@
 # ADR 0014 — `NodeKind::External` behind `--unstable-plugins`
 
-- Status: proposed; amends ADR 0004
+- Status: superseded by ADR 0017 (never accepted in its proposed form)
 - Date: 2026-04-21
 
 ## Context
@@ -85,3 +85,17 @@ deliberately left open (ADR 0004 said "no loader ships in v0.1.0"
 but left `NodeKind::External` accepting at the serde layer). Does
 not touch ADR 0008 or 0009 — the builtin tool set and single-agent-
 node-kind decisions stand.
+
+**Superseded by ADR 0017 (2026-04-21).** The `--unstable-plugins`
+gate and the `NodeKind::External` stub are both retired in favor of
+removing the `External` variant from v0.1 entirely. The rationale
+the `Context` section above enumerates (five missing protocol pieces)
+is preserved; ADR 0017 simply concludes that keeping a reserved stub
+is not cheaper than removing it, given that the stabilization ADR
+will pick names and shapes from scratch. The stabilization checklist
+in this ADR's §3 carries forward into the follow-up ADR that
+reintroduces subprocess transport at v0.2+, at which point it will
+take a `transport: builtin | subprocess` axis shape on existing
+kinds rather than a sibling kind. `PipelineError::UnstableNodeKind`
+is removed; `kind: external` in YAML becomes a serde "unknown
+variant" error like any other unknown kind.

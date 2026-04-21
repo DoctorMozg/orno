@@ -36,12 +36,18 @@ Map of agent name to `AgentConfig`. Each named agent can be referenced by:
 - A node: `nodes[*].agent: <name>`.
 - Another agent's subagent tool: `handler: { kind: subagent, agent: <name> }`.
 
+### Default provider
+
+`openrouter` is the default `LlmTransport` target for v0.1.0. OpenRouter exposes every upstream vendor behind a single OpenAI-compatible endpoint, so a single `OPENROUTER_API_KEY` unlocks OpenAI, Anthropic, Google, and open-weight models without per-vendor plumbing. Agents select the upstream by giving the OpenRouter route as `model:` (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.5`, `google/gemini-2.5-pro`). Direct-vendor `provider: openai` / `provider: anthropic` remain valid identifiers but require the matching vendor key and are not enabled by default.
+
+The backing `LlmTransport` impl is not wired yet (ADR 0002; roadmap Phase ≥2). This section fixes the naming convention so samples, event logs, and the future transport agree from day one.
+
 ### `AgentConfig`
 
 ```yaml
 my_agent:
-  model: gpt-5                 # required
-  provider: openai             # required; matches an LlmTransport provider
+  model: openai/gpt-5          # required; slash-prefixed route for the default (OpenRouter) provider
+  provider: openrouter         # required; matches an LlmTransport provider. Default: openrouter
   system: "You are..."         # optional system prompt
   allowed_tools:               # required; may be empty
     - Bash
@@ -239,8 +245,8 @@ version: 1
 
 agents:
   greeter:
-    model: gpt-5
-    provider: openai
+    model: openai/gpt-5
+    provider: openrouter
     system: "You are friendly."
     allowed_tools: []
     policy:

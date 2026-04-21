@@ -15,8 +15,8 @@ vars:
 
 agents:
   issue_enricher:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are an issue enricher. You receive a raw git log and produce a
       structured list of merged PRs.
@@ -45,8 +45,8 @@ agents:
       on_parse_error: retry_once
 
   notes_synthesizer:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are a release-notes synthesizer. You receive an enriched PR list
       and produce a user-facing changelog.

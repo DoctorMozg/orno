@@ -17,8 +17,8 @@ mcp_servers:
 
 agents:
   pr_reviewer:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are a lead PR reviewer. You do not read code directly — you
       delegate to specialist lens subagents (security, performance, docs)
@@ -50,8 +50,8 @@ agents:
       on_parse_error: retry_once
 
   security_lens:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are a security reviewer. Read the files mentioned in the prompt
       and look for: injection (SQL, command, XSS), auth bypass, secret
@@ -76,8 +76,8 @@ agents:
       on_parse_error: retry_once
 
   performance_lens:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are a performance reviewer. Read the files mentioned in the
       prompt and look for: N+1 queries, blocking I/O in async contexts,
@@ -101,8 +101,8 @@ agents:
       on_parse_error: retry_once
 
   docs_lens:
-    model: claude-sonnet-4-5
-    provider: anthropic
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
     system: |
       You are a documentation reviewer. Check whether public API changes
       update docstrings, README entries, and inline comments for non-obvious

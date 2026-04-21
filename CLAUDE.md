@@ -112,6 +112,46 @@ Pedantic clippy is `warn` in both crates with a small documented allow list. Whe
 
 One `thiserror` enum per subsystem (`CoreError`, `PipelineError`, `NodeError`, `AgentError`, `ToolError`, `LlmError`, `McpError`) in `orno-core/src/error.rs`. `#[from]` only when the conversion is unambiguous and the variant carries no extra context; otherwise use an explicit struct variant with `#[source]`. `anyhow::Result` is used exclusively in `orno-cli` at dispatch boundaries.
 
+Use `#[error(transparent)]` on pass-through variants that wrap a foreign error (`std::io::Error`, `serde_json::Error`) without adding orno context — it forwards `Display` and `source()` cleanly. Reserve named struct variants with `#[source]` for errors that carry orno context (a pipeline path, a node id, a stage name). Every error enum is `#[non_exhaustive]` so new variants do not break downstream matches.
+
+## Rust idioms
+
+- **`async-trait` on every seam.** `orno-core` passes its trait objects as `Arc<dyn Trait>` (`LlmTransport`, `NodeExecutor`, `EventSink`, plus the planned `Agent`, `ToolHandler`, `McpClient`). Native `async fn` in traits (stable since 1.75) is not dyn-compatible, so `#[async_trait]` stays on every seam. Dropping it breaks trait-object dispatch with an opaque lifetime error — the macro is not optional here.
+- **`#[non_exhaustive]` on every public enum.** Already on `Event`, `NodeKind`, `NodeRequest`, and each error enum. Adding a variant must stay non-breaking. Internal-only enums may skip it; enums reachable through serde or the public API must carry it.
+- **Map-shaped variants only on tag-serialized enums.** Serde internal tagging (`tag = "type"`, `tag = "kind"`) needs each variant to serialize as a map. Named-field struct variants (`RunStarted { run_id }`) and newtype variants wrapping a struct (`Llm(LlmNode)`) both qualify; plain multi-field tuple variants do not. `Event` uses the first form, `NodeKind` / `NodeRequest` use the second.
+- **Borrow in parameters, own in fields.** `&str` / `&Path` in function signatures, `String` / `PathBuf` in storage. Tool-handler return types are the exception: they own their output strings because they cross async boundaries.
+- **Keep transport-library types off the public surface.** `genai::*` and `rmcp::*` live behind `LlmTransport` and `McpClient`. If a helper needs them, make it `pub(crate)` and translate at the trait boundary. This is the load-bearing rule behind ADRs 0002 and 0007 — breaking it forces every downstream crate to track `genai`/`rmcp` versions.
+- **`#[must_use]` on constructors returning `Result`** and on builder methods that consume state. Catches silently-dropped errors and half-built configs at compile time.
+
+## Tracing and logging
+
+Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSON. `init_tracing` in `orno-cli/src/main.rs` is the single setup site — do not call `tracing_subscriber::fmt()` from anywhere else.
+
+- **Structured fields, not format strings.** `info!(node.id = %id, attempt = i, "retrying")` — never `info!("retrying node {id}")`. Fields preserve types for downstream log pipelines.
+- **`%` for Display, `?` for Debug.** Prefer `%` on human-readable types (ids, paths, model names); `?` on structured values. Never `?` a struct with many fields — pick the fields you want.
+- **Field names are `snake_case` with dot namespaces.** `pipeline.run_id`, `node.id`, `node.kind`, `tool.name`, `llm.model`, `llm.provider`, `http.status_code`. Matches OpenTelemetry semantic conventions so filters compose across tools.
+- **`#[instrument]` on every seam-crossing async function.** Transport calls, node execute, tool invoke, sink write. Use `skip(self, …)` to keep large fields out of the span, `name = "…"` when the function name is too generic, and `fields(node.id = %id)` to hoist parameters.
+- **Attach async work with `.instrument(span)`.** Never `let _g = span.enter()` across an `.await` — entering a span across yields corrupts the active-span stack.
+- **No secrets in logs above `debug!`.** API keys, token-bearing headers, and MCP server env blocks are redacted before emission. Tool outputs may contain user data — never log them at `info!`.
+- **Events ≠ tracing.** `EventSink::emit` is the user-facing log (stdout, versioned envelope, schema guaranteed). `tracing` is internal observability (stderr, no schema). Do not emit user-facing state via `tracing`, and do not emit diagnostic noise via `EventSink`.
+
+## Comments
+
+- **WHY, never WHAT.** If a block needs a narrator, rename the function instead.
+- **`pub` items in `orno-core` carry a doc comment, either item-level `///` or a module-level `//!` that covers them.** When a module has a single dominant symbol (e.g. `pipeline::template::TemplateEngine`), the `//!` header is enough; when a file exposes multiple distinct symbols, each gets its own `///`. Trait-method doc comments describe the contract (preconditions, postconditions, panics); implementation notes belong inside the method body.
+- **No TODO comments in committed code.** Open an issue or add to `docs/roadmap.md`. A rare exception takes the form `// TODO(user, 2026-Q?): <concrete removal trigger>`.
+- **No section-header comments.** If a file wants `// === parsing ===` dividers, it wants splitting instead.
+- **No autobiographical comments.** `// added to fix bug #47`, `// this used to use X`, `// refactored from the old module` — all of these belong in commit messages, not source.
+
+## Testing patterns
+
+- **CLI integration tests use `assert_cmd` + `predicates`.** They live in `crates/orno-cli/tests/` and invoke `orno` as a subprocess. `tests/cli.rs` is the template — copy its pattern rather than starting a parallel one.
+- **Event-stream assertions use `insta` YAML snapshots.** Snapshots contain `run-<nanos>` ids and wall-clock timestamps; redact with `insta::with_settings! { filters => vec![(regex, replacement)] }` alongside the test. Keep redactions next to the test, not in a shared helper — it makes the snapshot self-describing.
+- **Parametric tests use `rstest`.** Each strictness dimension (iteration limit, unknown tool, mutation denied, network denied, budget exceeded) lands as an `#[rstest]` + `#[case]` table. Async cases combine `#[rstest]` with `#[tokio::test]` and mark fixture args with `#[future]`.
+- **Hand-rolled fakes, not `mockall`.** The seam count is small enough that a fake struct in a `mod tests` block is clearer than derived mocks. `mockall` adds proc-macro latency and obscures intent.
+- **One test per terminal `AgentError` variant.** Every strictness dimension must have at least one test that asserts termination with the exact expected variant. The loop's contract is "bounded" — only a test that checks the bound actually proves it.
+- **`cargo insta review`** is the accept-new-snapshots workflow. Never edit `.snap` files by hand; run the review command or delete and re-run.
+
 ## ADRs
 
 - `docs/adr/0001-workspace-split.md` — two-crate split rationale.

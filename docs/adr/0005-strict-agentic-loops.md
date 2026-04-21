@@ -1,6 +1,6 @@
 # ADR 0005 — Strict agentic loops with five strictness dimensions
 
-- Status: accepted
+- Status: accepted; dimension 4 (bounded resources) narrowed by ADR 0017
 - Date: 2026-04-21
 
 ## Context
@@ -76,3 +76,34 @@ that is rarely the bottleneck in CI.
   freezes its shape. Deviating from that shape (e.g., reordering
   budget checks after the LLM call) must be argued in a follow-up
   ADR.
+
+## Amendments
+
+ADR 0017 (node attributes over new kinds) narrows dimension 4 "Bounded
+resources":
+
+- The declared budgets are now `max_total_tokens` and `max_tool_calls`
+  only. `max_wall_clock` is retired as an agent-specific budget.
+- The `BudgetExceeded { kind: WallClock }` event variant is retired
+  pre-v0.1. Token and tool-call breaches continue to emit
+  `BudgetExceeded { kind: Tokens | ToolCalls }` and terminate the
+  node as before.
+- Wall-clock is now the universal `timeout:` attribute from ADR 0017,
+  applicable to every `NodeKind` (`agent`, `shell`). Breach emits
+  `NodeTimedOut { limit, elapsed }` and the node settles with
+  `NodeStatus::TimedOut` (ADR 0010 amendment via ADR 0017). This is
+  a hard terminator, not a strictness-mode dimension — enforcement
+  posture is always hard-fail and does not appear in the ADR 0016
+  trajectory table.
+- The other four dimensions (iteration, tool surface, effects,
+  non-determinism) are unchanged. The five-dimension framing and the
+  AgentPolicy aggregate remain the user-facing contract; dimension
+  4's internal membership shrank but its hard-fail guarantee is
+  intact.
+
+Rationale: wall-clock is orthogonal to the "agent-internal budget"
+concept — a shell node benefits from the same deadline shape, and
+modeling timeout as an agent-only budget forced a second enforcement
+path once shell nodes started needing it. The ADR 0017 brainstorm
+surfaced this as a category error and moved timeout to where it
+belongs.

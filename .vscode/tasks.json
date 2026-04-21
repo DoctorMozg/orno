@@ -1,0 +1,60 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo: build workspace",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--workspace"],
+      "problemMatcher": ["$rustc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "cargo: clippy (deny warnings)",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "problemMatcher": ["$rustc"],
+      "group": "build",
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "orno: run pr-review example",
+      "type": "shell",
+      "command": "cargo",
+      "args": [
+        "run",
+        "-p",
+        "orno-cli",
+        "--",
+        "run",
+        "examples/pr-review.yaml"
+      ],
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}

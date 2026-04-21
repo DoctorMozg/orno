@@ -4,6 +4,7 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CoreError {
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
@@ -16,6 +17,7 @@ pub enum CoreError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PipelineError {
     #[error("failed to read pipeline file {path}")]
     Io {
@@ -39,6 +41,7 @@ pub enum PipelineError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum NodeError {
     #[error("node `{id}` kind `{kind}` is not registered")]
     UnknownKind { id: String, kind: String },
@@ -55,6 +58,7 @@ pub enum NodeError {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum LlmError {
     #[error("LLM transport is not wired yet (skeleton stub)")]
     NotImplemented,

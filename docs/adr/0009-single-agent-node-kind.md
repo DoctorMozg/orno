@@ -1,6 +1,6 @@
 # ADR 0009 — Single `agent` node kind, no separate `llm` kind
 
-- Status: accepted
+- Status: accepted; node-kind set further narrowed by ADR 0017
 - Date: 2026-04-21
 
 ## Context
@@ -68,3 +68,19 @@ Two node kinds remain for LLM-free work: `shell` and `external`.
 - Inline vs. referenced agent config is a surface-level
   convenience — under the hood both materialize to the same
   `LoopAgent` (ADR 0006) before execution.
+
+## Amendments
+
+ADR 0017 (node attributes over new kinds) further narrows the v0.1
+`NodeKind` set:
+
+- v0.1 `NodeKind` variants are **`Agent`, `Shell`** (two, not three).
+  The `External` variant is removed per ADR 0017 §3 and is not gated
+  behind a flag.
+- The Decision section above says "Two node kinds remain for LLM-free
+  work: `shell` and `external`." Read as of v0.1 ship: one node kind
+  remains for LLM-free work — `shell`. The `external` slot returns
+  post-v0.1 as a `transport:` axis on existing kinds (ADR 0017 §3),
+  not as a sibling kind.
+- The collapse of `llm` into `agent` documented here is unchanged;
+  ADR 0017 does not revisit that decision.

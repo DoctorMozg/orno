@@ -1,6 +1,6 @@
 # ADR 0010 — Typed node results and process exit codes
 
-- Status: accepted
+- Status: accepted; shell output shape and `NodeStatus` extended by ADR 0017
 - Date: 2026-04-21
 
 ## Context
@@ -113,3 +113,39 @@ prompt, not by a runtime `FailNode` tool. Rationale:
 - Replay consumers gain the ability to reconstruct exit codes from the
   recorded event log alone, without re-running the pipeline or the
   agents inside it.
+
+## Amendments
+
+ADR 0017 (node attributes over new kinds) modifies two pieces of this
+ADR's contract:
+
+- **Shell output shape (breaking, pre-v0.1).** Shell nodes no longer
+  expose `nodes.<id>.output`. They produce three template context
+  fields instead:
+  - `nodes.<id>.stdout: String` — captured stdout (the former
+    `.output`).
+  - `nodes.<id>.stderr: String` — captured stderr.
+  - `nodes.<id>.exit_code: i32` — process exit code.
+
+  Agent nodes **keep** `nodes.<id>.output` (final assistant message).
+  The asymmetry is deliberate: shell has three channels worth
+  surfacing; an agent has one. Status derivation for shell is
+  unchanged — `Ok` iff exit code `0`, `Failed` otherwise.
+
+- **`NodeStatus` gains `TimedOut`.** The enum is now
+  `Ok | Failed | TimedOut` (still `#[non_exhaustive]`). `TimedOut`
+  is emitted when the universal `timeout:` attribute (ADR 0017)
+  breaches the wall-clock ceiling. Scheduler semantics match
+  `Failed`: descendants are skipped by default; `continue_on_error:
+  true` covers both `Failed` and `TimedOut` and both contribute to
+  exit code `2` unless covered. Serialized as the lowercase string
+  `"timed_out"` in templates and events.
+
+- **Exit-code table is unchanged**: `0` for all-covered, `1` for
+  load/infra error, `2` for any uncovered non-`Ok` node (now
+  including `TimedOut`).
+
+- **`BudgetExceeded { kind: WallClock }`** is retired via ADR 0005
+  amendment; replay consumers reconstructing exit codes from event
+  logs should expect `NodeTimedOut` where they previously saw the
+  wall-clock budget breach.

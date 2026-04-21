@@ -1,6 +1,6 @@
 # ADR 0004 — Defer the plugin protocol; design the wire format now
 
-- Status: accepted; node-kind set and extension model clarified by ADRs 0008–0009
+- Status: accepted; node-kind set and extension model clarified by ADRs 0008–0009; `NodeKind::External` stub removed by ADR 0017
 - Date: 2026-04-21
 
 ## Context
@@ -58,3 +58,12 @@ the v0.1.0 node-kind set and what "extensibility" means in practice.
 - `NodeKind::External` remains a stub and still reserves the
   subprocess-plugin slot for post-v0.1. The wire format for that
   slot is unchanged.
+
+ADR 0017 (node attributes over new kinds) supersedes the stub-retention
+posture above. The `NodeKind::External` variant is removed from the
+v0.1 `NodeKind` enum entirely. The whole-node-plugin deferral itself
+stands — no loader ships in v0.1 — but the subprocess-plugin slot is
+no longer a reserved kind. When subprocess transport returns post-v0.1,
+it takes a `transport: builtin | subprocess` axis shape on the existing
+kinds (ADR 0017 §3), not a sibling kind. ADR 0014's stabilization
+checklist carries forward into the ADR that reintroduces it.
