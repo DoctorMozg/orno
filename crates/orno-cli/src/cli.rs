@@ -40,6 +40,20 @@ pub enum Command {
         /// Repeatable; later files shadow earlier (ADR 0020).
         #[arg(long = "secrets-file", value_name = "PATH")]
         secrets_file: Vec<PathBuf>,
+
+        /// Verbose diagnostics: bumps tracing to `debug` (unless
+        /// `RUST_LOG` is already set) and lifts the default
+        /// `--stderr-tail-bytes` cap from 2 KB to 64 KB. Failure
+        /// records always appear regardless; this flag controls how
+        /// much detail they carry.
+        #[arg(short = 'v', long = "verbose")]
+        verbose: bool,
+
+        /// Cap on captured stderr (and similarly bounded payloads) in
+        /// failure diagnostics. Default 2048 in normal mode, 65536
+        /// when `--verbose`. An explicit value here always wins.
+        #[arg(long = "stderr-tail-bytes", value_name = "BYTES")]
+        stderr_tail_bytes: Option<usize>,
     },
 
     /// Load and validate a pipeline YAML without running it.

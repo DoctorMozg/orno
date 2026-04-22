@@ -40,20 +40,18 @@
     {
       "label": "orno: run pr-review example",
       "type": "shell",
-      "command": "cargo",
-      "args": [
-        "run",
-        "-p",
-        "orno-cli",
-        "--",
-        "run",
-        "examples/pr-review.yaml"
-      ],
+      "command": "cargo run -p orno-cli -- run examples/pr-review.yaml 2>&1",
+      "options": {
+        "env": {
+          "RUST_LOG": "info"
+        }
+      },
       "problemMatcher": ["$rustc"],
       "presentation": {
         "clear": true,
         "reveal": "always",
-        "panel": "shared"
+        "panel": "shared",
+        "echo": true
       }
     }
   ]

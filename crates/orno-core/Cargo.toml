@@ -41,3 +41,7 @@ async-trait = "0.1"
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }
+# Used in tests to capture and assert on `tracing::warn!` output from
+# failure paths inside the engine. Production code only depends on the
+# `tracing` macro crate; this is test-only.
+tracing-subscriber = { workspace = true }

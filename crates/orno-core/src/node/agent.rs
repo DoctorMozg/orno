@@ -15,20 +15,50 @@ use serde_json::json;
 use tracing::instrument;
 
 use crate::error::{LlmError, NodeError};
-use crate::events::{Event, EventSink};
+use crate::events::{Event, EventSink, LlmFailure};
 use crate::llm::{LlmRequest, LlmTransport};
 
 use super::{AgentNodeRequest, NodeExecutor, NodeRequest, NodeResponse};
 
+/// Default cap on the body excerpt captured into `LlmFailure::ApiError`
+/// when the executor was constructed without a caller-supplied bound.
+/// Mirrors `EngineConfig::default().max_output_bytes` so an embedder
+/// that builds the executor in isolation gets the same truncation
+/// policy the CLI threads through.
+const DEFAULT_BODY_EXCERPT_BYTES: usize = 2048;
+
 pub struct AgentExecutor {
     transport: Arc<dyn LlmTransport>,
     sink: Arc<dyn EventSink>,
+    /// Cap for body excerpts captured into `LlmFailure::ApiError`.
+    /// Decoupled from the engine's own `max_output_bytes` only at the
+    /// type level — the CLI passes them as the same value so a
+    /// truncated stderr tail and a truncated HTTP body excerpt look
+    /// alike to log readers.
+    body_excerpt_max_bytes: usize,
 }
 
 impl AgentExecutor {
     #[must_use]
-    pub fn new(transport: Arc<dyn LlmTransport>, sink: Arc<dyn EventSink>) -> Self {
-        Self { transport, sink }
+    pub fn new(
+        transport: Arc<dyn LlmTransport>,
+        sink: Arc<dyn EventSink>,
+        body_excerpt_max_bytes: usize,
+    ) -> Self {
+        Self {
+            transport,
+            sink,
+            body_excerpt_max_bytes,
+        }
+    }
+
+    /// Convenience constructor for embedders (and tests) that do not
+    /// thread an `EngineConfig` through to the executor. Picks the
+    /// same default the engine ships with so the wire format stays
+    /// consistent across construction sites.
+    #[must_use]
+    pub fn with_defaults(transport: Arc<dyn LlmTransport>, sink: Arc<dyn EventSink>) -> Self {
+        Self::new(transport, sink, DEFAULT_BODY_EXCERPT_BYTES)
     }
 }
 
@@ -111,11 +141,28 @@ impl NodeExecutor for AgentExecutor {
             })
             .await;
 
-        let response = self
-            .transport
-            .complete(llm_req)
-            .await
-            .map_err(|e| llm_error_to_node(node_id, e))?;
+        // Inspect the transport result before mapping to NodeError so a
+        // typed `LlmRequestFailed` lands on the wire next to the
+        // dangling `LlmRequestStarted`. Without this, an auth or
+        // rate-limit failure surfaces only as the generic
+        // `NodeFailure::ExecutorError` blob — log pipelines cannot page
+        // on `auth_failed` separately from a stray template error.
+        let response = match self.transport.complete(llm_req).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                let failure = LlmFailure::from_llm_error(&err, self.body_excerpt_max_bytes);
+                self.sink
+                    .record(Event::LlmRequestFailed {
+                        run_id: run_id.to_string(),
+                        node_id: node_id.to_string(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        failure,
+                    })
+                    .await;
+                return Err(llm_error_to_node(node_id, err));
+            }
+        };
 
         self.sink
             .record(Event::LlmResponseReceived {
@@ -148,8 +195,37 @@ fn llm_error_to_node(id: &str, err: LlmError) -> NodeError {
 mod tests {
     use super::*;
     use crate::events::InMemorySink;
-    use crate::llm::DummyTransport;
+    use crate::llm::{DummyTransport, LlmResponse};
     use crate::pipeline::{AgentPolicy, OnParseError};
+    use async_trait::async_trait;
+
+    /// Transport stub that returns a caller-chosen `LlmError`. Lives in
+    /// the test module because production code never wants a transport
+    /// that always fails — its only purpose is to exercise the
+    /// `LlmRequestFailed` emission path.
+    struct FailingTransport(LlmError);
+
+    impl FailingTransport {
+        fn auth() -> Self {
+            Self(LlmError::AuthFailed {
+                provider: "openai".into(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmTransport for FailingTransport {
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            // Cloning by reconstruction since LlmError isn't Clone — the
+            // stub holds a single error and the test calls it once.
+            Err(match &self.0 {
+                LlmError::AuthFailed { provider } => LlmError::AuthFailed {
+                    provider: provider.clone(),
+                },
+                other => panic!("FailingTransport got an unsupported variant: {other:?}"),
+            })
+        }
+    }
 
     fn policy() -> AgentPolicy {
         AgentPolicy {
@@ -180,7 +256,7 @@ mod tests {
     #[tokio::test]
     async fn emits_request_and_response_events_in_order() {
         let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::new(Arc::new(DummyTransport), sink.clone());
+        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink.clone());
 
         let resp = exec
             .execute("run_test", "n", agent_req())
@@ -218,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn nonempty_allowed_tools_rejected_as_unsupported() {
         let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::new(Arc::new(DummyTransport), sink);
+        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
         let req = NodeRequest::Agent(AgentNodeRequest {
             agent: "greeter".into(),
             initial_prompt: "say hi".into(),
@@ -243,10 +319,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_error_emits_llm_request_failed_before_propagating() {
+        // The Phase 3 invariant: a transport failure leaves a typed
+        // `LlmRequestFailed` on the wire next to the dangling
+        // `LlmRequestStarted`. Without this event, a downstream consumer
+        // can only see the generic `NodeFailure::ExecutorError` blob and
+        // cannot tell `auth_failed` from a stray template error.
+        let sink = Arc::new(InMemorySink::new());
+        let exec = AgentExecutor::with_defaults(Arc::new(FailingTransport::auth()), sink.clone());
+
+        let err = exec
+            .execute("run_test", "n", agent_req())
+            .await
+            .expect_err("transport failure must propagate as NodeError");
+        assert!(matches!(err, NodeError::Execution { .. }));
+
+        let events = sink.snapshot();
+        let mut started_idx = None;
+        let mut failed_idx = None;
+        for (i, env) in events.iter().enumerate() {
+            match &env.event {
+                Event::LlmRequestStarted { .. } => started_idx = Some(i),
+                Event::LlmRequestFailed { failure, .. } => {
+                    assert!(
+                        matches!(failure, LlmFailure::AuthFailed),
+                        "expected AuthFailed classification, got {failure:?}",
+                    );
+                    failed_idx = Some(i);
+                }
+                Event::LlmResponseReceived { .. } => {
+                    panic!("LlmResponseReceived must not fire on a transport failure");
+                }
+                _ => {}
+            }
+        }
+        let started = started_idx.expect("LlmRequestStarted must still fire");
+        let failed = failed_idx.expect("LlmRequestFailed must fire on transport error");
+        assert!(
+            started < failed,
+            "LlmRequestFailed must follow LlmRequestStarted in stream order",
+        );
+    }
+
+    #[tokio::test]
     async fn non_agent_request_rejected() {
         use crate::node::ShellNodeRequest;
         let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::new(Arc::new(DummyTransport), sink);
+        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
         let req = NodeRequest::Shell(ShellNodeRequest {
             command: "echo".into(),
             args: Vec::new(),

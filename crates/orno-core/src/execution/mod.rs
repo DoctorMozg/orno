@@ -7,7 +7,7 @@ pub mod scheduler;
 pub mod walker;
 
 pub use context::{Context, ContextConflict};
-pub use scheduler::{Engine, RunInputs};
+pub use scheduler::{Engine, EngineConfig, RunInputs};
 pub use walker::{DagWalker, NodeState};
 
 /// Generate a fresh run identifier in the form `run_<ULID>`.

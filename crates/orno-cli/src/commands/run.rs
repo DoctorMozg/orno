@@ -19,7 +19,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 
 use orno_core::events::{EventSink, InMemorySink};
-use orno_core::execution::{Engine, RunInputs, new_run_id};
+use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
 use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
@@ -41,11 +41,23 @@ pub struct RunFlags {
     pub inline_env: Vec<String>,
     pub env_files: Vec<PathBuf>,
     pub secrets_files: Vec<PathBuf>,
+    /// Threaded into `EngineConfig.verbose`. CLI controls what
+    /// counts as "verbose"; the engine just shapes its output.
+    pub verbose: bool,
+    /// Threaded into `EngineConfig.max_output_bytes`. The CLI
+    /// resolves the default-vs-verbose policy before this struct
+    /// is built.
+    pub max_output_bytes: usize,
 }
 
 pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     let pipeline = pipeline::load::load_from_path(path)
         .with_context(|| format!("loading pipeline `{}`", path.display()))?;
+
+    let engine_config = EngineConfig {
+        verbose: flags.verbose,
+        max_output_bytes: flags.max_output_bytes,
+    };
 
     let inputs = resolve_inputs(&pipeline, &flags)?;
 
@@ -62,15 +74,22 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let mut registry = NodeRegistry::new();
     registry.register("shell", Arc::new(ShellExecutor));
+    // Reuse the engine's `max_output_bytes` for the LLM body excerpt
+    // cap so a truncated stderr tail and a truncated HTTP error body
+    // look alike to a log reader (Phase 3 / ADR 0023).
     registry.register(
         "agent",
-        Arc::new(AgentExecutor::new(transport, sink_dyn.clone())),
+        Arc::new(AgentExecutor::new(
+            transport,
+            sink_dyn.clone(),
+            engine_config.max_output_bytes,
+        )),
     );
     let registry = Arc::new(registry);
 
     let templates = Arc::new(TemplateEngine::new());
 
-    let engine = Engine::new(sink_dyn, registry, templates);
+    let engine = Engine::new(sink_dyn, registry, templates, engine_config);
     let run_id = new_run_id();
 
     engine.run(&run_id, &pipeline, inputs).await?;
