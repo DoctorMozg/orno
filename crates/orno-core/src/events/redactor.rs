@@ -77,7 +77,9 @@ impl Redactor {
     pub fn redact_json(&self, v: &Value) -> Value {
         match v {
             Value::String(s) => Value::String(self.redact(s).into_owned()),
-            Value::Array(items) => Value::Array(items.iter().map(|i| self.redact_json(i)).collect()),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|i| self.redact_json(i)).collect())
+            }
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {

@@ -4,6 +4,7 @@
 //! crate and are exercised (with dummy implementations) from the skeleton
 //! onward. See `docs/adr/0003-event-log-from-day-one.md`.
 
+pub mod agent;
 pub mod budget;
 pub mod config;
 pub mod error;
@@ -14,7 +15,7 @@ pub mod node;
 pub mod pipeline;
 pub mod telemetry;
 
-pub use error::{CoreError, LlmError, NodeError, PipelineError};
+pub use error::{AgentError, CoreError, LlmError, NodeError, PipelineError};
 
 /// Render the pipeline JSON Schema as a pretty-printed string. Used by the
 /// `orno schema` subcommand; IDEs can reference the committed file via a

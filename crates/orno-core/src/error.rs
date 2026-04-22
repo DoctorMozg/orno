@@ -13,6 +13,9 @@ pub enum CoreError {
     Node(#[from] NodeError),
 
     #[error(transparent)]
+    Agent(#[from] AgentError),
+
+    #[error(transparent)]
     Llm(#[from] LlmError),
 }
 
@@ -73,6 +76,32 @@ pub enum NodeError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+/// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Phase 4
+/// carries the three variants needed by the single-shot `LoopAgent`;
+/// Phase 5 will grow terminal strictness variants (`IterationLimitExceeded`,
+/// `UnknownToolCalled`, `BudgetExceeded`, `ParseFailed`) per ADR 0005.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// The agent policy is internally inconsistent (e.g. `max_iterations`
+    /// is zero). Raised before any LLM call so the operator sees a
+    /// configuration error rather than a mid-run transport failure.
+    #[error("invalid agent policy: {0}")]
+    InvalidPolicy(String),
+
+    /// A policy feature is declared but not yet honored in this phase
+    /// (e.g. non-empty `allowed_tools` before Phase 5 wires tool
+    /// handlers). Fails fast so strict pipelines never silently lose
+    /// policy.
+    #[error("agent uses feature `{0}` not yet supported")]
+    UnsupportedYet(String),
+
+    /// LLM transport returned a typed error. Use `source()` to reach the
+    /// underlying `LlmError` for classification.
+    #[error(transparent)]
+    Llm(#[from] LlmError),
 }
 
 #[derive(Debug, Error)]

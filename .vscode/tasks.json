@@ -38,9 +38,9 @@
       }
     },
     {
-      "label": "orno: run pr-review example",
+      "label": "orno: run commit-digest example",
       "type": "shell",
-      "command": "cargo run -p orno-cli -- run examples/pr-review.yaml -v 2>&1",
+      "command": "cargo run -p orno-cli -- run examples/commit-digest.yaml --secrets-file .env.secrets -v 2>&1",
       "options": {
         "env": {
           "RUST_LOG": "info"

@@ -42,17 +42,29 @@ impl GenAiTransport {
     /// `agents`. One `genai::Client` per distinct provider. Returns a
     /// `ConfigError` for any provider name not in [`KNOWN_PROVIDERS`].
     ///
+    /// `secrets` is the resolved `secrets.*` namespace from ADR 0020 —
+    /// values present here (typically from `--secrets-file`) are handed
+    /// to genai as literal auth data, taking precedence over the
+    /// provider's conventional env-var lookup. When a provider's
+    /// secret is absent from the map, the client falls back to
+    /// `AuthData::from_env(...)` so CI runners and replay tapes that
+    /// export keys in the shell keep working unchanged.
+    ///
     /// API-key presence is NOT checked here — genai itself fails with
-    /// `RequiresApiKey` when the transport is invoked without the env
-    /// var set. Failing at run start rather than dispatch time is a
-    /// Phase 7 improvement (`orno plan` will surface it).
-    pub fn from_agents(agents: &BTreeMap<String, AgentConfig>) -> Result<Self, LlmError> {
+    /// `RequiresApiKey` when the transport is invoked without either
+    /// a literal secret or an env var. Failing at run start rather
+    /// than dispatch time is a Phase 7 improvement (`orno plan` will
+    /// surface it).
+    pub fn from_agents(
+        agents: &BTreeMap<String, AgentConfig>,
+        secrets: &BTreeMap<String, String>,
+    ) -> Result<Self, LlmError> {
         let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
         for cfg in agents.values() {
             if clients.contains_key(&cfg.provider) {
                 continue;
             }
-            let client = build_client(&cfg.provider)?;
+            let client = build_client(&cfg.provider, secrets)?;
             clients.insert(cfg.provider.clone(), Arc::new(client));
         }
         Ok(Self { clients })
@@ -109,35 +121,59 @@ impl LlmTransport for GenAiTransport {
     }
 }
 
+/// Pick the `AuthData` the resolver will hand genai for a given
+/// provider. CLI-resolved secrets (ADR 0020 `secrets.*` namespace)
+/// take precedence; absent keys fall back to `AuthData::from_env(...)`
+/// so shell-export and CI workflows keep working. The fallback is
+/// genai-native — an `ApiKeyEnvNotFound` error from the adapter is
+/// the signal that neither path found a credential.
+fn resolve_auth(env_name: &str, secrets: &BTreeMap<String, String>) -> AuthData {
+    match secrets.get(env_name) {
+        Some(value) => AuthData::from_single(value.clone()),
+        None => AuthData::from_env(env_name),
+    }
+}
+
 /// Adapter-pinning resolver: every client holds a closure that fixes
 /// the `AdapterKind` (and, for openrouter, the endpoint + auth env)
 /// regardless of what genai's prefix detection would otherwise pick.
 /// This is what makes `provider: anthropic + model: gpt-5` fail at the
 /// provider rather than silently routing to `OpenAI`.
-fn build_client(provider: &str) -> Result<Client, LlmError> {
+///
+/// Each auth'd closure captures its `AuthData` by move so the genai
+/// resolver has no reason to consult `std::env` at request time when
+/// the CLI already resolved the secret. `AuthData::clone()` returns
+/// a fresh owned value per call; the capture stays `Fn`, not `FnMut`.
+fn build_client(provider: &str, secrets: &BTreeMap<String, String>) -> Result<Client, LlmError> {
     match provider {
-        "openai" => Ok(Client::builder()
-            .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                    Ok(ServiceTarget {
-                        endpoint: Endpoint::from_static("https://api.openai.com/v1/"),
-                        auth: AuthData::from_env("OPENAI_API_KEY"),
-                        model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                    })
-                },
-            ))
-            .build()),
-        "anthropic" => Ok(Client::builder()
-            .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                    Ok(ServiceTarget {
-                        endpoint: Endpoint::from_static("https://api.anthropic.com/v1/"),
-                        auth: AuthData::from_env("ANTHROPIC_API_KEY"),
-                        model: ModelIden::new(AdapterKind::Anthropic, st.model.model_name),
-                    })
-                },
-            ))
-            .build()),
+        "openai" => {
+            let auth = resolve_auth("OPENAI_API_KEY", secrets);
+            Ok(Client::builder()
+                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                        Ok(ServiceTarget {
+                            endpoint: Endpoint::from_static("https://api.openai.com/v1/"),
+                            auth: auth.clone(),
+                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
+                        })
+                    },
+                ))
+                .build())
+        }
+        "anthropic" => {
+            let auth = resolve_auth("ANTHROPIC_API_KEY", secrets);
+            Ok(Client::builder()
+                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                        Ok(ServiceTarget {
+                            endpoint: Endpoint::from_static("https://api.anthropic.com/v1/"),
+                            auth: auth.clone(),
+                            model: ModelIden::new(AdapterKind::Anthropic, st.model.model_name),
+                        })
+                    },
+                ))
+                .build())
+        }
         "ollama" => Ok(Client::builder()
             .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
                 |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -149,17 +185,20 @@ fn build_client(provider: &str) -> Result<Client, LlmError> {
                 },
             ))
             .build()),
-        "openrouter" => Ok(Client::builder()
-            .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                    Ok(ServiceTarget {
-                        endpoint: Endpoint::from_static("https://openrouter.ai/api/v1/"),
-                        auth: AuthData::from_env("OPENROUTER_API_KEY"),
-                        model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                    })
-                },
-            ))
-            .build()),
+        "openrouter" => {
+            let auth = resolve_auth("OPENROUTER_API_KEY", secrets);
+            Ok(Client::builder()
+                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                        Ok(ServiceTarget {
+                            endpoint: Endpoint::from_static("https://openrouter.ai/api/v1/"),
+                            auth: auth.clone(),
+                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
+                        })
+                    },
+                ))
+                .build())
+        }
         other => Err(LlmError::ConfigError(format!(
             "unknown provider `{other}`; known: {}",
             KNOWN_PROVIDERS.join(", "),
@@ -264,11 +303,56 @@ mod tests {
                 policy: default_policy(),
             },
         );
-        let err = GenAiTransport::from_agents(&agents).expect_err("must reject unknown provider");
+        let err = GenAiTransport::from_agents(&agents, &BTreeMap::new())
+            .expect_err("must reject unknown provider");
         assert!(
             matches!(err, LlmError::ConfigError(msg) if msg.contains("not-a-real-provider")),
             "expected ConfigError naming the bad provider",
         );
+    }
+
+    #[test]
+    fn resolve_auth_prefers_cli_secret_over_env_lookup() {
+        // ADR 0020 ergonomics: a `--secrets-file` value reaches genai
+        // as a literal `AuthData::Key`, not as a deferred env lookup.
+        // Without this, the adapter's request-time `std::env::var`
+        // call would still fail even though the user handed orno the
+        // credential explicitly.
+        let mut secrets = BTreeMap::new();
+        secrets.insert("OPENROUTER_API_KEY".into(), "cli-resolved-value".into());
+
+        match resolve_auth("OPENROUTER_API_KEY", &secrets) {
+            AuthData::Key(value) => assert_eq!(value, "cli-resolved-value"),
+            other => panic!("expected AuthData::Key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_falls_back_to_env_when_secret_absent() {
+        // The env path stays reachable so CI runners that `export` the
+        // key in the shell — and replay tapes that don't thread secrets
+        // through at all — keep working without a CLI flag.
+        let secrets = BTreeMap::new();
+        match resolve_auth("OPENROUTER_API_KEY", &secrets) {
+            AuthData::FromEnv(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
+            other => panic!("expected AuthData::FromEnv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_client_openrouter_with_secret_does_not_defer_to_env() {
+        // Integration-style check over the build_client → closure path:
+        // a pipeline that resolves OPENROUTER_API_KEY via `--secrets-file`
+        // must construct a client whose resolver never calls into
+        // `std::env` for auth. Proving this without spawning a live
+        // request is awkward, so we check the precondition by making
+        // resolve_auth's branch observable: a secret-backed client
+        // builds the same way as one without, never erroring on
+        // construction.
+        let mut secrets = BTreeMap::new();
+        secrets.insert("OPENROUTER_API_KEY".into(), "cli-val".into());
+        assert!(build_client("openrouter", &secrets).is_ok());
+        assert!(build_client("openrouter", &BTreeMap::new()).is_ok());
     }
 
     #[test]

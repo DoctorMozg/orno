@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use orno_core::events::{EventSink, StreamingSink};
+use orno_core::events::{EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
 use orno_core::node::NodeRegistry;
@@ -66,21 +66,32 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     let transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
         _ => Arc::new(
-            GenAiTransport::from_agents(&pipeline.agents)
+            GenAiTransport::from_agents(&pipeline.agents, &inputs.secrets)
                 .context("constructing LLM transport from pipeline agents")?,
         ),
     };
 
+    // Build the redactor once from the resolved `secrets.*` map and
+    // share it with the agent executor. The engine builds its own
+    // instance inside `Engine::run` from the same secret map — the two
+    // instances carry the same value list, so redaction is consistent
+    // across agent-emitted `LlmRequestStarted` excerpts and
+    // scheduler-emitted `NodeFailure` tails (ADR 0020 / 0024). Using
+    // an `Arc` avoids cloning the secret-value list per `LlmRequest`.
+    let redactor = Arc::new(Redactor::new(&inputs.secrets));
+
     let mut registry = NodeRegistry::new();
     registry.register("shell", Arc::new(ShellExecutor));
     // Reuse the engine's `max_output_bytes` for the LLM body excerpt
-    // cap so a truncated stderr tail and a truncated HTTP error body
-    // look alike to a log reader (Phase 3 / ADR 0023).
+    // cap so a truncated stderr tail, a truncated HTTP error body, and
+    // a truncated prompt/response excerpt all look alike to a log
+    // reader (ADR 0023 / 0024).
     registry.register(
         "agent",
         Arc::new(AgentExecutor::new(
             transport,
             sink.clone(),
+            redactor,
             engine_config.max_output_bytes,
         )),
     );

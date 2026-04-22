@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=../schemas/pipeline.schema.json
+# Commit-digest pipeline. Pulls a short window of recent git activity
+# out of the current working tree (no remote refs required) and asks
+# two chained agents to turn it into a plain-English status report
+# plus three suggested next steps.
+#
+# Runs end-to-end on Phase 4: every agent has an empty allowed_tools
+# list, so only a single LLM round-trip executes per agent node.
+#
+# Phase 5 tool-evolution path (not yet wired):
+#   - status_writer gains `Read` + `Bash` to open files named in the
+#     log and confirm what actually changed
+#   - next_steps gains `WebFetch` to follow linked PR / issue URLs
+#   - an `mcp_servers:` block adds a `github` MCP so both agents can
+#     query live PR / branch state instead of inferring from commit
+#     subjects alone
+#   - a third agent writes the digest to CHANGELOG.md via `Write`
+#
+# Prereqs:
+#   - $OPENROUTER_API_KEY in the environment
+#   - `git` on PATH, invoked from a repo with at least one commit
+
+version: 1
+
+vars:
+  log_depth: 10
+
+agents:
+  status_writer:
+    model: google/gemma-4-31b-it
+    provider: openrouter
+    system: |
+      You turn a short log of recent git activity into a plain-English
+      status report. Keep it to one dense paragraph (five sentences max).
+      Do not invent work that is not visible in the input. Mention the
+      working-tree state only if it shows unstaged or untracked files.
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1500
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+
+  next_steps:
+    model: google/gemma-4-31b-it
+    provider: openrouter
+    system: |
+      You convert a status digest into exactly three concrete next steps.
+      Each step is one imperative sentence. No hedging, no preamble, no
+      trailing commentary. Number them 1., 2., 3.
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 800
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+
+nodes:
+  - id: recent_commits
+    kind: shell
+    command: git
+    args: ["log", "--pretty=format:%h %s", "-n", "{{ vars.log_depth }}"]
+
+  - id: working_tree
+    kind: shell
+    command: git
+    args: ["status", "--short"]
+
+  - id: digest
+    kind: agent
+    agent: status_writer
+    needs: [recent_commits, working_tree]
+    initial_prompt: |
+      Recent commits (newest first):
+      {{ nodes.recent_commits.stdout }}
+
+      Working tree (empty means a clean tree):
+      {{ nodes.working_tree.stdout }}
+
+      Write the status report now.
+
+  - id: plan
+    kind: agent
+    agent: next_steps
+    needs: [digest]
+    initial_prompt: |
+      Status digest:
+      {{ nodes.digest.content }}
+
+      List the three next steps.

@@ -87,25 +87,36 @@ pub enum Event {
         reason: String,
     },
     /// Emitted immediately before the transport is called. Carries
-    /// provider + model identifiers but never the prompt — prompt
-    /// bodies may contain rendered `secrets.*` values (ADR 0020) and
-    /// must stay out of the event log. The response content is
-    /// propagated through `NodeResponse.output`, not through events.
+    /// provider + model identifiers plus redacted head excerpts of the
+    /// rendered prompt and optional system prompt (ADR 0024). The
+    /// excerpts are passed through the per-run `Redactor` so rendered
+    /// `secrets.*` values never reach the wire (ADR 0020), and bounded
+    /// by the engine's `max_output_bytes` so a megabyte-long prompt
+    /// does not flood the event log — the same cap used for
+    /// `LlmFailure::ApiError.body_excerpt` and shell stderr tails.
+    /// `system_excerpt` is `None` when the agent config declared no
+    /// system prompt, distinct from an empty string.
     LlmRequestStarted {
         run_id: String,
         node_id: String,
         provider: String,
         model: String,
+        prompt_excerpt: String,
+        system_excerpt: Option<String>,
     },
     /// Emitted immediately after a successful transport call. Carries
-    /// the normalized `finish_reason` and token usage so downstream
-    /// budget accounting has a numeric signal without parsing
-    /// provider-specific payloads.
+    /// the normalized `finish_reason`, token usage, and a redacted
+    /// head excerpt of the model's response so downstream tools can
+    /// surface what the model actually produced without folding the
+    /// unbounded `NodeResponse.output` payload. Excerpt redaction and
+    /// truncation follow the same rules as `LlmRequestStarted`
+    /// (ADR 0024).
     LlmResponseReceived {
         run_id: String,
         node_id: String,
         finish_reason: Option<String>,
         usage: Option<Usage>,
+        content_excerpt: String,
     },
     /// Emitted when the transport call returned `Err` — paired with the
     /// preceding `LlmRequestStarted` so log pipelines can detect a
@@ -265,7 +276,13 @@ impl LlmFailure {
 /// the actionable signal at the *front* (status text, JSON
 /// `error.message`); truncating from the head would drop exactly that
 /// — opposite of stderr tails where the cause sits at the end.
-fn truncate_excerpt(s: &str, max_bytes: usize) -> String {
+///
+/// The same head-retention semantics apply to prompt and response
+/// excerpts on `LlmRequestStarted` / `LlmResponseReceived` (ADR 0024):
+/// a rendered prompt starts with the operator instruction, and a model
+/// response starts with the direct answer — truncating either from
+/// the back keeps the part a human would actually read first.
+pub(crate) fn truncate_excerpt(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }

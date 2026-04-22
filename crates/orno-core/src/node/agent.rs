@@ -1,77 +1,70 @@
-//! Agent node executor — Phase 4 single-shot implementation.
+//! Adapter between the `NodeExecutor` seam and the [`Agent`] seam.
 //!
-//! Composes an `LlmTransport` (ADR 0002) with the event sink so the
-//! loop emits `LlmRequestStarted` + `LlmResponseReceived` around each
-//! transport call. Phase 4 runs exactly one LLM round-trip;
-//! iteration, tool dispatch, and budget enforcement (ADR 0005
-//! dimensions 1–4) land with Phase 5. `allow_mutations` and
-//! `allow_network` are declared on the policy but unenforced — they
-//! only start mattering when tools exist.
+//! `AgentExecutor` translates `NodeRequest::Agent` into an `AgentRequest`,
+//! delegates to an `Arc<dyn Agent>`, and packages the `AgentOutput` back
+//! into `NodeResponse` JSON. All loop behavior — LLM dispatch, event
+//! emission, policy checks — lives inside the injected `Agent` impl
+//! (`LoopAgent` today; Phase 5 grows it).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::instrument;
 
-use crate::error::{LlmError, NodeError};
-use crate::events::{Event, EventSink, LlmFailure};
-use crate::llm::{LlmRequest, LlmTransport};
+use crate::agent::{Agent, AgentOutput, AgentRequest, LoopAgent};
+use crate::error::{AgentError, NodeError};
+use crate::events::{EventSink, Redactor};
+use crate::llm::LlmTransport;
 
 use super::{AgentNodeRequest, NodeExecutor, NodeRequest, NodeResponse};
 
-/// Default cap on the body excerpt captured into `LlmFailure::ApiError`
-/// when the executor was constructed without a caller-supplied bound.
-/// Mirrors `EngineConfig::default().max_output_bytes` so an embedder
-/// that builds the executor in isolation gets the same truncation
-/// policy the CLI threads through.
-const DEFAULT_BODY_EXCERPT_BYTES: usize = 2048;
-
 pub struct AgentExecutor {
-    transport: Arc<dyn LlmTransport>,
-    sink: Arc<dyn EventSink>,
-    /// Cap for body excerpts captured into `LlmFailure::ApiError`.
-    /// Decoupled from the engine's own `max_output_bytes` only at the
-    /// type level — the CLI passes them as the same value so a
-    /// truncated stderr tail and a truncated HTTP body excerpt look
-    /// alike to log readers.
-    body_excerpt_max_bytes: usize,
+    agent: Arc<dyn Agent>,
 }
 
 impl AgentExecutor {
+    /// Construct an adapter backed by a caller-supplied `Agent`. Primary
+    /// construction point for embedders and tests that want to swap in
+    /// a fake agent implementation.
+    #[must_use]
+    pub fn from_agent(agent: Arc<dyn Agent>) -> Self {
+        Self { agent }
+    }
+
+    /// Construct an adapter backed by a fresh [`LoopAgent`]. The CLI
+    /// hands transport + sink + redactor + body-excerpt cap; the
+    /// executor wires them into the default agent. The redactor is
+    /// shared with the engine so `secrets.*` values redact
+    /// consistently across agent-emitted `LlmRequestStarted`
+    /// excerpts and scheduler-emitted `NodeFailure` tails
+    /// (ADR 0020 / 0024).
     #[must_use]
     pub fn new(
         transport: Arc<dyn LlmTransport>,
         sink: Arc<dyn EventSink>,
+        redactor: Arc<Redactor>,
         body_excerpt_max_bytes: usize,
     ) -> Self {
-        Self {
+        Self::from_agent(Arc::new(LoopAgent::new(
             transport,
             sink,
+            redactor,
             body_excerpt_max_bytes,
-        }
+        )))
     }
 
-    /// Convenience constructor for embedders (and tests) that do not
-    /// thread an `EngineConfig` through to the executor. Picks the
-    /// same default the engine ships with so the wire format stays
-    /// consistent across construction sites.
+    /// Construct an adapter backed by a [`LoopAgent`] with the default
+    /// body-excerpt cap. Mirrors `LoopAgent::with_defaults` so embedders
+    /// that don't thread an `EngineConfig` get the same truncation
+    /// policy the CLI threads through.
     #[must_use]
     pub fn with_defaults(transport: Arc<dyn LlmTransport>, sink: Arc<dyn EventSink>) -> Self {
-        Self::new(transport, sink, DEFAULT_BODY_EXCERPT_BYTES)
+        Self::from_agent(Arc::new(LoopAgent::with_defaults(transport, sink)))
     }
 }
 
 #[async_trait]
 impl NodeExecutor for AgentExecutor {
-    #[instrument(
-        skip(self, req),
-        fields(
-            node.id = %node_id,
-            node.kind = "agent",
-            pipeline.run_id = %run_id,
-        ),
-    )]
     async fn execute(
         &self,
         run_id: &str,
@@ -79,7 +72,7 @@ impl NodeExecutor for AgentExecutor {
         req: NodeRequest,
     ) -> Result<NodeResponse, NodeError> {
         let NodeRequest::Agent(AgentNodeRequest {
-            agent: _,
+            agent,
             initial_prompt,
             system,
             provider,
@@ -98,137 +91,99 @@ impl NodeExecutor for AgentExecutor {
             });
         };
 
-        // Phase 4 is single-shot with no tool dispatch. Misconfigured
-        // pipelines fail fast rather than silently ignoring the
-        // declared policy — the whole point of strict loops is that
-        // policy is load-bearing, not cosmetic.
-        if !allowed_tools.is_empty() {
-            return Err(NodeError::UnsupportedYet {
-                id: node_id.to_string(),
-                feature: "allowed_tools (Phase 5)".to_string(),
-            });
-        }
-        if policy.max_iterations == 0 {
-            return Err(NodeError::Execution {
-                id: node_id.to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "max_iterations must be >= 1",
-                )
-                .into(),
-            });
-        }
-
-        let llm_req = LlmRequest {
-            provider: provider.clone(),
-            model: model.clone(),
-            prompt: initial_prompt,
+        let agent_req = AgentRequest {
+            agent_name: agent,
+            initial_prompt,
             system,
-            temperature: None,
-            // Phase 4 treats the agent's budget as a per-call cap
-            // until the loop lands. Clamp into u32 because genai's
-            // ChatOptions uses u32; a user who wrote u64::MAX in YAML
-            // gets u32::MAX sent over the wire. Treat `0` as "unset"
-            // — OpenAI and Anthropic read `max_tokens: 0` as a zero
-            // completion-token cap and return empty responses, so we
-            // must omit the field entirely when the budget is
-            // unconfigured.
-            max_tokens: (policy.max_total_tokens > 0)
-                .then(|| u32::try_from(policy.max_total_tokens).unwrap_or(u32::MAX)),
+            provider,
+            model,
+            policy,
+            allowed_tools,
         };
 
-        self.sink
-            .record(Event::LlmRequestStarted {
-                run_id: run_id.to_string(),
-                node_id: node_id.to_string(),
-                provider: provider.clone(),
-                model: model.clone(),
-            })
-            .await;
-
-        // Inspect the transport result before mapping to NodeError so a
-        // typed `LlmRequestFailed` lands on the wire next to the
-        // dangling `LlmRequestStarted`. Without this, an auth or
-        // rate-limit failure surfaces only as the generic
-        // `NodeFailure::ExecutorError` blob — log pipelines cannot page
-        // on `auth_failed` separately from a stray template error.
-        let response = match self.transport.complete(llm_req).await {
-            Ok(resp) => resp,
-            Err(err) => {
-                let failure = LlmFailure::from_llm_error(&err, self.body_excerpt_max_bytes);
-                self.sink
-                    .record(Event::LlmRequestFailed {
-                        run_id: run_id.to_string(),
-                        node_id: node_id.to_string(),
-                        provider: provider.clone(),
-                        model: model.clone(),
-                        failure,
-                    })
-                    .await;
-                return Err(llm_error_to_node(node_id, err));
-            }
-        };
-
-        self.sink
-            .record(Event::LlmResponseReceived {
-                run_id: run_id.to_string(),
-                node_id: node_id.to_string(),
-                finish_reason: response.finish_reason.clone(),
-                usage: response.usage.clone(),
-            })
-            .await;
+        let output = self
+            .agent
+            .run(run_id, node_id, agent_req)
+            .await
+            .map_err(|err| agent_error_to_node(node_id, err))?;
 
         Ok(NodeResponse {
             node_id: node_id.to_string(),
-            output: json!({
-                "content": response.content,
-                "finish_reason": response.finish_reason,
-                "usage": response.usage,
-            }),
+            output: agent_output_to_json(&output),
         })
     }
 }
 
-fn llm_error_to_node(id: &str, err: LlmError) -> NodeError {
-    NodeError::Execution {
-        id: id.to_string(),
-        source: Box::new(err),
+/// Translate an [`AgentError`] into a [`NodeError`] preserving the
+/// two user-facing distinctions that the dispatch layer already
+/// surfaces: "feature not ready yet" stays `UnsupportedYet` so strict
+/// pipelines get the same classification they got pre-adapter;
+/// everything else collapses into `Execution` with the agent error as
+/// the `source()` chain.
+fn agent_error_to_node(id: &str, err: AgentError) -> NodeError {
+    match err {
+        AgentError::UnsupportedYet(feature) => NodeError::UnsupportedYet {
+            id: id.to_string(),
+            feature,
+        },
+        other => NodeError::Execution {
+            id: id.to_string(),
+            source: Box::new(other),
+        },
     }
+}
+
+fn agent_output_to_json(out: &AgentOutput) -> serde_json::Value {
+    json!({
+        "content": out.content,
+        "finish_reason": out.finish_reason,
+        "usage": out.usage,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, AgentOutput, AgentRequest};
+    use crate::error::AgentError;
     use crate::events::InMemorySink;
-    use crate::llm::{DummyTransport, LlmResponse};
+    use crate::llm::{DummyTransport, Usage};
     use crate::pipeline::{AgentPolicy, OnParseError};
-    use async_trait::async_trait;
 
-    /// Transport stub that returns a caller-chosen `LlmError`. Lives in
-    /// the test module because production code never wants a transport
-    /// that always fails — its only purpose is to exercise the
-    /// `LlmRequestFailed` emission path.
-    struct FailingTransport(LlmError);
+    /// Hand-rolled fake `Agent` for adapter tests. Returns a preset
+    /// output or a preset error — enough to exercise the two adapter
+    /// branches without pulling in a transport.
+    struct FakeAgent {
+        result: std::sync::Mutex<Option<Result<AgentOutput, AgentError>>>,
+    }
 
-    impl FailingTransport {
-        fn auth() -> Self {
-            Self(LlmError::AuthFailed {
-                provider: "openai".into(),
+    impl FakeAgent {
+        fn ok(out: AgentOutput) -> Arc<Self> {
+            Arc::new(Self {
+                result: std::sync::Mutex::new(Some(Ok(out))),
+            })
+        }
+
+        fn err(err: AgentError) -> Arc<Self> {
+            Arc::new(Self {
+                result: std::sync::Mutex::new(Some(Err(err))),
             })
         }
     }
 
     #[async_trait]
-    impl LlmTransport for FailingTransport {
-        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
-            // Cloning by reconstruction since LlmError isn't Clone — the
-            // stub holds a single error and the test calls it once.
-            Err(match &self.0 {
-                LlmError::AuthFailed { provider } => LlmError::AuthFailed {
-                    provider: provider.clone(),
-                },
-                other => panic!("FailingTransport got an unsupported variant: {other:?}"),
-            })
+    impl Agent for FakeAgent {
+        async fn run(
+            &self,
+            _run_id: &str,
+            _node_id: &str,
+            _req: AgentRequest,
+        ) -> Result<AgentOutput, AgentError> {
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("FakeAgent called more than once")
         }
     }
 
@@ -246,7 +201,7 @@ mod tests {
         }
     }
 
-    fn agent_req() -> NodeRequest {
+    fn agent_node_request() -> NodeRequest {
         NodeRequest::Agent(AgentNodeRequest {
             agent: "greeter".into(),
             initial_prompt: "say hi".into(),
@@ -259,61 +214,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_request_and_response_events_in_order() {
-        let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink.clone());
+    async fn wraps_agent_output_into_node_response_json() {
+        let fake = FakeAgent::ok(AgentOutput {
+            content: "hello".into(),
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+            }),
+        });
+        let exec = AgentExecutor::from_agent(fake);
 
         let resp = exec
-            .execute("run_test", "n", agent_req())
+            .execute("run_test", "n", agent_node_request())
             .await
-            .expect("dummy transport always succeeds");
+            .expect("adapter must forward successful agent output");
 
         assert_eq!(resp.node_id, "n");
-        assert!(resp.output["content"].as_str().unwrap().contains("[dummy]"));
-
-        let events = sink.snapshot();
-        let starts = events
-            .iter()
-            .enumerate()
-            .find_map(|(i, e)| matches!(e.event, Event::LlmRequestStarted { .. }).then_some(i))
-            .expect("LlmRequestStarted emitted");
-        let recvs = events
-            .iter()
-            .enumerate()
-            .find_map(|(i, e)| matches!(e.event, Event::LlmResponseReceived { .. }).then_some(i))
-            .expect("LlmResponseReceived emitted");
-        assert!(
-            starts < recvs,
-            "LlmRequestStarted must precede LlmResponseReceived",
-        );
-
-        if let Event::LlmRequestStarted {
-            provider, model, ..
-        } = &events[starts].event
-        {
-            assert_eq!(provider, "openai");
-            assert_eq!(model, "gpt-5");
-        }
+        assert_eq!(resp.output["content"], "hello");
+        assert_eq!(resp.output["finish_reason"], "stop");
+        assert_eq!(resp.output["usage"]["total_tokens"], 7);
     }
 
     #[tokio::test]
-    async fn nonempty_allowed_tools_rejected_as_unsupported() {
-        let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
-        let req = NodeRequest::Agent(AgentNodeRequest {
-            agent: "greeter".into(),
-            initial_prompt: "say hi".into(),
-            system: None,
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-            policy: policy(),
-            allowed_tools: vec!["Bash".into()],
-        });
+    async fn unsupported_yet_error_preserves_node_classification() {
+        // The adapter must keep the "feature not ready" distinction that
+        // strict pipelines rely on — collapsing it into Execution would
+        // make unrelated failures indistinguishable from policy drift.
+        let fake = FakeAgent::err(AgentError::UnsupportedYet("allowed_tools (Phase 5)".into()));
+        let exec = AgentExecutor::from_agent(fake);
 
         let err = exec
-            .execute("run_test", "n", req)
+            .execute("run_test", "n", agent_node_request())
             .await
-            .expect_err("tools must be refused in Phase 4");
+            .expect_err("UnsupportedYet must propagate");
         match err {
             NodeError::UnsupportedYet { id, feature } => {
                 assert_eq!(id, "n");
@@ -324,46 +259,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_error_emits_llm_request_failed_before_propagating() {
-        // The Phase 3 invariant: a transport failure leaves a typed
-        // `LlmRequestFailed` on the wire next to the dangling
-        // `LlmRequestStarted`. Without this event, a downstream consumer
-        // can only see the generic `NodeFailure::ExecutorError` blob and
-        // cannot tell `auth_failed` from a stray template error.
-        let sink = Arc::new(InMemorySink::new());
-        let exec = AgentExecutor::with_defaults(Arc::new(FailingTransport::auth()), sink.clone());
+    async fn invalid_policy_error_surfaces_as_execution_with_source() {
+        let fake = FakeAgent::err(AgentError::InvalidPolicy(
+            "max_iterations must be >= 1".into(),
+        ));
+        let exec = AgentExecutor::from_agent(fake);
 
         let err = exec
-            .execute("run_test", "n", agent_req())
+            .execute("run_test", "n", agent_node_request())
             .await
-            .expect_err("transport failure must propagate as NodeError");
-        assert!(matches!(err, NodeError::Execution { .. }));
-
-        let events = sink.snapshot();
-        let mut started_idx = None;
-        let mut failed_idx = None;
-        for (i, env) in events.iter().enumerate() {
-            match &env.event {
-                Event::LlmRequestStarted { .. } => started_idx = Some(i),
-                Event::LlmRequestFailed { failure, .. } => {
-                    assert!(
-                        matches!(failure, LlmFailure::AuthFailed),
-                        "expected AuthFailed classification, got {failure:?}",
-                    );
-                    failed_idx = Some(i);
-                }
-                Event::LlmResponseReceived { .. } => {
-                    panic!("LlmResponseReceived must not fire on a transport failure");
-                }
-                _ => {}
+            .expect_err("InvalidPolicy must propagate as Execution");
+        match err {
+            NodeError::Execution { id, source } => {
+                assert_eq!(id, "n");
+                assert!(
+                    source.to_string().contains("invalid agent policy"),
+                    "expected AgentError display in source chain, got {source}",
+                );
             }
+            other => panic!("expected Execution, got {other:?}"),
         }
-        let started = started_idx.expect("LlmRequestStarted must still fire");
-        let failed = failed_idx.expect("LlmRequestFailed must fire on transport error");
-        assert!(
-            started < failed,
-            "LlmRequestFailed must follow LlmRequestStarted in stream order",
-        );
     }
 
     #[tokio::test]
@@ -383,30 +298,5 @@ mod tests {
             NodeError::Execution { id, .. } => assert_eq!(id, "n"),
             other => panic!("expected Execution, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn max_total_tokens_zero_sends_no_cap() {
-        // When max_total_tokens is 0 (the default), the executor must NOT
-        // send max_tokens: Some(0) to the transport. DummyTransport always
-        // succeeds; if the executor panicked or sent Some(0) the test would
-        // need a real provider to observe the bad behavior — but at minimum
-        // we verify the path completes without error.
-        let sink = Arc::new(InMemorySink::new());
-        let mut p = policy();
-        p.max_total_tokens = 0;
-        let req = NodeRequest::Agent(AgentNodeRequest {
-            agent: "greeter".into(),
-            initial_prompt: "say hi".into(),
-            system: None,
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-            policy: p,
-            allowed_tools: Vec::new(),
-        });
-        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
-        exec.execute("run_test", "n", req)
-            .await
-            .expect("zero max_total_tokens must not error");
     }
 }
