@@ -9,6 +9,16 @@ fn orno() -> Command {
     Command::cargo_bin("orno").expect("orno binary should build")
 }
 
+/// Build an `orno` command with the test-only `DummyTransport` env var
+/// set. Needed for any test that drives an `agent` node without a real
+/// LLM API key — otherwise the run hits the live provider. The var
+/// name mirrors `run.rs::TEST_TRANSPORT_ENV`.
+fn orno_with_dummy_transport() -> Command {
+    let mut cmd = orno();
+    cmd.env("ORNO_TEST_LLM_TRANSPORT", "dummy");
+    cmd
+}
+
 fn write_pipeline(yaml: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     file.write_all(yaml.as_bytes()).expect("write");
@@ -32,7 +42,7 @@ fn validates_example_pipeline() {
 
 #[test]
 fn run_emits_lifecycle_events() {
-    let assert = orno()
+    let assert = orno_with_dummy_transport()
         .args(["run", "../../examples/hello.yaml"])
         .assert()
         .success();
@@ -48,6 +58,15 @@ fn run_emits_lifecycle_events() {
     );
     assert!(
         stdout.contains(r#""type":"run_finished""#),
+        "stdout: {stdout}"
+    );
+    // Agent nodes must bracket their transport call with LLM events.
+    assert!(
+        stdout.contains(r#""type":"llm_request_started""#),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""type":"llm_response_received""#),
         "stdout: {stdout}"
     );
 }

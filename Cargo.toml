@@ -71,6 +71,20 @@ time = { version = "0.3", default-features = false, features = [
 # time-ordered. Default features are already minimal.
 ulid = "1"
 
+# LLM transport (ADR 0002). Pinned exactly — pre-1.0 API churn is
+# expected between betas. genai has no `[features]` table, so the
+# workspace-wide `default-features = false` discipline does not apply.
+genai = "=0.6.0-beta.17"
+
+# Replay tape keying. A 256-bit hash of the rendered prompt plus the
+# provider+model pair indexes `ReplayTransport`'s in-memory map.
+blake3 = "1"
+
+# Tape I/O for `RecordingTransport` / `ReplayTransport` tests. Used from
+# integration tests and from round-trip unit tests — pulled at workspace
+# level so both crates share the same version.
+tempfile = "3"
+
 # Testing
 assert_cmd = "2"
 insta = { version = "1", features = ["yaml"] }

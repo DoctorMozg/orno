@@ -2,3 +2,7 @@
 .mz
 .DS_Store
 .env.secrets
+
+# insta snapshot artifacts are regenerated locally, not committed.
+*.snap
+*.snap.new

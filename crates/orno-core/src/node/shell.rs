@@ -21,9 +21,14 @@ pub struct ShellExecutor;
 impl NodeExecutor for ShellExecutor {
     #[instrument(
         skip(self, req),
-        fields(node.id = %id, node.kind = "shell"),
+        fields(node.id = %id, node.kind = "shell", pipeline.run_id = %_run_id),
     )]
-    async fn execute(&self, id: &str, req: NodeRequest) -> Result<NodeResponse, NodeError> {
+    async fn execute(
+        &self,
+        _run_id: &str,
+        id: &str,
+        req: NodeRequest,
+    ) -> Result<NodeResponse, NodeError> {
         let NodeRequest::Shell(ShellNodeRequest { command, args }) = req else {
             return Err(NodeError::Execution {
                 id: id.to_string(),
@@ -68,6 +73,22 @@ impl NodeExecutor for ShellExecutor {
 mod tests {
     use super::*;
 
+    use crate::pipeline::{AgentPolicy, OnParseError};
+
+    fn test_policy() -> AgentPolicy {
+        AgentPolicy {
+            max_iterations: 1,
+            max_total_tokens: 0,
+            max_tool_calls: 0,
+            max_subagent_depth: 0,
+            allow_mutations: false,
+            allow_network: false,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            on_parse_error: OnParseError::Fail,
+        }
+    }
+
     #[tokio::test]
     async fn echoes_stdout() {
         let exec = ShellExecutor;
@@ -76,7 +97,7 @@ mod tests {
             args: vec!["hi".to_string()],
         });
 
-        let resp = exec.execute("test_node", req).await.unwrap();
+        let resp = exec.execute("run_test", "test_node", req).await.unwrap();
 
         assert_eq!(resp.node_id, "test_node");
         let stdout = resp.output["stdout"].as_str().unwrap();
@@ -99,7 +120,7 @@ mod tests {
         });
 
         let resp = exec
-            .execute("fail_node", req)
+            .execute("run_test", "fail_node", req)
             .await
             .expect("execute should return Ok on non-zero exit");
 
@@ -121,10 +142,15 @@ mod tests {
         let req = NodeRequest::Agent(AgentNodeRequest {
             agent: "x".to_string(),
             initial_prompt: String::new(),
+            system: None,
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            policy: test_policy(),
+            allowed_tools: Vec::new(),
         });
 
         let err = exec
-            .execute("wrong_kind", req)
+            .execute("run_test", "wrong_kind", req)
             .await
             .expect_err("agent request must be rejected");
 
@@ -145,7 +171,7 @@ mod tests {
         });
 
         let err = exec
-            .execute("unknown", req)
+            .execute("run_test", "unknown", req)
             .await
             .expect_err("spawn failure should return Err");
 

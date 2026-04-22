@@ -1,9 +1,9 @@
 //! `orno run <pipeline.yaml>` — load, resolve env/secrets, dispatch, stream.
 //!
-//! Assembles a `NodeRegistry` over `ShellExecutor` (real) and
-//! `AgentExecutor` (stub), threads them plus a `TemplateEngine`
-//! into `Engine::run`, and prints every recorded envelope as
-//! NDJSON on stdout.
+//! Assembles a `NodeRegistry` over `ShellExecutor` and `AgentExecutor`
+//! (wrapping a `GenAiTransport`), threads them plus a
+//! `TemplateEngine` into `Engine::run`, and prints every recorded
+//! envelope as NDJSON on stdout.
 //!
 //! Env and secrets resolution lives in this module (ADR 0020):
 //! process env, `--env-file`, `--secrets-file`, and `-e` flags
@@ -18,14 +18,22 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use orno_core::events::InMemorySink;
+use orno_core::events::{EventSink, InMemorySink};
 use orno_core::execution::{Engine, RunInputs, new_run_id};
+use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
 use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
 use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
+
+/// Test-only escape hatch: when set to `dummy`, `orno run` swaps
+/// `GenAiTransport` for `DummyTransport` so integration tests can
+/// snapshot the event stream without a live API key. The var name
+/// is intentionally awkward — end users should never set it.
+/// Record/replay tape wiring (Phase 7) will subsume this.
+const TEST_TRANSPORT_ENV: &str = "ORNO_TEST_LLM_TRANSPORT";
 
 /// Parsed CLI flags consumed by the env/secrets resolver.
 #[derive(Debug, Default)]
@@ -42,15 +50,27 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     let inputs = resolve_inputs(&pipeline, &flags)?;
 
     let sink = Arc::new(InMemorySink::new());
+    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+
+    let transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
+        Ok("dummy") => Arc::new(DummyTransport),
+        _ => Arc::new(
+            GenAiTransport::from_agents(&pipeline.agents)
+                .context("constructing LLM transport from pipeline agents")?,
+        ),
+    };
 
     let mut registry = NodeRegistry::new();
     registry.register("shell", Arc::new(ShellExecutor));
-    registry.register("agent", Arc::new(AgentExecutor));
+    registry.register(
+        "agent",
+        Arc::new(AgentExecutor::new(transport, sink_dyn.clone())),
+    );
     let registry = Arc::new(registry);
 
     let templates = Arc::new(TemplateEngine::new());
 
-    let engine = Engine::new(sink.clone(), registry, templates);
+    let engine = Engine::new(sink_dyn, registry, templates);
     let run_id = new_run_id();
 
     engine.run(&run_id, &pipeline, inputs).await?;

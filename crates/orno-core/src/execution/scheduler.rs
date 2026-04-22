@@ -16,7 +16,7 @@ use serde_json::Value;
 use tracing::instrument;
 
 use crate::error::CoreError;
-use crate::events::{Event, EventEnvelope, EventSink};
+use crate::events::{Event, EventSink};
 use crate::execution::context::Context;
 use crate::execution::walker::DagWalker;
 use crate::node::{NodeRegistry, NodeResponse, kind_str, render_request};
@@ -80,19 +80,10 @@ impl Engine {
         pipeline: &Pipeline,
         inputs: RunInputs,
     ) -> Result<(), CoreError> {
-        let mut seq: u64 = 0;
-        let mut next_seq = || {
-            seq += 1;
-            seq
-        };
-
         self.sink
-            .record(EventEnvelope::new(
-                next_seq(),
-                Event::RunStarted {
-                    run_id: run_id.to_string(),
-                },
-            ))
+            .record(Event::RunStarted {
+                run_id: run_id.to_string(),
+            })
             .await;
 
         let mut walker = DagWalker::new(pipeline)?;
@@ -101,16 +92,15 @@ impl Engine {
 
         while let Some(node) = walker.next_ready() {
             self.sink
-                .record(EventEnvelope::new(
-                    next_seq(),
-                    Event::NodeStarted {
-                        run_id: run_id.to_string(),
-                        node_id: node.id.clone(),
-                    },
-                ))
+                .record(Event::NodeStarted {
+                    run_id: run_id.to_string(),
+                    node_id: node.id.clone(),
+                })
                 .await;
 
-            let (node_ok, node_output) = self.dispatch_node(node, &context).await;
+            let (node_ok, node_output) = self
+                .dispatch_node(run_id, node, &context, &pipeline.agents)
+                .await;
 
             if let Some(output) = node_output {
                 context.record_node_output(&node.id, output);
@@ -123,38 +113,29 @@ impl Engine {
             let newly_skipped = walker.complete(&node_id, node_ok);
 
             self.sink
-                .record(EventEnvelope::new(
-                    next_seq(),
-                    Event::NodeFinished {
-                        run_id: run_id.to_string(),
-                        node_id: node_id.clone(),
-                        ok: node_ok,
-                    },
-                ))
+                .record(Event::NodeFinished {
+                    run_id: run_id.to_string(),
+                    node_id: node_id.clone(),
+                    ok: node_ok,
+                })
                 .await;
 
             for (skipped_id, reason) in newly_skipped {
                 self.sink
-                    .record(EventEnvelope::new(
-                        next_seq(),
-                        Event::NodeSkipped {
-                            run_id: run_id.to_string(),
-                            node_id: skipped_id,
-                            reason,
-                        },
-                    ))
+                    .record(Event::NodeSkipped {
+                        run_id: run_id.to_string(),
+                        node_id: skipped_id,
+                        reason,
+                    })
                     .await;
             }
         }
 
         self.sink
-            .record(EventEnvelope::new(
-                next_seq(),
-                Event::RunFinished {
-                    run_id: run_id.to_string(),
-                    ok: run_ok,
-                },
-            ))
+            .record(Event::RunFinished {
+                run_id: run_id.to_string(),
+                ok: run_ok,
+            })
             .await;
 
         Ok(())
@@ -167,8 +148,10 @@ impl Engine {
     /// successful responses carry output back for downstream templating.
     async fn dispatch_node(
         &self,
+        run_id: &str,
         node: &crate::pipeline::Node,
         context: &Context,
+        agents: &BTreeMap<String, crate::pipeline::AgentConfig>,
     ) -> (bool, Option<Value>) {
         let kind = kind_str(&node.kind);
         let Some(exec) = self.registry.get(kind) else {
@@ -180,20 +163,20 @@ impl Engine {
             return (false, None);
         };
 
-        let req = match render_request(&node.kind, &self.templates, context) {
+        let req = match render_request(&node.kind, &self.templates, context, agents) {
             Ok(req) => req,
             Err(err) => {
                 tracing::warn!(
                     node.id = %node.id,
                     node.kind = kind,
                     error = %err,
-                    "template render failed",
+                    "render_request failed",
                 );
                 return (false, None);
             }
         };
 
-        match exec.execute(&node.id, req).await {
+        match exec.execute(run_id, &node.id, req).await {
             Ok(resp) => {
                 let ok = node_response_ok(&node.kind, &resp);
                 (ok, ok.then_some(resp.output))
