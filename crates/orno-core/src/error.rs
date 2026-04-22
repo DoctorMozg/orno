@@ -17,6 +17,9 @@ pub enum CoreError {
 
     #[error(transparent)]
     Llm(#[from] LlmError),
+
+    #[error(transparent)]
+    Tool(#[from] ToolError),
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +101,58 @@ pub enum AgentError {
     #[error("agent uses feature `{0}` not yet supported")]
     UnsupportedYet(String),
 
+    /// Agent exhausted `max_iterations` without reaching a `stop`
+    /// finish reason.
+    #[error("agent exceeded max_iterations ({max})")]
+    IterationLimitExceeded { max: u32 },
+
+    /// The LLM called a tool not listed in `allowed_tools` or not
+    /// registered in the executor's handler map.
+    #[error("agent called unknown tool `{name}`")]
+    UnknownToolCalled { name: String },
+
+    /// A running budget dimension was exceeded. `kind` is from
+    /// `crate::events::BudgetKind` so the wire format shares the
+    /// classification type between the error surface and the event
+    /// surface.
+    #[error("agent exceeded budget: {kind:?}")]
+    BudgetExceeded { kind: crate::events::BudgetKind },
+
+    /// A tool that requires `allow_mutations=true` was called but the
+    /// agent policy forbids mutations. The denial is fed back to the
+    /// model (ADR 0005 §3); this variant remains available for
+    /// strict-mode use.
+    #[error("tool `{tool_name}` blocked by allow_mutations=false")]
+    MutatingCallBlocked { tool_name: String },
+
+    /// A tool that requires `allow_network=true` was called but the
+    /// agent policy forbids network access.
+    #[error("tool `{tool_name}` blocked by allow_network=false")]
+    NetworkBlocked { tool_name: String },
+
+    /// A network tool was called against a domain that is either on the
+    /// `blocked_domains` list or not on the `allowed_domains` allowlist.
+    #[error("tool `{tool_name}` blocked for domain `{domain}`")]
+    DomainBlocked { tool_name: String, domain: String },
+
+    /// Subagent recursion exceeded `max_subagent_depth`.
+    #[error("subagent depth exceeded ({max})")]
+    SubagentDepthExceeded { max: u32 },
+
+    /// A tool's arguments failed to parse and `on_parse_error: fail`
+    /// was set.
+    #[error("tool `{tool}` arguments failed to parse: {error}")]
+    ParseFailed { tool: String, error: String },
+
+    /// A tool handler returned an error. `name` is the tool name for
+    /// context; `source` is the underlying `ToolError`.
+    #[error("tool `{name}` failed")]
+    Tool {
+        name: String,
+        #[source]
+        source: ToolError,
+    },
+
     /// LLM transport returned a typed error. Use `source()` to reach the
     /// underlying `LlmError` for classification.
     #[error(transparent)]
@@ -161,4 +216,30 @@ pub enum LlmError {
     /// never falls through to a live call.
     #[error("replay tape miss for key `{key}`")]
     ReplayMiss { key: String },
+}
+
+/// Errors surfaced from [`crate::tool::ToolHandler::invoke`].
+/// Handlers return these; [`AgentError::Tool`] wraps them with
+/// the tool name for caller context.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ToolError {
+    /// The underlying I/O or API call failed. `source` carries the
+    /// original error chain.
+    #[error("tool `{name}` invocation failed")]
+    Invocation {
+        name: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The arguments JSON could not be deserialized into the expected
+    /// shape. Returned before any side effects.
+    #[error("tool `{name}` arguments invalid: {message}")]
+    InvalidArgs { name: String, message: String },
+
+    /// This handler is not yet wired (stub). Indicates a Phase 5+
+    /// feature that the caller declared but has not been implemented.
+    #[error("tool `{name}` not implemented yet: {feature}")]
+    NotImplemented { name: String, feature: String },
 }

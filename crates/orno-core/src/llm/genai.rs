@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
+use genai::chat::{
+    ChatMessage, ChatOptions, ChatRequest, StopReason, Tool, ToolCall as GenAiToolCall, ToolName,
+    ToolResponse,
+};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use tracing::instrument;
@@ -25,7 +28,9 @@ use tracing::instrument;
 use crate::error::LlmError;
 use crate::pipeline::AgentConfig;
 
-use super::{LlmRequest, LlmResponse, LlmTransport, Usage};
+use super::{
+    LlmRequest, LlmResponse, LlmTransport, OrnoChatMessage, OrnoChatTool, OrnoChatToolCall, Usage,
+};
 
 /// Providers known in v0.1. Kept explicit so a typo in a pipeline YAML
 /// surfaces as `ConfigError` at run start, not a confusing genai
@@ -93,6 +98,12 @@ impl LlmTransport for GenAiTransport {
         if let Some(system) = &req.system {
             chat = chat.with_system(system.clone());
         }
+        for msg in &req.messages {
+            chat = chat.append_message(orno_msg_to_genai(msg));
+        }
+        if !req.tools.is_empty() {
+            chat = chat.with_tools(req.tools.iter().map(orno_tool_to_genai));
+        }
 
         let mut options = ChatOptions::default();
         if let Some(t) = req.temperature {
@@ -109,6 +120,26 @@ impl LlmTransport for GenAiTransport {
 
         let finish_reason = response.stop_reason.as_ref().map(|r| r.raw().to_string());
         let usage = convert_usage(&response.usage);
+        let is_tool_call = matches!(response.stop_reason, Some(StopReason::ToolCall(_)));
+
+        if is_tool_call {
+            let tool_calls = response
+                .into_tool_calls()
+                .into_iter()
+                .map(|c| OrnoChatToolCall {
+                    call_id: c.call_id,
+                    fn_name: c.fn_name,
+                    fn_arguments: c.fn_arguments,
+                })
+                .collect();
+            return Ok(LlmResponse {
+                content: String::new(),
+                finish_reason,
+                usage: Some(usage),
+                tool_calls,
+            });
+        }
+
         let content = response
             .into_first_text()
             .ok_or_else(|| LlmError::ParseError("provider returned no text content".to_string()))?;
@@ -117,6 +148,7 @@ impl LlmTransport for GenAiTransport {
             content,
             finish_reason,
             usage: Some(usage),
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -272,6 +304,42 @@ fn convert_usage(u: &genai::chat::Usage) -> Usage {
     }
 }
 
+/// Translate an orno-owned message variant into the genai counterpart.
+/// Kept private so `genai::ChatMessage` never appears in a public signature
+/// (ADR 0002). `ToolCalls` collapses to a single assistant turn via
+/// `ChatMessage::from(Vec<ToolCall>)`; `ToolResult` becomes a `Tool`-role
+/// message carrying a `ToolResponse`.
+fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
+    match msg {
+        OrnoChatMessage::User { content } => ChatMessage::user(content.clone()),
+        OrnoChatMessage::Assistant { content } => ChatMessage::assistant(content.clone()),
+        OrnoChatMessage::ToolCalls { calls } => {
+            let genai_calls: Vec<GenAiToolCall> = calls
+                .iter()
+                .map(|c| GenAiToolCall {
+                    call_id: c.call_id.clone(),
+                    fn_name: c.fn_name.clone(),
+                    fn_arguments: c.fn_arguments.clone(),
+                    thought_signatures: None,
+                })
+                .collect();
+            ChatMessage::from(genai_calls)
+        }
+        OrnoChatMessage::ToolResult { call_id, content } => {
+            ChatMessage::from(ToolResponse::new(call_id.clone(), content.clone()))
+        }
+    }
+}
+
+/// Translate orno's tool metadata into the genai `Tool` shape. Custom tool
+/// names always land as `ToolName::Custom`; orno exposes no built-ins on this
+/// surface.
+fn orno_tool_to_genai(t: &OrnoChatTool) -> Tool {
+    Tool::new(ToolName::Custom(t.name.clone()))
+        .with_description(t.description.clone())
+        .with_schema(t.schema.clone())
+}
+
 /// Wrapper so `genai::Error` can cross the `std::error::Error` trait
 /// object boundary required by `LlmError::Transport`. `genai::Error`
 /// implements `Display` via `derive_more`; we forward both.
@@ -419,6 +487,30 @@ mod tests {
         assert_eq!(out.prompt_tokens, 10);
         assert_eq!(out.completion_tokens, 0);
         assert_eq!(out.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_orno_msg_user_converts_to_genai() {
+        let msg = OrnoChatMessage::User {
+            content: "hi there".to_string(),
+        };
+        let genai_msg = orno_msg_to_genai(&msg);
+        assert_eq!(genai_msg.role, genai::chat::ChatRole::User);
+    }
+
+    #[test]
+    fn test_orno_tool_converts_to_genai() {
+        let tool = OrnoChatTool {
+            name: "get_weather".to_string(),
+            description: "Looks up the current weather".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let genai_tool = orno_tool_to_genai(&tool);
+        assert_eq!(genai_tool.name.as_str(), "get_weather");
+        assert_eq!(
+            genai_tool.description.as_deref(),
+            Some("Looks up the current weather"),
+        );
     }
 
     fn default_policy() -> crate::pipeline::AgentPolicy {

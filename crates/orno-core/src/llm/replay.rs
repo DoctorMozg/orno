@@ -93,14 +93,14 @@ mod tests {
     use std::sync::Arc;
 
     fn req(prompt: &str) -> LlmRequest {
-        LlmRequest {
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-            prompt: prompt.into(),
-            system: None,
-            temperature: None,
-            max_tokens: None,
-        }
+        LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            prompt.into(),
+            None,
+            None,
+            None,
+        )
     }
 
     #[tokio::test]
@@ -138,6 +138,7 @@ mod tests {
                     completion_tokens: 1,
                     total_tokens: 2,
                 }),
+                tool_calls: Vec::new(),
             },
         };
         let replay = ReplayTransport::from_entries(vec![entry]);
@@ -158,5 +159,30 @@ mod tests {
             LlmError::ConfigError(msg) => assert!(msg.contains("parse error")),
             other => panic!("expected ConfigError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn different_message_history_produces_different_keys() {
+        use crate::llm::OrnoChatMessage;
+
+        let base_req = LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hello".into(),
+            None,
+            None,
+            None,
+        );
+
+        let mut with_history = base_req.clone();
+        with_history.messages = vec![OrnoChatMessage::User {
+            content: "previous turn".into(),
+        }];
+
+        assert_ne!(
+            tape_key(&base_req),
+            tape_key(&with_history),
+            "different message history must produce different tape keys",
+        );
     }
 }

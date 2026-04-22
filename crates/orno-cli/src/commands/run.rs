@@ -14,10 +14,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use orno_core::agent::{Agent, LoopAgent, LoopAgentConfig};
 use orno_core::events::{EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
@@ -27,6 +28,10 @@ use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
+use orno_core::tool::{
+    BashHandler, EditHandler, ReadHandler, SubagentHandler, ToolHandler, WebFetchHandler,
+    WriteHandler,
+};
 
 /// Test-only escape hatch: when set to `dummy`, `orno run` swaps
 /// `GenAiTransport` for `DummyTransport` so integration tests can
@@ -82,19 +87,56 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let mut registry = NodeRegistry::new();
     registry.register("shell", Arc::new(ShellExecutor));
+    // Built-in tool set per ADR 0008. `LoopAgent` gates each call
+    // against the per-agent `AgentPolicy.allowed_tools` list, so an
+    // agent that does not opt into a handler cannot reach it — the
+    // registration here is the availability ceiling, not the default.
+    let builtin_tools: Vec<Arc<dyn ToolHandler>> = vec![
+        Arc::new(BashHandler),
+        Arc::new(ReadHandler),
+        Arc::new(WriteHandler),
+        Arc::new(EditHandler),
+        Arc::new(WebFetchHandler),
+    ];
+
+    // ADR 0006: build the `LoopAgent` inside `Arc::new_cyclic` so each
+    // `SubagentHandler` can hold a `Weak<LoopAgent>` back-pointer into
+    // the same agent its tool vector lives on. A plain `Arc` would
+    // complete a cycle (LoopAgent → tools → SubagentHandler → LoopAgent)
+    // and leak the agent forever; the `Weak` form breaks the cycle while
+    // keeping dispatch O(1) on the hot path.
+    //
+    // One handler per entry in `pipeline.agents`: the YAML form
+    // `subagent.<name>` is the same string the parent's `allowed_tools`
+    // references, so registration key = handler name = allowlist entry.
     // Reuse the engine's `max_output_bytes` for the LLM body excerpt
     // cap so a truncated stderr tail, a truncated HTTP error body, and
     // a truncated prompt/response excerpt all look alike to a log
     // reader (ADR 0023 / 0024).
-    registry.register(
-        "agent",
-        Arc::new(AgentExecutor::new(
+    let body_excerpt_max_bytes = engine_config.max_output_bytes;
+    let event_sink = sink.clone();
+    let loop_agent: Arc<LoopAgent> = Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
+        let mut tools = builtin_tools.clone();
+        for (name, cfg) in &pipeline.agents {
+            tools.push(Arc::new(SubagentHandler::new(
+                format!("subagent.{name}"),
+                name.clone(),
+                cfg.clone(),
+                weak.clone(),
+                event_sink.clone(),
+            )));
+        }
+        LoopAgent::new(LoopAgentConfig {
             transport,
-            sink.clone(),
+            sink: event_sink.clone(),
             redactor,
-            engine_config.max_output_bytes,
-        )),
-    );
+            body_excerpt_max_bytes,
+            tools,
+        })
+    });
+
+    let agent: Arc<dyn Agent> = loop_agent;
+    registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
     let registry = Arc::new(registry);
 
     let templates = Arc::new(TemplateEngine::new());

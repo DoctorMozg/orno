@@ -315,12 +315,17 @@ impl Engine {
                 }
             }
             Err(err) => {
-                // Redact and cap: an LLM transport error can surface a
-                // multi-KB HTML body, and a rendered prompt in the chain
-                // can carry a secret value. Both must be bounded before
-                // they reach stderr.
+                // Walk the full `source()` chain — thiserror's Display
+                // only renders the top-level variant, so a `NodeError::
+                // Execution { source: AgentError::BudgetExceeded(...) }`
+                // would otherwise surface as the opaque
+                // ``node `digest` failed`` without the underlying cause
+                // that the operator actually needs to see. Redact and
+                // cap because an LLM transport error can surface a
+                // multi-KB HTML body and a rendered prompt can carry
+                // a secret value.
                 let error = truncate_tail(
-                    &redactor.redact(&format!("{err:#}")),
+                    &redactor.redact(&render_error_chain(&err)),
                     self.config.max_output_bytes,
                 );
                 tracing::warn!(
@@ -363,6 +368,25 @@ impl DispatchOutcome {
             output: None,
         }
     }
+}
+
+/// Render an error with its full `source()` chain. `thiserror`'s
+/// `Display` only emits the top-level variant — for a terminal like
+/// `NodeError::Execution { source: AgentError::BudgetExceeded {..} }`
+/// the raw `Display` reads as `node `digest` failed`, hiding the
+/// budget-breach that the operator actually needs to see. Each link
+/// is joined with `: ` so the output reads as a single diagnostic
+/// line. The `'static` bound is the same one `std::error::Error`'s
+/// inherent `source()` walker requires — `NodeError` satisfies it.
+fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut current = err.source();
+    while let Some(src) = current {
+        out.push_str(": ");
+        out.push_str(&src.to_string());
+        current = src.source();
+    }
+    out
 }
 
 /// Keep the **last** `max_bytes` of a string, on a UTF-8 boundary.
@@ -966,6 +990,53 @@ mod tests {
         assert!(
             format!("{err}").contains("graph") || format!("{err:#}").contains("cycle"),
             "propagated error should mention graph/cycle: {err:#}",
+        );
+    }
+
+    #[test]
+    fn render_error_chain_walks_source_links() {
+        // A `thiserror` Display on `NodeError::Execution` only renders
+        // the top-level variant. The operator needs the actual cause
+        // (e.g. `agent exceeded budget: Tokens` under `node `digest`
+        // failed`) to act on the failure. This guards the chain walker
+        // that restores that information.
+        use crate::error::{AgentError, NodeError};
+        use crate::events::BudgetKind;
+        let err = NodeError::Execution {
+            id: "digest".to_string(),
+            source: Box::new(AgentError::BudgetExceeded {
+                kind: BudgetKind::Tokens,
+            }),
+        };
+        let rendered = render_error_chain(&err);
+        assert!(
+            rendered.contains("node `digest` failed"),
+            "rendered chain missing top-level message: {rendered}",
+        );
+        assert!(
+            rendered.contains("agent exceeded budget"),
+            "rendered chain missing nested source: {rendered}",
+        );
+        assert!(
+            rendered.contains("Tokens"),
+            "rendered chain missing BudgetKind classifier: {rendered}",
+        );
+    }
+
+    #[test]
+    fn render_error_chain_handles_terminal_error() {
+        // An error with no source must still render its own Display
+        // without trailing separators or panics — the walker stops
+        // cleanly at the first `source() -> None`.
+        use crate::error::NodeError;
+        let err = NodeError::NotImplemented {
+            id: "stub".to_string(),
+        };
+        let rendered = render_error_chain(&err);
+        assert!(rendered.contains("not implemented"));
+        assert!(
+            !rendered.ends_with(": "),
+            "trailing separator leaked: {rendered}",
         );
     }
 

@@ -86,6 +86,27 @@ pub enum Event {
         run_id: String,
         reason: String,
     },
+    /// Emitted at the start of each agent iteration before the LLM
+    /// transport is called. `iteration` is 0-based so a single-shot
+    /// agent emits `iteration: 0`.
+    AgentIterationStarted {
+        run_id: String,
+        node_id: String,
+        iteration: u32,
+    },
+    /// Emitted after each successful or denied tool call within an
+    /// agent iteration. `input_excerpt` and `output_excerpt` are
+    /// redacted and head-truncated at `body_excerpt_max_bytes` (same
+    /// cap as `LlmRequestStarted` excerpts, ADR 0024). On a denied
+    /// call the `output_excerpt` carries the denial reason string.
+    ToolCallRecorded {
+        run_id: String,
+        node_id: String,
+        tool_name: String,
+        call_id: String,
+        input_excerpt: String,
+        output_excerpt: String,
+    },
     /// Emitted immediately before the transport is called. Carries
     /// provider + model identifiers plus redacted head excerpts of the
     /// rendered prompt and optional system prompt (ADR 0024). The
@@ -142,6 +163,54 @@ pub enum Event {
         failed_nodes: Vec<String>,
         skipped_nodes: Vec<String>,
     },
+    /// Emitted at the start of a subagent dispatch, before the child
+    /// `LoopAgent::run` is entered (ADR 0006). `parent_node_id` is the
+    /// DAG node the caller is bound to; the child inherits it for its
+    /// own event stream so a consumer filtering by `node_id` sees every
+    /// turn the tree produced. `depth` is the child's depth
+    /// (`caller_depth + 1`).
+    SubagentStarted {
+        run_id: String,
+        parent_node_id: String,
+        child_agent: String,
+        depth: u32,
+    },
+    /// Emitted when a subagent dispatch returned successfully. Carries
+    /// the child's final iteration count and cumulative token usage so
+    /// the parent's audit trail records what the child loop cost
+    /// without folding the child's `AgentOutput` into the wire format.
+    SubagentCompleted {
+        run_id: String,
+        parent_node_id: String,
+        child_agent: String,
+        depth: u32,
+        iterations: u32,
+        total_tokens: u64,
+    },
+    /// Emitted when a subagent dispatch returned `AgentError`. The error
+    /// is rendered with the full `Display` chain (`{:#}`) so downstream
+    /// consumers see the cause without a follow-up query. The parent
+    /// loop still feeds the failure back to its LLM as a denial-style
+    /// `ToolResult` string per ADR 0005 §3; this event records the
+    /// structured observability trail for the failure itself.
+    SubagentFailed {
+        run_id: String,
+        parent_node_id: String,
+        child_agent: String,
+        depth: u32,
+        error: String,
+    },
+    /// Emitted when the parent agent attempted a subagent dispatch that
+    /// would exceed `AgentPolicy.max_subagent_depth`. The child is never
+    /// entered; the parent's loop receives a denial-style `ToolResult`
+    /// string and continues.
+    SubagentDepthExceeded {
+        run_id: String,
+        parent_node_id: String,
+        attempted_child_agent: String,
+        depth_attempted: u32,
+        max_depth: u32,
+    },
 }
 
 /// Why a node never ran. Expanded as new skip cases appear
@@ -153,6 +222,19 @@ pub enum SkipReason {
     /// An upstream node this node transitively depended on
     /// finished with `ok: false`.
     DependencyFailed { upstream: String },
+}
+
+/// Which budget dimension the agent exhausted. Carried on
+/// `NodeFailure::BudgetExceeded` so downstream alerting can distinguish
+/// a token-count breach from a tool-call-count breach.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BudgetKind {
+    /// `max_total_tokens` was exceeded across the iteration history.
+    Tokens,
+    /// `max_tool_calls` was exceeded within the run.
+    ToolCalls,
 }
 
 /// Why a node finished with `ok: false`. Carried on
@@ -189,6 +271,21 @@ pub enum NodeFailure {
         exit_code: Option<i64>,
         stderr_tail: Option<String>,
     },
+    /// The agent exhausted `max_iterations` without reaching a `stop`
+    /// finish reason. The final LLM call returned a tool-call turn and
+    /// the loop could not continue.
+    IterationLimitExceeded { max_iterations: u32 },
+    /// A running budget (`max_total_tokens` or `max_tool_calls`) was
+    /// exceeded. `budget_kind` discriminates which dimension breached.
+    /// The field is `budget_kind` (not `kind`) because `kind` is the
+    /// serde tag discriminator on this enum, mirroring the
+    /// `NoExecutorRegistered { node_kind }` convention above.
+    BudgetExceeded { budget_kind: BudgetKind },
+    /// A tool call was denied by the policy gate (`allow_mutations`,
+    /// `allow_network`, domain lists). Per ADR 0005 §3 the denial is
+    /// fed back to the model as a tool-result string; this variant is
+    /// available for future strict-mode use.
+    ToolDenied { tool_name: String, reason: String },
 }
 
 /// Why an LLM transport call failed. Carried on

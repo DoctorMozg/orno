@@ -1,43 +1,116 @@
 # yaml-language-server: $schema=../schemas/pipeline.schema.json
 # Commit-digest pipeline. Pulls a short window of recent git activity
 # out of the current working tree (no remote refs required) and asks
-# two chained agents to turn it into a plain-English status report
-# plus three suggested next steps.
+# an agent to turn it into a plain-English status report, then hands
+# the digest to a second agent for three concrete next steps.
 #
-# Runs end-to-end on Phase 4: every agent has an empty allowed_tools
-# list, so only a single LLM round-trip executes per agent node.
+# This example exercises every Phase 5 tool handler at least once so a
+# reader can see the full tool surface wired end-to-end:
 #
-# Phase 5 tool-evolution path (not yet wired):
-#   - status_writer gains `Read` + `Bash` to open files named in the
-#     log and confirm what actually changed
-#   - next_steps gains `WebFetch` to follow linked PR / issue URLs
-#   - an `mcp_servers:` block adds a `github` MCP so both agents can
-#     query live PR / branch state instead of inferring from commit
-#     subjects alone
-#   - a third agent writes the digest to CHANGELOG.md via `Write`
+#   Bash                        — run `git shortlog -sn` to enumerate top contributors
+#   Read                        — open README.md for project-name context
+#   WebFetch                    — resolve a GitHub PR URL referenced in the commit log
+#   Edit                        — stamp the last-run timestamp into the tracker file
+#   Write                       — save the final digest to disk
+#   subagent.contributor_vibes  — delegate a one-line "contributor vibe"
+#                                 to a child agent loop (ADR 0006).
+#                                 The parent's `max_subagent_depth: 1`
+#                                 budget lets the child run at depth 1
+#                                 and no deeper — a child-of-child call
+#                                 would trip the depth gate and feed
+#                                 back a denial string.
 #
 # Prereqs:
 #   - $OPENROUTER_API_KEY in the environment
 #   - `git` on PATH, invoked from a repo with at least one commit
+#   - Network access to api.github.com and raw.githubusercontent.com
+#     (domain allowlist declared but not enforced until Phase 6)
 
 version: 1
 
 vars:
   log_depth: 10
+  output_dir: target/orno-digest
+  digest_path: target/orno-digest/digest.md
+  tracker_path: target/orno-digest/tracker.md
 
 agents:
   status_writer:
-    model: google/gemma-4-31b-it
+    model: anthropic/claude-sonnet-4.5
     provider: openrouter
     system: |
-      You turn a short log of recent git activity into a plain-English
-      status report. Keep it to one dense paragraph (five sentences max).
-      Do not invent work that is not visible in the input. Mention the
-      working-tree state only if it shows unstaged or untracked files.
+      You prepare a weekly commit digest for engineering leadership.
+      You have a small, explicit tool surface — use each tool at least
+      once so the resulting digest is grounded in real evidence and the
+      tracker file records that this run happened.
+
+      Method (follow in order):
+        1. Call Read with path "README.md" to pick up the project name
+           and one-sentence description for the digest header.
+        2. Call Bash with `git shortlog -sn -n 5` (no cwd override) to
+           get the top five contributors over all history. Note them.
+        3. Scan the recent commits handed to you for any GitHub PR URL
+           of the form `https://github.com/<owner>/<repo>/pull/<N>`. If
+           you find one, call WebFetch on it to confirm the PR title
+           and state. If none is present, call WebFetch exactly once on
+           `https://api.github.com/zen` as a liveness probe so the tool
+           is exercised either way — mention the result in the digest.
+        4. Call `subagent.contributor_vibes` with a prompt like
+           `Summarize the vibe of the five contributors: <names>` to
+           delegate a one-line flavor sentence. The child agent returns
+           a single upbeat sentence; include it verbatim in the digest.
+           If the child returns an error string starting with `error:`
+           or `denied:` (e.g. a depth-gate denial), fall back to writing
+           the line yourself so the digest still ships.
+        5. Call Write with path `{{ vars.digest_path }}` and the final
+           digest body. One tight paragraph plus a short "Top
+           contributors" list and the vibe line. Do not invent work
+           that is not visible in the commit log or tool outputs.
+        6. Call Edit with path `{{ vars.tracker_path }}`, old_string
+           `LAST_RUN: pending`, new_string `LAST_RUN: <today>` where
+           `<today>` is the UTC ISO date passed in the initial prompt.
+           The match is unique by construction.
+
+      When every tool has been called and the digest + tracker are
+      saved, reply with the digest body as your final assistant
+      message. Do not call any more tools after the reply.
+    allowed_tools:
+      - Read
+      - Bash
+      - WebFetch
+      - subagent.contributor_vibes
+      - Write
+      - Edit
+    policy:
+      max_iterations: 20
+      max_total_tokens: 40000
+      max_tool_calls: 15
+      max_subagent_depth: 1
+      allow_mutations: true
+      allow_network: true
+      allowed_domains:
+        - api.github.com
+        - github.com
+        - raw.githubusercontent.com
+      on_parse_error: retry_once
+
+  contributor_vibes:
+    # Subagent target for step 4. The parent calls this as
+    # `subagent.contributor_vibes` — the CLI registers one handler per
+    # `agents:` entry with that naming scheme (ADR 0006). The child
+    # runs at depth 1; its own `max_subagent_depth: 0` means it cannot
+    # recurse further, so the only recursion the pipeline ever does is
+    # the parent → child jump.
+    model: anthropic/claude-haiku-4.5
+    provider: openrouter
+    system: |
+      You produce a single upbeat sentence describing a list of git
+      contributors. No preamble, no trailing commentary — just the
+      sentence.
     allowed_tools: []
     policy:
       max_iterations: 1
-      max_total_tokens: 1500
+      max_total_tokens: 500
       max_tool_calls: 0
       max_subagent_depth: 0
       allow_mutations: false
@@ -45,12 +118,12 @@ agents:
       on_parse_error: fail
 
   next_steps:
-    model: google/gemma-4-31b-it
+    model: anthropic/claude-haiku-4.5
     provider: openrouter
     system: |
-      You convert a status digest into exactly three concrete next steps.
-      Each step is one imperative sentence. No hedging, no preamble, no
-      trailing commentary. Number them 1., 2., 3.
+      You convert a status digest into exactly three concrete next
+      steps. Each step is one imperative sentence. No hedging, no
+      preamble, no trailing commentary. Number them 1., 2., 3.
     allowed_tools: []
     policy:
       max_iterations: 1
@@ -72,10 +145,28 @@ nodes:
     command: git
     args: ["status", "--short"]
 
+  - id: current_date
+    # UTC ISO date for the tracker stamp. Captured in a shell node so
+    # the digest agent does not need to know the host's clock shape.
+    kind: shell
+    command: date
+    args: ["-u", "+%Y-%m-%d"]
+
+  - id: seed_tracker
+    # Ensure the tracker file exists with a known sentinel line so the
+    # Edit tool has a unique old_string to match on. The Write tool
+    # would also work here, but a shell seed keeps the agent focused on
+    # the amendment step rather than the bootstrap.
+    kind: shell
+    command: sh
+    args:
+      - "-c"
+      - "mkdir -p {{ vars.output_dir }} && printf 'LAST_RUN: pending\n' > {{ vars.tracker_path }}"
+
   - id: digest
     kind: agent
     agent: status_writer
-    needs: [recent_commits, working_tree]
+    needs: [recent_commits, working_tree, current_date, seed_tracker]
     initial_prompt: |
       Recent commits (newest first):
       {{ nodes.recent_commits.stdout }}
@@ -83,7 +174,12 @@ nodes:
       Working tree (empty means a clean tree):
       {{ nodes.working_tree.stdout }}
 
-      Write the status report now.
+      Current UTC date (for the tracker stamp): {{ nodes.current_date.stdout | trim }}
+      Digest output path: {{ vars.digest_path }}
+      Tracker path:       {{ vars.tracker_path }}
+
+      Follow the method in your system prompt. Use every tool you
+      have been granted at least once, then reply with the digest.
 
   - id: plan
     kind: agent

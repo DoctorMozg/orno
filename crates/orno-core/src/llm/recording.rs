@@ -104,24 +104,24 @@ mod tests {
         let path = tmp.path().to_path_buf();
         let rec = RecordingTransport::create(Arc::new(DummyTransport), &path).unwrap();
 
-        rec.complete(LlmRequest {
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-            prompt: "hello".into(),
-            system: None,
-            temperature: None,
-            max_tokens: None,
-        })
+        rec.complete(LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hello".into(),
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
-        rec.complete(LlmRequest {
-            provider: "openai".into(),
-            model: "gpt-5".into(),
-            prompt: "world".into(),
-            system: None,
-            temperature: None,
-            max_tokens: None,
-        })
+        rec.complete(LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "world".into(),
+            None,
+            None,
+            None,
+        ))
         .await
         .unwrap();
 

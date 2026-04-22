@@ -1361,6 +1361,7 @@ dependencies = [
  "blake3",
  "genai",
  "minijinja",
+ "reqwest",
  "rstest",
  "schemars 1.2.1",
  "serde",

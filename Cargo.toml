@@ -76,6 +76,11 @@ ulid = "1"
 # workspace-wide `default-features = false` discipline does not apply.
 genai = "=0.6.0-beta.17"
 
+# HTTP client for WebFetchHandler (ADR 0008). Pinned to the same major
+# that genai pulls transitively. Only `rustls-tls` is enabled — no
+# cookies, multipart, or blocking pools are needed for a simple GET.
+reqwest = { version = "0.13", default-features = false }
+
 # Replay tape keying. A 256-bit hash of the rendered prompt plus the
 # provider+model pair indexes `ReplayTransport`'s in-memory map.
 blake3 = "1"

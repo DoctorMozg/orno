@@ -11,9 +11,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent::{Agent, AgentOutput, AgentRequest, LoopAgent};
+use crate::agent::{Agent, AgentOutput, AgentRequest, LoopAgent, LoopAgentConfig};
 use crate::error::{AgentError, NodeError};
-use crate::events::{EventSink, Redactor};
+use crate::events::EventSink;
 use crate::llm::LlmTransport;
 
 use super::{AgentNodeRequest, NodeExecutor, NodeRequest, NodeResponse};
@@ -31,26 +31,16 @@ impl AgentExecutor {
         Self { agent }
     }
 
-    /// Construct an adapter backed by a fresh [`LoopAgent`]. The CLI
-    /// hands transport + sink + redactor + body-excerpt cap; the
-    /// executor wires them into the default agent. The redactor is
-    /// shared with the engine so `secrets.*` values redact
-    /// consistently across agent-emitted `LlmRequestStarted`
-    /// excerpts and scheduler-emitted `NodeFailure` tails
-    /// (ADR 0020 / 0024).
+    /// Construct an adapter backed by a fresh [`LoopAgent`] built from
+    /// the supplied [`LoopAgentConfig`]. The CLI hands transport, sink,
+    /// redactor, body-excerpt cap, and the registered tool-handler
+    /// set; the executor wires them into the default agent. The
+    /// redactor is shared with the engine so `secrets.*` values redact
+    /// consistently across agent-emitted `LlmRequestStarted` excerpts
+    /// and scheduler-emitted `NodeFailure` tails (ADR 0020 / 0024).
     #[must_use]
-    pub fn new(
-        transport: Arc<dyn LlmTransport>,
-        sink: Arc<dyn EventSink>,
-        redactor: Arc<Redactor>,
-        body_excerpt_max_bytes: usize,
-    ) -> Self {
-        Self::from_agent(Arc::new(LoopAgent::new(
-            transport,
-            sink,
-            redactor,
-            body_excerpt_max_bytes,
-        )))
+    pub fn new(config: LoopAgentConfig) -> Self {
+        Self::from_agent(Arc::new(LoopAgent::new(config)))
     }
 
     /// Construct an adapter backed by a [`LoopAgent`] with the default
@@ -99,6 +89,11 @@ impl NodeExecutor for AgentExecutor {
             model,
             policy,
             allowed_tools,
+            // Root `kind: agent` nodes always enter at depth 0. A
+            // subagent tool call from depth N dispatches the child at
+            // `N + 1`; see `LoopAgent::run` for the recursion gate
+            // (ADR 0006).
+            depth: 0,
         };
 
         let output = self
@@ -223,6 +218,8 @@ mod tests {
                 completion_tokens: 4,
                 total_tokens: 7,
             }),
+            iterations: 0,
+            total_tokens: 7,
         });
         let exec = AgentExecutor::from_agent(fake);
 

@@ -22,6 +22,12 @@ missing_panics_doc = "allow"
 struct_excessive_bools = "allow"
 struct_field_names = "allow"
 unnecessary_wraps = "allow"
+# `ToolHandler::{name,description}` return `&str` bound to `&self` so
+# `SubagentHandler` can yield a field reference (`&self.yaml_name`, a
+# dynamic `subagent.<agent>` string built at pipeline load). Builtin
+# handlers return string literals, which the lint wants upgraded to
+# `&'static str` — but that would break the dynamic-name impl.
+unnecessary_literal_bound = "allow"
 
 [dependencies]
 thiserror = { workspace = true }
@@ -36,6 +42,7 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 genai = { workspace = true }
 blake3 = { workspace = true }
+reqwest = { workspace = true }
 async-trait = "0.1"
 
 [dev-dependencies]
