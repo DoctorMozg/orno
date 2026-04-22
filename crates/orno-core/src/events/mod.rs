@@ -14,6 +14,10 @@ use time::OffsetDateTime;
 pub use in_memory_sink::InMemorySink;
 pub use sink::EventSink;
 
+/// Re-export of `llm::Usage` so `LlmResponseReceived` can carry it
+/// without cross-module coupling at the event-consumer layer.
+pub use crate::llm::Usage;
+
 /// Wire envelope for every event persisted or broadcast.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -70,6 +74,27 @@ pub enum Event {
     BudgetExceeded {
         run_id: String,
         reason: String,
+    },
+    /// Emitted immediately before the transport is called. Carries
+    /// provider + model identifiers but never the prompt — prompt
+    /// bodies may contain rendered `secrets.*` values (ADR 0020) and
+    /// must stay out of the event log. The response content is
+    /// propagated through `NodeResponse.output`, not through events.
+    LlmRequestStarted {
+        run_id: String,
+        node_id: String,
+        provider: String,
+        model: String,
+    },
+    /// Emitted immediately after a successful transport call. Carries
+    /// the normalized `finish_reason` and token usage so downstream
+    /// budget accounting has a numeric signal without parsing
+    /// provider-specific payloads.
+    LlmResponseReceived {
+        run_id: String,
+        node_id: String,
+        finish_reason: Option<String>,
+        usage: Option<Usage>,
     },
     RunFinished {
         run_id: String,
