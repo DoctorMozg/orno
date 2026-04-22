@@ -30,6 +30,7 @@ use crate::pipeline::template::TemplateEngine;
 /// (precedence, dotenv parsing, classification) happens in the CLI
 /// before `Engine::run` is called.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct RunInputs {
     /// Backs the `env.*` template namespace. Not auto-inherited from
     /// the process environment; the CLI decides what to expose.
@@ -108,9 +109,20 @@ impl Engine {
         pipeline: &Pipeline,
         inputs: RunInputs,
     ) -> Result<(), CoreError> {
+        // Own `run_id` once so every `Event::*` ctor can `clone()` from
+        // this local instead of hitting `&str::to_string()` on the
+        // parameter at every emission site. Shadows the borrowed name so
+        // nothing inside `run` accidentally keeps the old `&str` alive.
+        let run_id = run_id.to_string();
+        // Build the redactor from the run's `secrets.*` namespace before
+        // `Context::new` consumes `inputs.secrets`. Every user-visible
+        // string that reaches the event stream flows through this
+        // instance (ADR 0020).
+        let redactor = crate::events::Redactor::new(&inputs.secrets);
+
         self.sink
             .record(Event::RunStarted {
-                run_id: run_id.to_string(),
+                run_id: run_id.clone(),
             })
             .await;
 
@@ -139,7 +151,7 @@ impl Engine {
         while let Some(node) = walker.next_ready() {
             self.sink
                 .record(Event::NodeStarted {
-                    run_id: run_id.to_string(),
+                    run_id: run_id.clone(),
                     node_id: node.id.clone(),
                 })
                 .await;
@@ -149,7 +161,7 @@ impl Engine {
                 failure,
                 output: node_output,
             } = self
-                .dispatch_node(run_id, node, &context, &pipeline.agents)
+                .dispatch_node(&run_id, node, &context, &pipeline.agents, &redactor)
                 .await;
 
             // Record the node's output into Context regardless of
@@ -158,6 +170,11 @@ impl Engine {
             // diagnostic agents); the wire-format `NodeFailure` only
             // carries a bounded tail, the unbounded form lives here.
             if let Some(output) = node_output {
+                let output = if redactor.is_noop() {
+                    output
+                } else {
+                    redactor.redact_json(&output)
+                };
                 context.record_node_output(&node.id, output);
             }
             if !node_ok {
@@ -170,7 +187,7 @@ impl Engine {
 
             self.sink
                 .record(Event::NodeFinished {
-                    run_id: run_id.to_string(),
+                    run_id: run_id.clone(),
                     node_id: node_id.clone(),
                     ok: node_ok,
                     failure,
@@ -181,7 +198,7 @@ impl Engine {
                 skipped_nodes.push(skipped_id.clone());
                 self.sink
                     .record(Event::NodeSkipped {
-                        run_id: run_id.to_string(),
+                        run_id: run_id.clone(),
                         node_id: skipped_id,
                         reason,
                     })
@@ -191,7 +208,7 @@ impl Engine {
 
         self.sink
             .record(Event::RunFinished {
-                run_id: run_id.to_string(),
+                run_id: run_id.clone(),
                 ok: run_ok,
                 failed_nodes,
                 skipped_nodes,
@@ -214,6 +231,7 @@ impl Engine {
         node: &crate::pipeline::Node,
         context: &Context,
         agents: &BTreeMap<String, crate::pipeline::AgentConfig>,
+        redactor: &crate::events::Redactor,
     ) -> DispatchOutcome {
         let kind = kind_str(&node.kind);
         let Some(exec) = self.registry.get(kind) else {
@@ -230,7 +248,10 @@ impl Engine {
         let req = match render_request(&node.kind, &self.templates, context, agents) {
             Ok(req) => req,
             Err(err) => {
-                let error = format!("{err:#}");
+                // Redact before logging: a template error's Display chain
+                // can quote the offending expression, which may include a
+                // rendered `secrets.*` value (ADR 0020).
+                let error = redactor.redact(&format!("{err:#}")).into_owned();
                 tracing::warn!(
                     node.id = %node.id,
                     node.kind = kind,
@@ -255,13 +276,20 @@ impl Engine {
                 // still hand `resp.output` back to Context.
                 let exit_code = resp.output.get("exit_code").and_then(Value::as_i64);
                 let stderr_full = resp.output.get("stderr").and_then(Value::as_str);
-                let stderr_tail =
-                    stderr_full.map(|s| truncate_tail(s, self.config.max_output_bytes));
+                let stderr_tail = stderr_full.map(|s| {
+                    redactor
+                        .redact(&truncate_tail(s, self.config.max_output_bytes))
+                        .into_owned()
+                });
                 let stdout_tail = if self.config.verbose {
                     resp.output
                         .get("stdout")
                         .and_then(Value::as_str)
-                        .map(|s| truncate_tail(s, self.config.max_output_bytes))
+                        .map(|s| {
+                            redactor
+                                .redact(&truncate_tail(s, self.config.max_output_bytes))
+                                .into_owned()
+                        })
                         .unwrap_or_default()
                 } else {
                     String::new()
@@ -287,7 +315,14 @@ impl Engine {
                 }
             }
             Err(err) => {
-                let error = format!("{err:#}");
+                // Redact and cap: an LLM transport error can surface a
+                // multi-KB HTML body, and a rendered prompt in the chain
+                // can carry a secret value. Both must be bounded before
+                // they reach stderr.
+                let error = truncate_tail(
+                    &redactor.redact(&format!("{err:#}")),
+                    self.config.max_output_bytes,
+                );
                 tracing::warn!(
                     node.id = %node.id,
                     node.kind = kind,
@@ -351,13 +386,27 @@ fn truncate_tail(s: &str, max_bytes: usize) -> String {
 /// agent and any future kinds default to success when `execute` returns `Ok`
 /// so an agent payload that happens to carry an `exit_code` key is never
 /// misread as a shell exit.
+///
+/// Distinguishes "key absent" (forward-compat success — a future shell
+/// executor variant may omit it) from "key present but not a valid
+/// integer" (a contract violation by the executor; logged and treated as
+/// failure rather than silently passed).
 fn node_response_ok(kind: &NodeKind, resp: &NodeResponse) -> bool {
     match kind {
-        NodeKind::Shell(_) => resp
-            .output
-            .get("exit_code")
-            .and_then(Value::as_i64)
-            .is_none_or(|code| code == 0),
+        NodeKind::Shell(_) => match resp.output.get("exit_code") {
+            None => true,
+            Some(v) => {
+                if let Some(code) = v.as_i64() {
+                    code == 0
+                } else {
+                    tracing::warn!(
+                        exit_code = ?v,
+                        "shell exit_code is not an integer; treating as failure",
+                    );
+                    false
+                }
+            }
+        },
         _ => true,
     }
 }
@@ -435,6 +484,17 @@ mod tests {
         // Defensive: if a future ShellExecutor variant omits exit_code,
         // fall back to success rather than flagging the node failed.
         assert!(node_response_ok(&shell_kind(), &resp(json!({}))));
+    }
+
+    #[test]
+    fn shell_null_exit_code_is_fail() {
+        // An `exit_code: null` payload is a contract violation (the key
+        // is present but unusable) — must surface as failure rather than
+        // being silently treated as success the way an absent key is.
+        assert!(!node_response_ok(
+            &shell_kind(),
+            &resp(json!({"exit_code": null, "stdout": "", "stderr": ""})),
+        ));
     }
 
     #[test]

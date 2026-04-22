@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 /// One template context. `vars`, `env`, and `secrets` are populated
 /// at construction and never mutated. `nodes` grows as upstream
 /// nodes succeed (via `record_node_output`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Context {
     vars: BTreeMap<String, Value>,
     env: BTreeMap<String, String>,
@@ -47,6 +47,19 @@ impl Context {
             vars,
             env,
             secrets,
+            nodes: BTreeMap::new(),
+        }
+    }
+
+    /// Bare context with no vars, env, or secrets — for tests and
+    /// embedders that construct context programmatically. Prefer
+    /// `Context::new` when caller-supplied maps are available.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            vars: BTreeMap::new(),
+            env: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             nodes: BTreeMap::new(),
         }
     }

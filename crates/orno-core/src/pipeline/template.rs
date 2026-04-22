@@ -8,6 +8,13 @@ use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 
 use crate::error::PipelineError;
 
+/// Maximum number of bytes accepted for a single template source string.
+/// Templates above this threshold are rejected at render time rather than
+/// at parse time so the cap is enforced even when the template comes from
+/// user YAML (untrusted input). 64 KiB is several orders of magnitude
+/// larger than any legitimate prompt template.
+const MAX_TEMPLATE_SOURCE_BYTES: usize = 64 * 1024;
+
 pub struct TemplateEngine {
     env: Environment<'static>,
 }
@@ -30,6 +37,12 @@ impl TemplateEngine {
         source: &str,
         ctx: &serde_json::Value,
     ) -> Result<String, PipelineError> {
+        if source.len() > MAX_TEMPLATE_SOURCE_BYTES {
+            return Err(PipelineError::Validation(format!(
+                "template `{name}` source exceeds {MAX_TEMPLATE_SOURCE_BYTES} bytes ({} bytes)",
+                source.len(),
+            )));
+        }
         let tmpl =
             self.env
                 .template_from_str(source)

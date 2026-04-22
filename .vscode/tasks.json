@@ -40,7 +40,7 @@
     {
       "label": "orno: run pr-review example",
       "type": "shell",
-      "command": "cargo run -p orno-cli -- run examples/pr-review.yaml 2>&1",
+      "command": "cargo run -p orno-cli -- run examples/pr-review.yaml -v 2>&1",
       "options": {
         "env": {
           "RUST_LOG": "info"

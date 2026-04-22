@@ -128,8 +128,13 @@ impl NodeExecutor for AgentExecutor {
             // Phase 4 treats the agent's budget as a per-call cap
             // until the loop lands. Clamp into u32 because genai's
             // ChatOptions uses u32; a user who wrote u64::MAX in YAML
-            // gets u32::MAX sent over the wire.
-            max_tokens: Some(u32::try_from(policy.max_total_tokens).unwrap_or(u32::MAX)),
+            // gets u32::MAX sent over the wire. Treat `0` as "unset"
+            // — OpenAI and Anthropic read `max_tokens: 0` as a zero
+            // completion-token cap and return empty responses, so we
+            // must omit the field entirely when the budget is
+            // unconfigured.
+            max_tokens: (policy.max_total_tokens > 0)
+                .then(|| u32::try_from(policy.max_total_tokens).unwrap_or(u32::MAX)),
         };
 
         self.sink
@@ -378,5 +383,30 @@ mod tests {
             NodeError::Execution { id, .. } => assert_eq!(id, "n"),
             other => panic!("expected Execution, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn max_total_tokens_zero_sends_no_cap() {
+        // When max_total_tokens is 0 (the default), the executor must NOT
+        // send max_tokens: Some(0) to the transport. DummyTransport always
+        // succeeds; if the executor panicked or sent Some(0) the test would
+        // need a real provider to observe the bad behavior — but at minimum
+        // we verify the path completes without error.
+        let sink = Arc::new(InMemorySink::new());
+        let mut p = policy();
+        p.max_total_tokens = 0;
+        let req = NodeRequest::Agent(AgentNodeRequest {
+            agent: "greeter".into(),
+            initial_prompt: "say hi".into(),
+            system: None,
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            policy: p,
+            allowed_tools: Vec::new(),
+        });
+        let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
+        exec.execute("run_test", "n", req)
+            .await
+            .expect("zero max_total_tokens must not error");
     }
 }

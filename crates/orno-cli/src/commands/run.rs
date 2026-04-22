@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use orno_core::events::{EventSink, InMemorySink};
+use orno_core::events::{EventSink, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
 use orno_core::node::NodeRegistry;
@@ -61,8 +61,7 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let inputs = resolve_inputs(&pipeline, &flags)?;
 
-    let sink = Arc::new(InMemorySink::new());
-    let sink_dyn: Arc<dyn EventSink> = sink.clone();
+    let sink: Arc<dyn EventSink> = Arc::new(StreamingSink::stdout());
 
     let transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
@@ -81,7 +80,7 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
         "agent",
         Arc::new(AgentExecutor::new(
             transport,
-            sink_dyn.clone(),
+            sink.clone(),
             engine_config.max_output_bytes,
         )),
     );
@@ -89,15 +88,10 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let templates = Arc::new(TemplateEngine::new());
 
-    let engine = Engine::new(sink_dyn, registry, templates, engine_config);
+    let engine = Engine::new(sink, registry, templates, engine_config);
     let run_id = new_run_id();
 
     engine.run(&run_id, &pipeline, inputs).await?;
-
-    for envelope in sink.snapshot() {
-        let line = serde_json::to_string(&envelope)?;
-        println!("{line}");
-    }
     Ok(())
 }
 
@@ -156,7 +150,10 @@ fn resolve_inputs(pipeline: &Pipeline, flags: &RunFlags) -> Result<RunInputs> {
         env.insert(k, v);
     }
 
-    Ok(RunInputs { env, secrets })
+    let mut inputs = RunInputs::default();
+    inputs.env = env;
+    inputs.secrets = secrets;
+    Ok(inputs)
 }
 
 fn parse_inline_env(s: &str) -> Result<(String, String)> {
@@ -165,6 +162,9 @@ fn parse_inline_env(s: &str) -> Result<(String, String)> {
         .ok_or_else(|| anyhow!("expected `KEY=VAL`, got `{s}`"))?;
     if k.is_empty() {
         bail!("empty key in `-e {s}`");
+    }
+    if v.is_empty() {
+        tracing::warn!(key = %k, "empty value for `-e {k}=` — did you mean to unset this variable?");
     }
     Ok((k.to_string(), v.to_string()))
 }
@@ -195,7 +195,7 @@ fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
         if key.is_empty() {
             bail!("`{}` line {}: empty key", path.display(), lineno + 1);
         }
-        out.push((key.to_string(), v.trim().to_string()));
+        out.push((key.to_string(), v.to_string()));
     }
     Ok(out)
 }

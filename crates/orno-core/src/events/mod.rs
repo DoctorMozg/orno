@@ -6,13 +6,17 @@
 //! correlate events with wall clock without reconstructing from `seq`.
 
 pub mod in_memory_sink;
+pub mod redactor;
 pub mod sink;
+pub mod streaming_sink;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub use in_memory_sink::InMemorySink;
+pub use redactor::Redactor;
 pub use sink::EventSink;
+pub use streaming_sink::StreamingSink;
 
 /// Re-export of `llm::Usage` so `LlmResponseReceived` can carry it
 /// without cross-module coupling at the event-consumer layer.

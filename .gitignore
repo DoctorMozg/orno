@@ -6,3 +6,4 @@
 # insta snapshot artifacts are regenerated locally, not committed.
 *.snap
 *.snap.new
+.claude/agent-memory/
