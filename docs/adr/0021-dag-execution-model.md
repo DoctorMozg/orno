@@ -226,3 +226,43 @@ event schema stay as-is.
   `Context` for downstream templating but not re-emitted on the event
   stream. A future ADR decides whether the envelope grows output
   fields or whether consumers must snapshot the sink in-process.
+
+## Amendments
+
+### 2026-04-21 — superseded by ADR 0020 for `Context` env/secrets shape
+
+§3 of this ADR describes `Context` as a three-field struct
+`{ vars, env, nodes }` whose `env` map is captured at construction
+via `std::env::vars().collect()`. That shape is **superseded by
+ADR 0020** (_Env and secrets namespaces_). Concretely, as landed:
+
+- `Context` has **four** fields: `vars`, `env`, `secrets`, `nodes`.
+- `env` and `secrets` are **caller-provided** (via
+  `RunInputs { env, secrets }` on `Engine::run`); the context
+  constructor no longer reads the process environment.
+- `snapshot_for_template()` exposes `env.*` and `secrets.*` as two
+  disjoint top-level template namespaces.
+- `merge(...)` leaves both `env` and `secrets` untouched on the
+  receiver (not just `env`).
+
+The rest of §3 — per-branch snapshots, `nodes.<id>` scoping,
+last-writer-wins merge on `vars` and `nodes`, conflict-list audit
+trail — carries over unchanged.
+
+The execution flow in §4 is also updated by ADR 0020: `Engine::run`
+now takes a third argument, `inputs: RunInputs`, which the CLI
+resolves from `--env-file` / `--secrets-file` / `-e` flags and the
+pipeline's `pass_env:` / `secrets:` declarations before the run
+begins.
+
+### 2026-04-21 — test surface counts are approximate
+
+The Consequences bullet listing test counts (10 walker / 7 context /
+3 shell / 4 CLI integration) reflects the state at ADR drafting
+time. The landed suite is larger (9 context, 4 shell, 9 CLI, plus
+6 scheduler-level tests and 4 pipeline-validator tests and 3 node
+helper tests) because Phase 6 test review added coverage for the
+missing-executor branch, the template-render-error CLI path, and
+the `pass_env`/`secrets` constructor semantics from ADR 0020.
+Counts are illustrative; `cargo test --workspace --all-targets` is
+the source of truth.

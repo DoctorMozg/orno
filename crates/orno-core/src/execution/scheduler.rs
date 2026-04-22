@@ -31,10 +31,19 @@ use crate::pipeline::template::TemplateEngine;
 /// before `Engine::run` is called.
 #[derive(Debug, Clone, Default)]
 pub struct RunInputs {
+    /// Backs the `env.*` template namespace. Not auto-inherited from
+    /// the process environment; the CLI decides what to expose.
     pub env: BTreeMap<String, String>,
+    /// Backs the `secrets.*` template namespace. Disjoint from `env`
+    /// so a pipeline cannot resolve a secret through `env.*` and
+    /// sidestep redaction.
     pub secrets: BTreeMap<String, String>,
 }
 
+/// Walker-driven DAG runner. Dispatches ready nodes through the
+/// registered [`NodeExecutor`]s and emits lifecycle events via the
+/// [`EventSink`]. Parallelism is deferred (ADR 0021); a single
+/// `Engine` dispatches serially in YAML source order among ties.
 pub struct Engine {
     sink: Arc<dyn EventSink>,
     registry: Arc<NodeRegistry>,
@@ -55,6 +64,15 @@ impl Engine {
         }
     }
 
+    /// Drive the pipeline to completion, emitting `RunStarted` →
+    /// `NodeStarted` → `NodeFinished` → `NodeSkipped…` → `RunFinished`
+    /// envelopes through the sink.
+    ///
+    /// Returns `Ok(())` even when nodes fail — **per-run success is a
+    /// stream-level signal** carried by `RunFinished.ok`, never a
+    /// process-level error. `Err(CoreError)` is reserved for setup
+    /// failures that prevent the run from starting at all (invalid
+    /// graph, walker construction error).
     #[instrument(skip(self, pipeline, inputs), fields(pipeline.run_id = %run_id))]
     pub async fn run(
         &self,

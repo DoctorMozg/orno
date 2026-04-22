@@ -15,7 +15,7 @@ pub use registry::NodeRegistry;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::NodeError;
+use crate::error::{NodeError, PipelineError};
 use crate::execution::context::Context;
 use crate::pipeline::NodeKind;
 use crate::pipeline::template::TemplateEngine;
@@ -96,7 +96,7 @@ pub fn render_request(
     kind: &NodeKind,
     tmpl: &TemplateEngine,
     ctx: &Context,
-) -> Result<NodeRequest, crate::error::PipelineError> {
+) -> Result<NodeRequest, PipelineError> {
     let ctx_json = ctx.snapshot_for_template();
     match kind {
         NodeKind::Agent(n) => {
