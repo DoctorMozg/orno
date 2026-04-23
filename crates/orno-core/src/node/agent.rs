@@ -286,6 +286,7 @@ mod tests {
         let req = NodeRequest::Shell(ShellNodeRequest {
             command: "echo".into(),
             args: Vec::new(),
+            stdin: None,
         });
         let err = exec
             .execute("run_test", "n", req)

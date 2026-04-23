@@ -84,6 +84,14 @@ pub struct ShellNode {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Content to pipe into the child's stdin. Rendered through the
+    /// same template context as `command` and `args`. When `None`,
+    /// stdin is closed (default) — matching the pre-stdin behavior so
+    /// existing pipelines keep working. When `Some`, even an empty
+    /// string is delivered so the child sees a pipe that closes at
+    /// EOF rather than a closed handle.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 /// Named agent configuration. Referenced by `kind: agent` nodes and by

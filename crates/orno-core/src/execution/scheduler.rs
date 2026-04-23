@@ -446,6 +446,7 @@ mod tests {
         NodeKind::Shell(ShellNode {
             command: "echo".to_string(),
             args: Vec::new(),
+            stdin: None,
         })
     }
 
@@ -482,6 +483,7 @@ mod tests {
             kind: NodeKind::Shell(ShellNode {
                 command: command.to_string(),
                 args: Vec::new(),
+                stdin: None,
             }),
             needs: needs.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -798,6 +800,7 @@ mod tests {
                     "-c".to_string(),
                     "echo 'visible-cause' 1>&2; exit 7".to_string(),
                 ],
+                stdin: None,
             }),
             needs: Vec::new(),
         }]);
@@ -859,6 +862,7 @@ mod tests {
                         "-c".to_string(),
                         "echo 'recoverable' 1>&2; exit 9".to_string(),
                     ],
+                    stdin: None,
                 }),
                 needs: Vec::new(),
             },
@@ -914,6 +918,7 @@ mod tests {
                     "-c".to_string(),
                     "echo 'this is the failure reason' 1>&2; exit 2".to_string(),
                 ],
+                stdin: None,
             }),
             needs: Vec::new(),
         }]);

@@ -69,6 +69,11 @@ pub struct ShellNodeRequest {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Content piped into the child's stdin. Already rendered by the
+    /// time it reaches the executor. `None` means the child sees a
+    /// closed stdin (`Stdio::null()`). See `ShellNode::stdin`.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +146,15 @@ pub fn render_request(
             for (i, arg) in n.args.iter().enumerate() {
                 args.push(tmpl.render(&format!("shell.args[{i}]"), arg, &ctx_json)?);
             }
-            Ok(NodeRequest::Shell(ShellNodeRequest { command, args }))
+            let stdin = match n.stdin.as_deref() {
+                Some(s) => Some(tmpl.render("shell.stdin", s, &ctx_json)?),
+                None => None,
+            };
+            Ok(NodeRequest::Shell(ShellNodeRequest {
+                command,
+                args,
+                stdin,
+            }))
         }
     }
 }
@@ -187,6 +200,7 @@ mod tests {
         let shell = NodeKind::Shell(ShellNode {
             command: "true".into(),
             args: Vec::new(),
+            stdin: None,
         });
         assert_eq!(kind_str(&agent), "agent");
         assert_eq!(kind_str(&shell), "shell");
@@ -248,6 +262,7 @@ mod tests {
         let kind = NodeKind::Shell(ShellNode {
             command: "echo".into(),
             args: vec!["hi".into(), "there".into()],
+            stdin: None,
         });
         let tmpl = TemplateEngine::new();
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());

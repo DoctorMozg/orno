@@ -271,6 +271,7 @@ mod tests {
                 kind: NodeKind::Shell(ShellNode {
                     command: "true".to_string(),
                     args: Vec::new(),
+                    stdin: None,
                 }),
                 needs: needs.iter().map(|s| (*s).to_string()).collect(),
             })

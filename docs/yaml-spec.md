@@ -239,6 +239,21 @@ Non-agentic subprocess invocation. Not subject to agent policy.
   args: ["diff", "--stat", "HEAD~1..HEAD"]
 ```
 
+Fields:
+
+- `command: string` — program name (argv[0]). Not passed through a shell.
+- `args: [string]` — argv entries. Each entry is rendered through the template engine.
+- `stdin: string` (optional) — content piped into the child's stdin. Rendered through the same template context as `command` and `args`. When omitted, stdin is closed (`Stdio::null()`) — a child that reads stdin sees EOF immediately. Use `stdin:` to hand untrusted or multi-line content to a subprocess without the shell-escaping hazards of embedding it in `args`.
+
+```yaml
+- id: save_plan
+  kind: shell
+  needs: [plan]
+  command: sh
+  args: ["-c", "mkdir -p {{ vars.output_dir }} && cat > {{ vars.output_path }}"]
+  stdin: "{{ nodes.plan.content }}"
+```
+
 For subprocess invocations **inside** an agent loop, use the `Bash` tool (which *is* policy-gated). `kind: shell` exists for deterministic pipeline steps that don't need a model.
 
 ## Templates
@@ -248,7 +263,7 @@ MiniJinja (auto-escape disabled) renders the following strings:
 - `agents.*.system`
 - `agents.*.allowed_tools[*]` (for MCP tool names with `{{ vars.* }}` interpolation)
 - `nodes[*].initial_prompt`
-- `nodes[*].command` / `args` (shell nodes)
+- `nodes[*].command` / `args` / `stdin` (shell nodes)
 - `mcp_servers.*.command` / `url` / `env.*` / `auth.token`
 
 Template context:

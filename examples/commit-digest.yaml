@@ -33,6 +33,7 @@ vars:
   output_dir: target/orno-digest
   digest_path: target/orno-digest/digest.md
   tracker_path: target/orno-digest/tracker.md
+  next_steps_path: target/orno-digest/next-steps.md
 
 agents:
   status_writer:
@@ -83,8 +84,8 @@ agents:
       - Edit
     policy:
       max_iterations: 20
-      max_total_tokens: 40000
-      max_tool_calls: 15
+      max_total_tokens: 100000
+      max_tool_calls: 50
       max_subagent_depth: 1
       allow_mutations: true
       allow_network: true
@@ -110,7 +111,7 @@ agents:
     allowed_tools: []
     policy:
       max_iterations: 1
-      max_total_tokens: 500
+      max_total_tokens: 6000
       max_tool_calls: 0
       max_subagent_depth: 0
       allow_mutations: false
@@ -127,7 +128,7 @@ agents:
     allowed_tools: []
     policy:
       max_iterations: 1
-      max_total_tokens: 800
+      max_total_tokens: 6000
       max_tool_calls: 0
       max_subagent_depth: 0
       allow_mutations: false
@@ -190,3 +191,18 @@ nodes:
       {{ nodes.digest.content }}
 
       List the three next steps.
+
+  - id: write_next_steps
+    # The next_steps agent is pure summarizer — zero tool surface,
+    # mutation-denied. This shell node persists its output so the
+    # pipeline has a durable artifact without granting the agent
+    # filesystem access. `stdin:` hands the rendered content to `cat`
+    # verbatim; no shell expansion happens on $, backticks, or quotes
+    # because the LLM output never touches argv.
+    kind: shell
+    needs: [plan]
+    command: sh
+    args:
+      - "-c"
+      - "mkdir -p {{ vars.output_dir }} && cat > {{ vars.next_steps_path }}"
+    stdin: "{{ nodes.plan.content }}"
