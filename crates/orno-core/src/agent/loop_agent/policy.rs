@@ -69,7 +69,7 @@ impl LoopAgent {
                         .await);
                 }
                 // Gap 1 — domain gate. URL extracted from `url` arg;
-                // anything else (missing arg, non-string, unparseable)
+                // anything else (missing arg, non-string, unparsable)
                 // falls through to the handler which will produce its
                 // own error. Skipping the check on a missing URL is safe
                 // because the handler itself cannot reach the network
@@ -87,9 +87,8 @@ impl LoopAgent {
                     // through under naive equality, and applies the same
                     // rule to the allowlist so operators can whitelist a
                     // parent domain without enumerating every subdomain.
-                    let host_matches = |d: &String| -> bool {
-                        host == *d || host.ends_with(&format!(".{d}"))
-                    };
+                    let host_matches =
+                        |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
                     if policy.blocked_domains.iter().any(host_matches) {
                         return Ok(self
                             .deny(

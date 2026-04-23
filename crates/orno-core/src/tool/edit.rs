@@ -175,6 +175,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_contains_expected_fields() {
+        let schema = EditHandler.schema();
+
+        assert_eq!(
+            schema["type"].as_str(),
+            Some("object"),
+            "schema root must be an object: {schema}"
+        );
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema must expose a properties object");
+        for field in ["path", "old_string", "new_string"] {
+            assert!(
+                properties.contains_key(field),
+                "properties missing {field}: {schema}"
+            );
+        }
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("schema must expose a required array")
+            .iter()
+            .map(|v| v.as_str().expect("required entries are strings"))
+            .collect();
+        for field in ["path", "old_string", "new_string"] {
+            assert!(
+                required.contains(&field),
+                "`{field}` must be required: {required:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn missing_old_string_arg_returns_invalid_args() {
         let handler = EditHandler;

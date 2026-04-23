@@ -84,6 +84,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_contains_expected_fields() {
+        let schema = ReadHandler.schema();
+
+        assert_eq!(
+            schema["type"].as_str(),
+            Some("object"),
+            "schema root must be an object: {schema}"
+        );
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema must expose a properties object");
+        assert!(
+            properties.contains_key("path"),
+            "properties missing path: {schema}"
+        );
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("schema must expose a required array")
+            .iter()
+            .map(|v| v.as_str().expect("required entries are strings"))
+            .collect();
+        assert!(
+            required.contains(&"path"),
+            "`path` must be required: {required:?}"
+        );
+    }
+
     #[tokio::test]
     async fn nonexistent_file_returns_invocation_error() {
         let handler = ReadHandler;

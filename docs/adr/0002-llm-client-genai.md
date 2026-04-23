@@ -13,7 +13,7 @@ specification, so an SDK's type strictness is its abstraction leak. aider,
 continue, and codex-cli all wrap HTTP directly for this reason.
 
 The `genai` crate is the cleanest multi-provider abstraction in the Rust
-ecosystem and normalises `reasoning_content` across vendors. Its downsides
+ecosystem and normalizes `reasoning_content` across vendors. Its downsides
 per the research: it contradicts an OpenAI-compat-only constraint and ties
 the project to a 0.5→0.6-alpha release cadence.
 
@@ -44,7 +44,7 @@ directly. The dependency stays swappable.
 ## Consequences
 
 - Saves multiple weeks of hand-rolling chat-completions DTOs, SSE dialect
-  parsing per provider, and tool-call normalisation.
+  parsing per provider, and tool-call normalization.
 - Accepts coupling to `genai`'s release cadence and its opinion on the
   provider set. If `genai` breaks badly, the trait boundary lets us swap in a
   hand-rolled transport without rewriting callers.

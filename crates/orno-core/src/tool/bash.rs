@@ -181,6 +181,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_contains_expected_fields() {
+        let schema = BashHandler.schema();
+
+        assert_eq!(
+            schema["type"].as_str(),
+            Some("object"),
+            "schema root must be an object: {schema}"
+        );
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema must expose a properties object");
+        for field in ["command", "timeout_secs", "cwd"] {
+            assert!(
+                properties.contains_key(field),
+                "properties missing {field}: {schema}"
+            );
+        }
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("schema must expose a required array")
+            .iter()
+            .map(|v| v.as_str().expect("required entries are strings"))
+            .collect();
+        assert!(
+            required.contains(&"command"),
+            "`command` must be required: {required:?}"
+        );
+        assert!(
+            !required.contains(&"timeout_secs"),
+            "`timeout_secs` must remain optional: {required:?}"
+        );
+        assert!(
+            !required.contains(&"cwd"),
+            "`cwd` must remain optional: {required:?}"
+        );
+    }
+
     #[tokio::test]
     async fn cwd_is_respected() {
         let tmp = TempDir::new().expect("create tempdir");

@@ -137,6 +137,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn schema_contains_expected_fields() {
+        let schema = WebFetchHandler.schema();
+
+        assert_eq!(
+            schema["type"].as_str(),
+            Some("object"),
+            "schema root must be an object: {schema}"
+        );
+
+        let properties = schema["properties"]
+            .as_object()
+            .expect("schema must expose a properties object");
+        assert!(
+            properties.contains_key("url"),
+            "properties missing url: {schema}"
+        );
+
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("schema must expose a required array")
+            .iter()
+            .map(|v| v.as_str().expect("required entries are strings"))
+            .collect();
+        assert!(
+            required.contains(&"url"),
+            "`url` must be required: {required:?}"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_url_returns_invocation_error() {
         let handler = WebFetchHandler;
