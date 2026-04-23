@@ -41,6 +41,21 @@ fn validates_example_pipeline() {
 }
 
 #[test]
+fn validates_scoped_state_example() {
+    // ADR 0025: the scoped-state example exercises `SetState` +
+    // `allow_context_writes: true` + a downstream shell node that
+    // templates `nodes.<id>.state.<key>`. Validation is enough here —
+    // the happy-path runtime behavior is covered by unit tests in
+    // `orno-core`, and running the example end-to-end would require a
+    // live LLM key (DummyTransport can't script tool calls).
+    orno()
+        .args(["validate", "../../examples/scoped-state.yaml"])
+        .assert()
+        .success()
+        .stdout(contains("ok: version=1 nodes=2"));
+}
+
+#[test]
 fn run_emits_lifecycle_events() {
     let assert = orno_with_dummy_transport()
         .args(["run", "../../examples/hello.yaml"])

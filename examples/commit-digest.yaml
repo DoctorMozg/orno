@@ -188,7 +188,7 @@ nodes:
     needs: [digest]
     initial_prompt: |
       Status digest:
-      {{ nodes.digest.content }}
+      {{ nodes.digest.output }}
 
       List the three next steps.
 
@@ -205,4 +205,4 @@ nodes:
     args:
       - "-c"
       - "mkdir -p {{ vars.output_dir }} && cat > {{ vars.next_steps_path }}"
-    stdin: "{{ nodes.plan.content }}"
+    stdin: "{{ nodes.plan.output }}"

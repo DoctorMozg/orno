@@ -73,6 +73,13 @@ pub struct AgentOutput {
     /// the same subagent-observability reason as `iterations`.
     #[serde(default)]
     pub total_tokens: u64,
+    /// Node-scoped state tree produced by `SetState` calls during the
+    /// loop (ADR 0025). `None` when the agent made no `SetState` calls
+    /// or the policy denied them — `AgentExecutor` elides the
+    /// `state` field from `nodes.<id>` serialization in that case so
+    /// pipelines that don't use the feature see no shape change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<serde_json::Value>,
 }
 
 /// Agent-loop contract. Every `kind: agent` node executes through an

@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=../schemas/pipeline.schema.json
+# Scoped-state example (ADR 0025). An agent inspects a short bug
+# description, publishes structured triage fields via `SetState`, and a
+# downstream shell node renders those fields into a triage summary file
+# without re-parsing the assistant's free-form reply.
+#
+# Demonstrates:
+#
+#   SetState                     — write `nodes.<self>.state.<key>`
+#   allow_context_writes: true   — the opt-in gate for `context_self`
+#                                  tools (ADR 0025 amending ADR 0005 §3)
+#   nodes.<id>.state.<key>       — downstream template access to a key
+#                                  the upstream agent wrote, sibling to
+#                                  the existing nodes.<id>.output slot
+#                                  (ADR 0025 amending ADR 0010).
+#
+# Prereqs:
+#   - $OPENROUTER_API_KEY in the environment
+#
+# This example exercises the happy path called out in ADR 0025 §7; it
+# does not demonstrate oversize-payload or malformed-key rejection —
+# both are covered by unit tests.
+
+version: 1
+
+vars:
+  bug_description: |
+    Users report the "Export CSV" button on the reports page hangs for
+    large datasets (>50k rows). Browser freezes for ~20s, then resolves.
+    Started after the 2026-04-18 release. No errors in server logs.
+  output_dir: target/orno-scoped-state
+  summary_path: target/orno-scoped-state/triage-summary.md
+
+agents:
+  triager:
+    model: anthropic/claude-haiku-4.5
+    provider: openrouter
+    system: |
+      You triage bug reports into structured fields. You have exactly
+      one tool — `SetState` — and three fields to publish.
+
+      Method (follow in order):
+        1. Call SetState with key="severity" and a JSON string value
+           from the set {"low", "medium", "high", "critical"}.
+        2. Call SetState with key="category" and a JSON string value
+           from {"performance", "correctness", "ui", "infra", "other"}.
+        3. Call SetState with key="next_action" and a JSON string
+           value — one imperative sentence describing the immediate
+           next step.
+        4. Reply with a one-sentence summary of the triage. Do not
+           call any more tools after the reply.
+
+      Base every field on the bug description. Do not invent context
+      the description does not contain. If the description is too thin
+      to pick a level with confidence, choose "low" / "other" / "Ask
+      the reporter for reproduction steps."
+    allowed_tools:
+      - SetState
+    policy:
+      max_iterations: 6
+      max_total_tokens: 8000
+      max_tool_calls: 6
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      allow_context_writes: true
+      on_parse_error: retry_once
+
+nodes:
+  - id: triage
+    kind: agent
+    agent: triager
+    initial_prompt: |
+      Bug description:
+      {{ vars.bug_description }}
+
+      Follow the method in your system prompt. Publish the three fields
+      via SetState, then reply with the summary.
+
+  - id: write_summary
+    # Pure shell node — proves scoped state flows across the DAG. The
+    # agent has no filesystem tool surface (`allow_mutations: false`);
+    # this node is what actually persists the triage to disk. Each
+    # `{{ nodes.triage.state.<key> }}` render is the exact value the
+    # agent handed to `SetState`, not a regex over its final message.
+    kind: shell
+    needs: [triage]
+    command: sh
+    args:
+      - "-c"
+      - "mkdir -p {{ vars.output_dir }} && cat > {{ vars.summary_path }}"
+    stdin: |
+      # Triage summary
+
+      - Severity:    {{ nodes.triage.state.severity }}
+      - Category:    {{ nodes.triage.state.category }}
+      - Next action: {{ nodes.triage.state.next_action }}
+
+      Agent summary: {{ nodes.triage.output }}

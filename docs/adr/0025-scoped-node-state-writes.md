@@ -77,7 +77,9 @@ happen.
 - `key: "plan"` writes to `nodes.<self>.state.plan`.
 - `key` must match `[A-Za-z_][A-Za-z0-9_]*` and be non-empty. Empty,
   dot-containing, or otherwise malformed keys are
-  `ToolError::InvalidArgs { reason }` — the gate has already cleared
+  `ToolError::InvalidArgs { name: "SetState", message: "..." }` —
+  reusing the pre-existing `InvalidArgs` variant that every other
+  builtin returns for shape mismatches. The gate has already cleared
   the call, so this is an argument-validation error, not a policy
   denial.
 - A second call with the same `key` **replaces** the prior value
@@ -211,10 +213,10 @@ being emitted.
   engine's existing `record_node_output` stores the combined object
   under `nodes.<id>`. Templates read `nodes.<id>.output` and
   `nodes.<id>.state.*` exactly as described in §2.
-- **`ToolError`** gains two variants under `#[non_exhaustive]`:
-  `InvalidArgs { reason }` and `StateTooLarge { bytes, cap }`. Every
-  variant carries enough structured detail that a reader does not
-  have to grep the message.
+- **`ToolError`** gains one new variant under `#[non_exhaustive]`:
+  `StateTooLarge { name, bytes, cap }`. The pre-existing
+  `InvalidArgs { name, message }` variant already covers malformed-key
+  reporting and is reused as-is — no churn to every other builtin.
 - **`LoopAgent` and `LoopAgentConfig`** grow a per-node state buffer
   plumbed to the `SetState` handler. The plumbing is internal; the
   public `LoopAgent::new` signature is unchanged. `ToolInvocation`

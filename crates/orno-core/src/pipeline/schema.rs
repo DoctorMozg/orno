@@ -116,12 +116,15 @@ pub struct AgentConfig {
     pub policy: AgentPolicy,
 }
 
-/// Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017). Every
-/// field is required; defaults belong in docs and examples, not silently
-/// in code. Wall-clock is **not** here — ADR 0017 promotes it to a
-/// universal node-level `timeout:` attribute applicable to every
-/// `NodeKind`; the attribute is not yet modeled on `Node` and lands with
-/// the Phase 4–5 executor work.
+/// Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017,
+/// extended by ADR 0025). Every field is required in Rust construction;
+/// defaults belong in docs and examples, not silently in code.
+/// `allow_context_writes` gets `#[serde(default)]` so pre-ADR-0025 YAML
+/// pipelines keep deserializing — the default `false` matches the old
+/// behavior of "no mutable context." Wall-clock is **not** here — ADR
+/// 0017 promotes it to a universal node-level `timeout:` attribute
+/// applicable to every `NodeKind`; the attribute is not yet modeled on
+/// `Node` and lands with the Phase 4–5 executor work.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentPolicy {
     pub max_iterations: u32,
@@ -130,6 +133,13 @@ pub struct AgentPolicy {
     pub max_subagent_depth: u32,
     pub allow_mutations: bool,
     pub allow_network: bool,
+    /// Gates `ToolEffect::ContextSelf` (the `SetState` builtin, ADR
+    /// 0025). Defaults to `false` so a pipeline that never references
+    /// the new tool behaves identically to pre-ADR-0025 builds. When
+    /// `false`, any `SetState` call returns a tool-result denial string
+    /// exactly like `allow_mutations=false` denies filesystem tools.
+    #[serde(default)]
+    pub allow_context_writes: bool,
     #[serde(default)]
     pub allowed_domains: Vec<String>,
     #[serde(default)]

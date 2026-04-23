@@ -1,5 +1,3 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.68s
-     Running `target/debug/orno schema`
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pipeline",
@@ -117,9 +115,14 @@
       ]
     },
     "AgentPolicy": {
-      "description": "Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017). Every\nfield is required; defaults belong in docs and examples, not silently\nin code. Wall-clock is **not** here — ADR 0017 promotes it to a\nuniversal node-level `timeout:` attribute applicable to every\n`NodeKind`; the attribute is not yet modeled on `Node` and lands with\nthe Phase 4–5 executor work.",
+      "description": "Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017,\nextended by ADR 0025). Every field is required in Rust construction;\ndefaults belong in docs and examples, not silently in code.\n`allow_context_writes` gets `#[serde(default)]` so pre-ADR-0025 YAML\npipelines keep deserializing — the default `false` matches the old\nbehavior of \"no mutable context.\" Wall-clock is **not** here — ADR\n0017 promotes it to a universal node-level `timeout:` attribute\napplicable to every `NodeKind`; the attribute is not yet modeled on\n`Node` and lands with the Phase 4–5 executor work.",
       "type": "object",
       "properties": {
+        "allow_context_writes": {
+          "description": "Gates `ToolEffect::ContextSelf` (the `SetState` builtin, ADR\n0025). Defaults to `false` so a pipeline that never references\nthe new tool behaves identically to pre-ADR-0025 builds. When\n`false`, any `SetState` call returns a tool-result denial string\nexactly like `allow_mutations=false` denies filesystem tools.",
+          "type": "boolean",
+          "default": false
+        },
         "allow_mutations": {
           "type": "boolean"
         },

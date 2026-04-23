@@ -128,12 +128,22 @@ fn agent_error_to_node(id: &str, err: AgentError) -> NodeError {
     }
 }
 
+/// Shape `AgentOutput` into the object downstream templates see as
+/// `nodes.<id>`. ADR 0025 (amending ADR 0010) codifies `output` for the
+/// final LLM text and `state` for the `SetState`-written object; the
+/// pre-ADR skeleton used `content` which no pipeline ever referenced.
+/// `state` is only present when the agent made at least one `SetState`
+/// call so pipelines that don't opt into the feature see no shape
+/// change.
 fn agent_output_to_json(out: &AgentOutput) -> serde_json::Value {
-    json!({
-        "content": out.content,
-        "finish_reason": out.finish_reason,
-        "usage": out.usage,
-    })
+    let mut obj = serde_json::Map::new();
+    obj.insert("output".to_string(), json!(out.content));
+    if let Some(state) = &out.state {
+        obj.insert("state".to_string(), state.clone());
+    }
+    obj.insert("finish_reason".to_string(), json!(out.finish_reason));
+    obj.insert("usage".to_string(), json!(out.usage));
+    serde_json::Value::Object(obj)
 }
 
 #[cfg(test)]
@@ -190,6 +200,7 @@ mod tests {
             max_subagent_depth: 0,
             allow_mutations: false,
             allow_network: false,
+            allow_context_writes: false,
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
@@ -220,6 +231,7 @@ mod tests {
             }),
             iterations: 0,
             total_tokens: 7,
+            state: None,
         });
         let exec = AgentExecutor::from_agent(fake);
 
@@ -228,10 +240,45 @@ mod tests {
             .await
             .expect("adapter must forward successful agent output");
 
+        // ADR 0025 amends ADR 0010: the wire shape is `{output, state?,
+        // finish_reason, usage}`. `state` is absent when the agent made
+        // no `SetState` calls so pipelines that don't use the feature
+        // see no shape change from the pre-ADR skeleton.
         assert_eq!(resp.node_id, "n");
-        assert_eq!(resp.output["content"], "hello");
+        assert_eq!(resp.output["output"], "hello");
+        assert!(
+            resp.output.get("state").is_none(),
+            "state must be absent when AgentOutput.state is None: {:?}",
+            resp.output,
+        );
         assert_eq!(resp.output["finish_reason"], "stop");
         assert_eq!(resp.output["usage"]["total_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn wraps_state_when_set_state_was_called() {
+        // Sibling of the baseline: when the agent wrote under `state.*`,
+        // the adapter must surface that object on `NodeResponse.output`
+        // so downstream templates can read `nodes.<id>.state.key` per
+        // ADR 0025.
+        let fake = FakeAgent::ok(AgentOutput {
+            content: "hello".into(),
+            finish_reason: Some("stop".into()),
+            usage: None,
+            iterations: 0,
+            total_tokens: 0,
+            state: Some(json!({ "plan": { "status": "ready" }, "count": 3 })),
+        });
+        let exec = AgentExecutor::from_agent(fake);
+
+        let resp = exec
+            .execute("run_test", "n", agent_node_request())
+            .await
+            .expect("adapter must forward output with state");
+
+        assert_eq!(resp.output["output"], "hello");
+        assert_eq!(resp.output["state"]["plan"]["status"], "ready");
+        assert_eq!(resp.output["state"]["count"], 3);
     }
 
     #[tokio::test]

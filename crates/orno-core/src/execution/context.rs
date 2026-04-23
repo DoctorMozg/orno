@@ -66,9 +66,12 @@ impl Context {
 
     /// Store a completed upstream node's output under `nodes.<id>`.
     /// For shell nodes the output is `{ stdout, stderr, exit_code }`;
-    /// for agent nodes it is the final assistant message payload.
-    /// The scheduler is authoritative for calling this only on
-    /// success (failed nodes are `Skipped`, not recorded).
+    /// for agent nodes it is `{ output, state?, finish_reason, usage }`
+    /// where `output` is the final assistant message and `state` is
+    /// present only when the agent made at least one `SetState` call
+    /// (ADR 0025 amending ADR 0010). The scheduler is authoritative
+    /// for calling this only on success (failed nodes are `Skipped`,
+    /// not recorded).
     pub fn record_node_output(&mut self, node_id: &str, output: Value) {
         self.nodes.insert(node_id.to_string(), output);
     }

@@ -238,6 +238,19 @@ pub enum ToolError {
     #[error("tool `{name}` arguments invalid: {message}")]
     InvalidArgs { name: String, message: String },
 
+    /// A `SetState` call would push the serialized size of
+    /// `nodes.<self>.state` past `EngineConfig.max_output_bytes`. The
+    /// write is rejected and the previous state is left intact. ADR
+    /// 0025 §5 — shared cap with stderr tails, API body excerpts, and
+    /// prompt/response excerpts so one knob governs every
+    /// wire-emitted value.
+    #[error("tool `{name}` write rejected: state size {bytes} exceeds cap {cap}")]
+    StateTooLarge {
+        name: String,
+        bytes: usize,
+        cap: usize,
+    },
+
     /// This handler is not yet wired (stub). Indicates a Phase 5+
     /// feature that the caller declared but has not been implemented.
     #[error("tool `{name}` not implemented yet: {feature}")]

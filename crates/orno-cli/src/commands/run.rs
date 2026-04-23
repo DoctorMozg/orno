@@ -29,8 +29,8 @@ use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, ReadHandler, SubagentHandler, ToolHandler, WebFetchHandler,
-    WriteHandler,
+    BashHandler, EditHandler, ReadHandler, SetStateHandler, SubagentHandler, ToolHandler,
+    WebFetchHandler, WriteHandler,
 };
 
 /// Test-only escape hatch: when set to `dummy`, `orno run` swaps
@@ -87,16 +87,31 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let mut registry = NodeRegistry::new();
     registry.register("shell", Arc::new(ShellExecutor));
-    // Built-in tool set per ADR 0008. `LoopAgent` gates each call
-    // against the per-agent `AgentPolicy.allowed_tools` list, so an
-    // agent that does not opt into a handler cannot reach it — the
-    // registration here is the availability ceiling, not the default.
+
+    // Reuse the engine's `max_output_bytes` for the LLM body excerpt
+    // cap so a truncated stderr tail, a truncated HTTP error body, and
+    // a truncated prompt/response excerpt all look alike to a log
+    // reader (ADR 0023 / 0024). `SetStateHandler` (ADR 0025 §5) uses
+    // the same cap for its whole-state serialize-and-measure check so
+    // an oversize write is comparable to an oversize excerpt.
+    let body_excerpt_max_bytes = engine_config.max_output_bytes;
+
+    // Built-in tool set per ADR 0008 + ADR 0025 (SetState). `LoopAgent`
+    // gates each call against the per-agent `AgentPolicy.allowed_tools`
+    // list, so an agent that does not opt into a handler cannot reach
+    // it — the registration here is the availability ceiling, not the
+    // default. `SetStateHandler` shares the run-level redactor so
+    // `secrets.*` leaves are scrubbed before state reaches the wire.
     let builtin_tools: Vec<Arc<dyn ToolHandler>> = vec![
         Arc::new(BashHandler),
         Arc::new(ReadHandler),
         Arc::new(WriteHandler),
         Arc::new(EditHandler),
         Arc::new(WebFetchHandler),
+        Arc::new(SetStateHandler::new(
+            redactor.clone(),
+            body_excerpt_max_bytes,
+        )),
     ];
 
     // ADR 0006: build the `LoopAgent` inside `Arc::new_cyclic` so each
@@ -109,11 +124,6 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     // One handler per entry in `pipeline.agents`: the YAML form
     // `subagent.<name>` is the same string the parent's `allowed_tools`
     // references, so registration key = handler name = allowlist entry.
-    // Reuse the engine's `max_output_bytes` for the LLM body excerpt
-    // cap so a truncated stderr tail, a truncated HTTP error body, and
-    // a truncated prompt/response excerpt all look alike to a log
-    // reader (ADR 0023 / 0024).
-    let body_excerpt_max_bytes = engine_config.max_output_bytes;
     let event_sink = sink.clone();
     let loop_agent: Arc<LoopAgent> = Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
         let mut tools = builtin_tools.clone();

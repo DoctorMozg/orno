@@ -26,15 +26,16 @@
 //! back to a handler.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::{Map, Value};
 use tracing::instrument;
 
 use crate::error::{AgentError, ToolError};
 use crate::events::{BudgetKind, Event, EventSink, LlmFailure, Redactor, truncate_excerpt};
 use crate::llm::{LlmRequest, LlmTransport, OrnoChatMessage, OrnoChatTool, OrnoChatToolCall};
-use crate::tool::{ToolEffect, ToolHandler, ToolInvocation};
+use crate::tool::{StateHandle, ToolEffect, ToolHandler, ToolInvocation};
 
 use super::{Agent, AgentOutput, AgentRequest};
 
@@ -176,6 +177,14 @@ impl LoopAgent {
                     ));
                 }
             }
+            ToolEffect::ContextSelf => {
+                if !policy.allow_context_writes {
+                    return Ok(format!(
+                        "denied: tool `{}` blocked by allow_context_writes=false",
+                        tool_call.fn_name,
+                    ));
+                }
+            }
             ToolEffect::ReadOnly => {}
         }
 
@@ -192,6 +201,20 @@ impl LoopAgent {
                 source,
             }),
         }
+    }
+}
+
+/// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
+/// `None` when no `SetState` call landed — keeps the wire shape of
+/// `nodes.<id>` unchanged for pipelines that never opt into the feature
+/// (ADR 0025 §2). A poisoned mutex also reports `None` since the
+/// offending panic has already terminated the relevant tool call; a
+/// partial buffer would be worse than no state.
+fn final_state(buf: &Mutex<Value>) -> Option<Value> {
+    let guard = buf.lock().ok()?;
+    match &*guard {
+        Value::Object(m) if m.is_empty() => None,
+        other => Some(other.clone()),
     }
 }
 
@@ -227,6 +250,13 @@ impl Agent for LoopAgent {
                 return Err(AgentError::UnknownToolCalled { name: name.clone() });
             }
         }
+
+        // Per-node state buffer for the `SetState` builtin (ADR 0025).
+        // One object per `run()` call, visible only to tool dispatches
+        // inside this loop. Subagent recursion calls `run()` again and
+        // gets a fresh buffer — child state never leaks into the parent.
+        let state_buffer: Mutex<Value> = Mutex::new(Value::Object(Map::new()));
+        let state_handle = StateHandle::new(&state_buffer);
 
         // Build the tool definitions the LLM sees on each request —
         // intersection of `allowed_tools` and the registered handler
@@ -353,12 +383,18 @@ impl Agent for LoopAgent {
 
             // No tool calls → the model produced a final text answer.
             if response.tool_calls.is_empty() {
+                // ADR 0025 §2: the `state` field is `None` when the
+                // agent made no `SetState` calls. An empty buffer maps
+                // to `None` so pipelines that never use the feature see
+                // no shape change on `nodes.<id>`.
+                let state = final_state(&state_buffer);
                 return Ok(AgentOutput {
                     content: response.content,
                     finish_reason: response.finish_reason,
                     usage: response.usage,
                     iterations: iteration,
                     total_tokens,
+                    state,
                 });
             }
 
@@ -419,6 +455,7 @@ impl Agent for LoopAgent {
                             node_id,
                             call_id: &tool_call.call_id,
                             depth: req.depth,
+                            state_handle: Some(state_handle),
                         };
                         self.check_policy_and_invoke(handler, tool_call, &req.policy, inv)
                             .await?
@@ -434,6 +471,7 @@ impl Agent for LoopAgent {
                         node_id,
                         call_id: &tool_call.call_id,
                         depth: req.depth,
+                        state_handle: Some(state_handle),
                     };
                     self.check_policy_and_invoke(handler, tool_call, &req.policy, inv)
                         .await?
@@ -513,6 +551,7 @@ mod tests {
             max_subagent_depth: 0,
             allow_mutations: false,
             allow_network: false,
+            allow_context_writes: false,
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
@@ -994,6 +1033,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_writes_denied_feeds_back_as_tool_result_and_loop_continues() {
+        // ADR 0025 §3: `ContextSelf` tools are gated by
+        // `allow_context_writes`. Like `Mutations` / `Network` denials,
+        // a refusal is non-terminal — the denial string reaches the
+        // model as a `ToolResult` and the loop continues. A SetState
+        // call with the flag off must not mutate the node-state buffer
+        // and must not terminate the loop.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::ContextSelf, "should not run"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response("c1", "EchoTool", serde_json::json!({})),
+            ScriptedTransport::text_response("noted — state writes disabled"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_context_writes = false;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("context-writes denial must feed back, not terminate");
+
+        assert!(
+            out.content.contains("state writes disabled"),
+            "final output should carry the model's acknowledgment: {:?}",
+            out.content,
+        );
+        // The denial string must be routed as the tool's `ToolResult`
+        // so a downstream pair of `ToolCallRecorded` + next
+        // `LlmRequestStarted` shows the gate fired.
+        let events = sink.snapshot();
+        let recorded = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+            .expect("ToolCallRecorded must still fire for a gated ContextSelf call");
+        if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+            assert!(
+                output_excerpt.contains("allow_context_writes=false"),
+                "denial excerpt must name the gate: {output_excerpt:?}",
+            );
+        }
+        // ADR 0025 §2: because no SetState write landed, the buffer stays
+        // empty and `AgentOutput.state` collapses to `None`.
+        assert!(
+            out.state.is_none(),
+            "no SetState call landed, state must be None: {:?}",
+            out.state,
+        );
+    }
+
+    #[tokio::test]
     async fn mutations_denied_feeds_back_as_tool_result_and_loop_continues() {
         // ADR 0005 §3: bounded effects via the feed-back mechanism. A
         // denied mutation is *not* a terminal error — the denial string
@@ -1072,6 +1173,53 @@ mod tests {
             Some("stop"),
             "finish_reason should be stop for a completed text turn",
         );
+    }
+
+    #[tokio::test]
+    async fn set_state_call_surfaces_in_agent_output_state() {
+        // ADR 0025 end-to-end check: a `ContextSelf` tool that writes
+        // through the per-call `state_handle` must appear in the
+        // returned `AgentOutput.state`. The flag is on, the handler is
+        // the real `SetStateHandler`, and the transport scripts one
+        // SetState call followed by a text turn so the loop exits on
+        // iteration two with the buffer populated.
+        use crate::tool::SetStateHandler;
+
+        let sink = Arc::new(InMemorySink::new());
+        let redactor = Arc::new(crate::events::Redactor::default());
+        let state_tool = Arc::new(SetStateHandler::new(redactor.clone(), 2048));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "SetState",
+                serde_json::json!({ "key": "plan", "value": { "status": "ready" } }),
+            ),
+            ScriptedTransport::text_response("wrote plan"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink,
+            redactor,
+            body_excerpt_max_bytes: 2048,
+            tools: vec![state_tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_context_writes = true;
+        req.allowed_tools = vec!["SetState".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("SetState dispatch succeeds");
+
+        let state = out
+            .state
+            .expect("state must be present after a SetState call");
+        assert_eq!(state["plan"]["status"], "ready");
     }
 
     /// Dotted-name handler used to exercise the wire-name translation

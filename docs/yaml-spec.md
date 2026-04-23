@@ -128,6 +128,7 @@ my_agent:
     max_subagent_depth: 3
     allow_mutations: false
     allow_network: false
+    allow_context_writes: false  # opt-in for SetState (ADR 0025)
     allowed_domains: []
     blocked_domains: []
     on_parse_error: fail       # fail | retry_once
@@ -139,7 +140,7 @@ my_agent:
 
 Each entry matches one of:
 
-- A builtin name: `Bash`, `Read`, `Edit`, `Write`, `WebFetch` (ADR 0008 table).
+- A builtin name: `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `SetState` (ADR 0008 + ADR 0025).
 - A specific MCP tool: `"mcp.<server>.<tool>"` where `<server>` is a key in the top-level `mcp_servers:` map and `<tool>` is a tool advertised by that server.
 - An MCP server wildcard: `"mcp.<server>.*"` — every tool the server advertises.
 - A subagent reference: `"subagent.<agent-name>"` where `<agent-name>` is a key in `agents:`. The tool takes `{ prompt: string }`; the parent's emitted prompt becomes the child's `initial_prompt` for a fresh agent run (ADR 0006). Requires `max_subagent_depth > 0`.
@@ -159,6 +160,7 @@ See ADR 0005 for full definitions. Brief reference:
 - `max_tool_calls` — counts every attempted tool call including blocked and subagent calls.
 - `max_subagent_depth` — 0 disables subagents entirely.
 - `allow_mutations` / `allow_network` — gate tool calls by declared effect class (ADR 0008).
+- `allow_context_writes` — gate `SetState` and other `context_self` tools (ADR 0025). Off by default; an agent that never writes scoped state has no reason to opt in. Refusal feeds back to the model as a denial string; the loop continues.
 - `allowed_domains` / `blocked_domains` — domain name list for `WebFetch` and network-capable MCP tools. Blocklist wins on overlap. Subdomain matching: `"api.github.com"` matches exactly; `".github.com"` matches any subdomain; `"github.com"` matches both the bare host and any subdomain.
 - `on_parse_error` — what to do when the model returns malformed JSON for a tool call's arguments. `fail` terminates; `retry_once` feeds the parse error back as a tool-result message and loops once more.
 
@@ -251,7 +253,7 @@ Fields:
   needs: [plan]
   command: sh
   args: ["-c", "mkdir -p {{ vars.output_dir }} && cat > {{ vars.output_path }}"]
-  stdin: "{{ nodes.plan.content }}"
+  stdin: "{{ nodes.plan.output }}"
 ```
 
 For subprocess invocations **inside** an agent loop, use the `Bash` tool (which *is* policy-gated). `kind: shell` exists for deterministic pipeline steps that don't need a model.
@@ -272,6 +274,7 @@ Template context:
 - `env.<NAME>` — pipeline inputs. See [Environment and secrets](#environment-and-secrets); undeclared names are a template-render error, never a silent empty string.
 - `secrets.<NAME>` — redacted credentials. See [Environment and secrets](#environment-and-secrets); values are replaced with `***` in every event and trace.
 - `nodes.<id>.output` — final assistant message from a completed upstream `kind: agent` node. Available in nodes whose `needs:` includes `<id>`.
+- `nodes.<id>.state.<key>` — scoped key written by the upstream agent's `SetState` tool (ADR 0025). Only present when the agent made at least one `SetState` call; referencing an absent `state.<key>` is a template-render error. Keys are single-level identifiers (`[A-Za-z_][A-Za-z0-9_]*`), not dotted paths.
 - `nodes.<id>.stdout` / `.stderr` / `.exit_code` — per-channel results from a completed upstream `kind: shell` node (ADR 0017 §2). Shell nodes do **not** expose `.output`; referencing it is a template-render error.
 - `nodes.<id>.status` — terminal `NodeStatus` for any completed upstream node (`completed | failed | timed_out | skipped`).
 
@@ -284,7 +287,10 @@ Template context:
 | `Write`    | local_write             | `allow_mutations: true`                   |
 | `Bash`     | shell (mut + net)       | both `allow_mutations` and `allow_network` |
 | `WebFetch` | network_read            | `allow_network: true` + domain rules      |
+| `SetState` | context_self            | `allow_context_writes: true`              |
 | `mcp.*`    | declared by the server  | matches the advertised effect             |
+
+The `SetState` builtin writes a single top-level key under `nodes.<self>.state.*` (ADR 0025). Arguments: `{ key: string, value: <json> }`. `key` matches `^[A-Za-z_][A-Za-z0-9_]*$` — single-level only, no dotted paths. A second call with the same key overwrites the prior value wholesale; the whole state tree is size-capped at the engine's `max_output_bytes`. Secret-valued leaves are redacted before storage. State writes affect only the current node; downstream nodes that `needs:` this one read through `nodes.<id>.state.<key>`.
 
 Blocking behavior:
 

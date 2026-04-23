@@ -6,9 +6,12 @@
 pub mod bash;
 pub mod edit;
 pub mod read;
+pub mod set_state;
 pub mod subagent;
 pub mod web_fetch;
 pub mod write;
+
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -18,6 +21,7 @@ use crate::error::ToolError;
 pub use bash::BashHandler;
 pub use edit::EditHandler;
 pub use read::ReadHandler;
+pub use set_state::SetStateHandler;
 pub use subagent::SubagentHandler;
 pub use web_fetch::WebFetchHandler;
 pub use write::WriteHandler;
@@ -37,6 +41,12 @@ pub enum ToolEffect {
     Network,
     /// Both mutations and network. Requires both policies.
     MutationsAndNetwork,
+    /// Mutates `nodes.<self>.state.*` via the `SetState` builtin (ADR
+    /// 0025). Requires `allow_context_writes`. Does not imply
+    /// `Mutations` — external side effects (fs/process) still require
+    /// that flag. Confined to the current node; cross-node state is
+    /// ADR 0026's territory.
+    ContextSelf,
 }
 
 /// Per-call context threaded from `LoopAgent` into `ToolHandler::invoke`.
@@ -46,8 +56,10 @@ pub enum ToolEffect {
 ///
 /// `SubagentHandler` uses `depth` to bound recursion (ADR 0006) and
 /// `run_id` / `node_id` to emit `SubagentStarted` / `SubagentCompleted`
-/// events on the shared sink. Builtin handlers typically ignore every
-/// field but `call_id`.
+/// events on the shared sink. `SetStateHandler` (ADR 0025) uses
+/// `state_handle` to persist its writes without relying on global
+/// state. Builtin handlers that care about none of these typically
+/// ignore every field but `call_id`.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolInvocation<'a> {
     /// Run identifier the parent agent is executing under (`run_<ULID>`).
@@ -62,6 +74,34 @@ pub struct ToolInvocation<'a> {
     /// `N` agent dispatches the child at depth `N + 1`, bounded by
     /// `AgentPolicy.max_subagent_depth` (ADR 0006).
     pub depth: u32,
+    /// Writable handle to the current node's `state` buffer (ADR 0025).
+    /// `Some` only when the node's `allow_context_writes` policy is set
+    /// and the handler is dispatched through `LoopAgent`. `SetState`
+    /// reaches for this; every other handler leaves it alone.
+    pub state_handle: Option<StateHandle<'a>>,
+}
+
+/// Borrow-scoped pointer to a single node's `state` buffer. Held for
+/// the duration of a tool dispatch and released immediately after.
+/// Created by `LoopAgent`; constructed nowhere else so the buffer
+/// lifetime is controlled at one point in the crate.
+///
+/// The underlying `Mutex` is `std::sync::Mutex` rather than
+/// `tokio::sync::Mutex` because the lock is taken only for the synchronous
+/// read-modify-write inside `SetStateHandler::invoke` — never held across
+/// an `.await`.
+#[derive(Debug, Clone, Copy)]
+pub struct StateHandle<'a> {
+    pub(crate) buf: &'a Mutex<Value>,
+}
+
+impl<'a> StateHandle<'a> {
+    /// Wrap a borrowed `Mutex<Value>` into a handle. `pub(crate)` so
+    /// only the agent crate can mint a handle; ADR 0025 confines writes
+    /// to `LoopAgent`-dispatched flows.
+    pub(crate) fn new(buf: &'a Mutex<Value>) -> Self {
+        Self { buf }
+    }
 }
 
 // Explicit `'a` on the impl binds the `&'a str` parameter in `for_test`
@@ -79,6 +119,7 @@ impl<'a> ToolInvocation<'a> {
             node_id: "n",
             call_id,
             depth: 0,
+            state_handle: None,
         }
     }
 }

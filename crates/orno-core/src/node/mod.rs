@@ -185,6 +185,7 @@ mod tests {
             max_subagent_depth: 0,
             allow_mutations: false,
             allow_network: false,
+            allow_context_writes: false,
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
