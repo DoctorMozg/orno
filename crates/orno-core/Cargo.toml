@@ -25,6 +25,7 @@ ulid = { workspace = true }
 genai = { workspace = true }
 blake3 = { workspace = true }
 reqwest = { workspace = true }
+rmcp = { workspace = true }
 async-trait = "0.1"
 
 [dev-dependencies]

@@ -40,6 +40,24 @@ cargo nextest run --workspace --all-targets         # faster test runner (option
 
 CI (`.github/workflows/ci.yml`) runs 9 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `test`, `msrv`, and `coverage`. A release-build matrix runs on ubuntu-latest, macos-14, and windows-2022. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — Phase 2 activation after doc comments exist.
 
+## Verification after every change batch
+
+After any batch of edits — before reporting the task as done — run the full CI-equivalent gate locally, in this order:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets
+cargo deny check
+cargo machete
+typos
+cargo doc --workspace --all-features --no-deps
+```
+
+All seven must pass. A green `cargo test` alone is not sufficient: `cargo deny` catches new advisories on transitive deps (including `rmcp` → `paste`), `typos` catches wording drift in doc comments and ADRs, `machete` catches dead deps, `cargo doc` catches broken intra-doc links, and `fmt`/`clippy` catch style and lint regressions that will fail CI. Never claim a change is complete based on a subset — CI runs all of them and will red-flag anything skipped locally.
+
+If a gate fails on something unrelated to the current change (e.g. a newly-reported advisory on a transitive dep), fix it or add a targeted ignore with a rationale in `deny.toml`. Never bypass with `--no-verify`, `allow(...)` blanket suppressions, or by deleting the failing test — the gate is there to catch real drift and suppressing it silently accrues debt.
+
 ## Workspace shape
 
 Two crates, enforced by ADR 0001:

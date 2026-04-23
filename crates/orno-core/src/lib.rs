@@ -18,12 +18,13 @@ pub mod error;
 pub mod events;
 pub mod execution;
 pub mod llm;
+pub mod mcp;
 pub mod node;
 pub mod pipeline;
 pub mod telemetry;
 pub mod tool;
 
-pub use error::{AgentError, CoreError, LlmError, NodeError, PipelineError, ToolError};
+pub use error::{AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, ToolError};
 
 /// Render the pipeline JSON Schema as a pretty-printed string. Used by the
 /// `orno schema` subcommand; IDEs can reference the committed file via a

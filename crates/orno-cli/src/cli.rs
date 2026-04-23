@@ -54,6 +54,26 @@ pub enum Command {
         /// when `--verbose`. An explicit value here always wins.
         #[arg(long = "stderr-tail-bytes", value_name = "BYTES")]
         stderr_tail_bytes: Option<usize>,
+
+        /// Write all LLM request/response pairs to a tape file for later
+        /// replay. Creates or truncates the file. Mutually exclusive with
+        /// `--replay-tape`.
+        #[arg(
+            long = "record-tape",
+            value_name = "PATH",
+            conflicts_with = "replay_tape"
+        )]
+        record_tape: Option<PathBuf>,
+
+        /// Replay LLM calls from a tape file instead of hitting the live
+        /// API. A tape miss returns an error without a fallback call.
+        /// Mutually exclusive with `--record-tape`.
+        #[arg(
+            long = "replay-tape",
+            value_name = "PATH",
+            conflicts_with = "record_tape"
+        )]
+        replay_tape: Option<PathBuf>,
     },
 
     /// Load and validate a pipeline YAML without running it.

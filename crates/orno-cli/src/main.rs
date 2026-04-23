@@ -50,6 +50,8 @@ async fn dispatch(args: Cli) -> Result<()> {
             secrets_file,
             verbose,
             stderr_tail_bytes,
+            record_tape,
+            replay_tape,
         } => {
             let flags = commands::run::RunFlags {
                 inline_env: env,
@@ -61,6 +63,8 @@ async fn dispatch(args: Cli) -> Result<()> {
                 } else {
                     2048
                 }),
+                record_tape,
+                replay_tape,
             };
             commands::run::run(&pipeline, flags).await
         },

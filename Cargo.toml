@@ -82,6 +82,22 @@ genai = "=0.6.0-beta.17"
 # pools are needed for a simple GET.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
+# MCP stack (ADR 0007). Pinned to 0.2; rmcp has pre-1.0 API churn.
+# Access goes only through McpClient (orno-core types never re-export
+# rmcp items). Features enumerated explicitly per default-features = false
+# discipline; exact names verified at build time.
+rmcp = { version = "0.2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    # base64 and macros are unconditionally imported in rmcp 0.2.1 despite
+    # being optional — must be listed explicitly to avoid link errors.
+    # transport-streamable-http-client omitted: its reqwest impl has the same
+    # bug; HTTP transport stubs return UnsupportedTransport until rmcp fixes
+    # its feature gating.
+    "base64",
+    "macros",
+] }
+
 # Replay tape keying. A 256-bit hash of the rendered prompt plus the
 # provider+model pair indexes `ReplayTransport`'s in-memory map.
 blake3 = "1"

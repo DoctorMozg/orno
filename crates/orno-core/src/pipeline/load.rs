@@ -96,6 +96,46 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
         )));
     }
 
+    // Validate per-agent tool allowlists.
+    // – `mcp.<server>.*` and `mcp.<server>.<tool>` must name a server declared
+    //   in `Pipeline.mcp_servers`.
+    // – `subagent.<child>` must name an agent declared in `Pipeline.agents`;
+    //   compose-down requires the child's effect policy to be no more
+    //   permissive than the parent's (ADR 0006 §compose-down).
+    for (agent_name, agent_config) in &pipeline.agents {
+        for tool in &agent_config.allowed_tools {
+            if let Some(rest) = tool.strip_prefix("mcp.") {
+                let server = rest.split('.').next().unwrap_or("");
+                if !pipeline.mcp_servers.contains_key(server) {
+                    return Err(PipelineError::Validation(format!(
+                        "agent `{agent_name}` references MCP tool `{tool}` \
+                         with unknown server `{server}`"
+                    )));
+                }
+            } else if let Some(child_name) = tool.strip_prefix("subagent.") {
+                let child = pipeline.agents.get(child_name).ok_or_else(|| {
+                    PipelineError::Validation(format!(
+                        "agent `{agent_name}` references unknown subagent \
+                             `{child_name}`"
+                    ))
+                })?;
+
+                if !agent_config.policy.allow_mutations && child.policy.allow_mutations {
+                    return Err(PipelineError::Validation(format!(
+                        "agent `{agent_name}` (allow_mutations=false) cannot \
+                         delegate to `{child_name}` (allow_mutations=true)"
+                    )));
+                }
+                if !agent_config.policy.allow_network && child.policy.allow_network {
+                    return Err(PipelineError::Validation(format!(
+                        "agent `{agent_name}` (allow_network=false) cannot \
+                         delegate to `{child_name}` (allow_network=true)"
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -105,7 +145,10 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use crate::pipeline::schema::{Node, NodeKind, Pipeline, ShellNode};
+    use crate::pipeline::schema::{
+        AgentConfig, AgentPolicy, McpServerConfig, McpStdioConfig, Node, NodeKind, OnParseError,
+        Pipeline, ShellNode,
+    };
 
     fn shell_node(id: &str, needs: &[&str]) -> Node {
         Node {
@@ -171,6 +214,136 @@ mod tests {
     fn well_formed_pipeline_is_accepted() {
         let p = pipeline(vec![shell_node("a", &[]), shell_node("b", &["a"])]);
         assert!(validate(&p).is_ok(), "valid pipeline should pass");
+    }
+
+    fn base_policy(allow_mutations: bool, allow_network: bool) -> AgentPolicy {
+        AgentPolicy {
+            max_iterations: 1,
+            max_total_tokens: 1000,
+            max_tool_calls: 5,
+            max_subagent_depth: 1,
+            allow_mutations,
+            allow_network,
+            allow_context_writes: false,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            on_parse_error: OnParseError::Fail,
+        }
+    }
+
+    fn agent_config(
+        allowed_tools: Vec<String>,
+        allow_mutations: bool,
+        allow_network: bool,
+    ) -> AgentConfig {
+        AgentConfig {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            system: None,
+            allowed_tools,
+            policy: base_policy(allow_mutations, allow_network),
+        }
+    }
+
+    fn stdio_mcp_server() -> McpServerConfig {
+        McpServerConfig::Stdio(McpStdioConfig {
+            command: vec!["echo".to_string()],
+            env: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn mcp_tool_with_unknown_server_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config(vec!["mcp.ghost.tool".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for unknown MCP server");
+        };
+        assert!(
+            msg.contains("ghost"),
+            "error should name the unknown server: {msg}"
+        );
+    }
+
+    #[test]
+    fn mcp_wildcard_with_known_server_is_accepted() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert("fs".to_string(), stdio_mcp_server());
+        p.agents.insert(
+            "a".to_string(),
+            agent_config(vec!["mcp.fs.*".to_string()], false, true),
+        );
+        assert!(validate(&p).is_ok());
+    }
+
+    #[test]
+    fn subagent_referencing_unknown_agent_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.ghost".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for unknown subagent");
+        };
+        assert!(
+            msg.contains("ghost"),
+            "error should name the missing child: {msg}"
+        );
+    }
+
+    #[test]
+    fn subagent_more_permissive_mutations_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents
+            .insert("child".to_string(), agent_config(Vec::new(), true, false));
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.child".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected compose-down validation error");
+        };
+        assert!(
+            msg.contains("allow_mutations"),
+            "error should name the policy dimension: {msg}"
+        );
+    }
+
+    #[test]
+    fn subagent_more_permissive_network_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents
+            .insert("child".to_string(), agent_config(Vec::new(), false, true));
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.child".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected compose-down validation error");
+        };
+        assert!(
+            msg.contains("allow_network"),
+            "error should name the policy dimension: {msg}"
+        );
+    }
+
+    #[test]
+    fn subagent_same_or_more_restrictive_policy_is_accepted() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "child".to_string(),
+            // same policy as parent
+            agent_config(Vec::new(), false, false),
+        );
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.child".to_string()], false, false),
+        );
+        assert!(validate(&p).is_ok());
     }
 
     #[test]

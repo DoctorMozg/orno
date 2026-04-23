@@ -13,25 +13,33 @@
 //! routed to `secrets.*`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 
+use orno_core::McpError;
 use orno_core::agent::{Agent, LoopAgent, LoopAgentConfig};
-use orno_core::events::{EventSink, Redactor, StreamingSink};
+use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
-use orno_core::llm::{DummyTransport, GenAiTransport, LlmTransport};
+use orno_core::llm::{
+    DummyTransport, GenAiTransport, LlmTransport, RecordingTransport, ReplayTransport,
+};
+use orno_core::mcp::{McpClient, McpTool, McpToolCallResult, RmcpClient};
 use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
 use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
+use orno_core::pipeline::schema::McpServerConfig;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, ReadHandler, SetStateHandler, SubagentHandler, ToolHandler,
-    WebFetchHandler, WriteHandler,
+    BashHandler, EditHandler, McpToolHandler, McpToolHandlerConfig, ReadHandler, SetStateHandler,
+    SubagentHandler, ToolHandler, WebFetchHandler, WriteHandler,
 };
+use serde_json::Value;
 
 /// Test-only escape hatch: when set to `dummy`, `orno run` swaps
 /// `GenAiTransport` for `DummyTransport` so integration tests can
@@ -39,6 +47,39 @@ use orno_core::tool::{
 /// is intentionally awkward — end users should never set it.
 /// Record/replay tape wiring (Phase 7) will subsume this.
 const TEST_TRANSPORT_ENV: &str = "ORNO_TEST_LLM_TRANSPORT";
+
+/// Mutex-guarded wrapper that lets the orchestrator hold a single MCP
+/// client behind `Arc<dyn McpClient>` for `McpToolHandler` dispatch while
+/// still calling `initialize()` / `shutdown()` via the mutex. v0.1.0
+/// executes tool calls serially, so the mutex never contends at runtime.
+struct SharedMcpClient {
+    server: String,
+    inner: tokio::sync::Mutex<Box<dyn McpClient>>,
+}
+
+impl fmt::Debug for SharedMcpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedMcpClient")
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl McpClient for SharedMcpClient {
+    fn server_name(&self) -> &str {
+        &self.server
+    }
+    async fn initialize(&mut self) -> Result<Vec<McpTool>, McpError> {
+        self.inner.lock().await.initialize().await
+    }
+    async fn call_tool(&self, tool: &str, args: Value) -> Result<McpToolCallResult, McpError> {
+        self.inner.lock().await.call_tool(tool, args).await
+    }
+    async fn shutdown(&mut self) -> Result<(), McpError> {
+        self.inner.lock().await.shutdown().await
+    }
+}
 
 /// Parsed CLI flags consumed by the env/secrets resolver.
 #[derive(Debug, Default)]
@@ -53,8 +94,19 @@ pub struct RunFlags {
     /// resolves the default-vs-verbose policy before this struct
     /// is built.
     pub max_output_bytes: usize,
+    /// When `Some`, wrap the live transport in `RecordingTransport`
+    /// and flush to this path at run end. Mutually exclusive with
+    /// `replay_tape`.
+    pub record_tape: Option<PathBuf>,
+    /// When `Some`, use `ReplayTransport` instead of the live transport.
+    /// Mutually exclusive with `record_tape`.
+    pub replay_tape: Option<PathBuf>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "run() is the top-level orchestrator for orno run; splitting it adds indirection without reducing conceptual load"
+)]
 pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     let pipeline = pipeline::load::load_from_path(path)
         .with_context(|| format!("loading pipeline `{}`", path.display()))?;
@@ -68,12 +120,33 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let sink: Arc<dyn EventSink> = Arc::new(StreamingSink::stdout());
 
-    let transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
+    let base_transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
         _ => Arc::new(
             GenAiTransport::from_agents(&pipeline.agents, &inputs.secrets)
                 .context("constructing LLM transport from pipeline agents")?,
         ),
+    };
+
+    // --replay-tape: swap the live transport for a tape reader. A tape
+    // miss is a hard error — no fallback to the live API (ADR 0005 §5).
+    // --record-tape: wrap the live transport to record (req, resp) pairs.
+    // We keep an Arc<RecordingTransport> alongside so we can flush after
+    // engine.run() — the trait does not expose flush().
+    let mut recording_transport: Option<Arc<RecordingTransport>> = None;
+    let transport: Arc<dyn LlmTransport> = if let Some(path) = &flags.replay_tape {
+        let replay = ReplayTransport::load(path)
+            .with_context(|| format!("loading replay tape `{}`", path.display()))?;
+        Arc::new(replay)
+    } else if let Some(path) = &flags.record_tape {
+        let rec = Arc::new(
+            RecordingTransport::create(base_transport, path)
+                .with_context(|| format!("creating record tape `{}`", path.display()))?,
+        );
+        recording_transport = Some(rec.clone());
+        rec
+    } else {
+        base_transport
     };
 
     // Build the redactor once from the resolved `secrets.*` map and
@@ -96,13 +169,94 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     // an oversize write is comparable to an oversize excerpt.
     let body_excerpt_max_bytes = engine_config.max_output_bytes;
 
+    // run_id must be minted before MCP lifecycle events are emitted so
+    // they carry a valid envelope correlation id.
+    let run_id = new_run_id();
+
+    // Spawn MCP servers declared in `Pipeline.mcp_servers` (ADR 0007).
+    // Each server initializes once before the engine runs. `McpToolHandler`
+    // instances are built per-tool and added to the agent's tool surface.
+    // On failure, `McpServerCrashed` is emitted and the run aborts.
+    let mut mcp_clients: Vec<Arc<SharedMcpClient>> = Vec::new();
+    let mut mcp_tools: Vec<Arc<dyn ToolHandler>> = Vec::new();
+
+    for (server_name, server_cfg) in &pipeline.mcp_servers {
+        let transport_label = match server_cfg {
+            McpServerConfig::Stdio(_) => "stdio",
+            McpServerConfig::Http(_) => "http",
+            _ => "unknown",
+        };
+        sink.record(Event::McpServerStarting {
+            run_id: run_id.clone(),
+            server: server_name.clone(),
+            transport: transport_label.to_string(),
+        })
+        .await;
+
+        let raw: Box<dyn McpClient> = match server_cfg {
+            McpServerConfig::Stdio(cfg) => {
+                Box::new(RmcpClient::new_stdio(server_name.clone(), cfg))
+            },
+            McpServerConfig::Http(cfg) => Box::new(RmcpClient::new_http(server_name.clone(), cfg)),
+            _ => {
+                bail!("unsupported MCP transport for server `{server_name}`");
+            },
+        };
+        let shared = Arc::new(SharedMcpClient {
+            server: server_name.clone(),
+            inner: tokio::sync::Mutex::new(raw),
+        });
+
+        // Drop the MutexGuard before entering the match so `shared` can be
+        // moved into `mcp_clients` inside the Ok arm.
+        let init_result = shared.inner.lock().await.initialize().await;
+        match init_result {
+            Ok(tools) => {
+                let tool_count = u32::try_from(tools.len()).unwrap_or(u32::MAX);
+                sink.record(Event::McpServerHandshaked {
+                    run_id: run_id.clone(),
+                    server: server_name.clone(),
+                    tool_count,
+                })
+                .await;
+
+                for tool in &tools {
+                    mcp_tools.push(Arc::new(McpToolHandler::new(
+                        McpToolHandlerConfig {
+                            yaml_name: format!("mcp.{server_name}.{}", tool.name),
+                            server: server_name.clone(),
+                            tool: tool.name.clone(),
+                            description: tool.description.clone(),
+                            schema: tool.schema.clone(),
+                            body_excerpt_max_bytes,
+                        },
+                        shared.clone() as Arc<dyn McpClient>,
+                        sink.clone(),
+                    )));
+                }
+
+                mcp_clients.push(shared);
+            },
+            Err(e) => {
+                sink.record(Event::McpServerCrashed {
+                    run_id: run_id.clone(),
+                    server: server_name.clone(),
+                    reason: e.to_string(),
+                })
+                .await;
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("MCP server `{server_name}` failed to initialize"));
+            },
+        }
+    }
+
     // Built-in tool set per ADR 0008 + ADR 0025 (SetState). `LoopAgent`
     // gates each call against the per-agent `AgentPolicy.allowed_tools`
     // list, so an agent that does not opt into a handler cannot reach
     // it — the registration here is the availability ceiling, not the
     // default. `SetStateHandler` shares the run-level redactor so
     // `secrets.*` leaves are scrubbed before state reaches the wire.
-    let builtin_tools: Vec<Arc<dyn ToolHandler>> = vec![
+    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> = vec![
         Arc::new(BashHandler),
         Arc::new(ReadHandler),
         Arc::new(WriteHandler),
@@ -113,6 +267,7 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
             body_excerpt_max_bytes,
         )),
     ];
+    builtin_tools.extend(mcp_tools);
 
     // ADR 0006: build the `LoopAgent` inside `Arc::new_cyclic` so each
     // `SubagentHandler` can hold a `Weak<LoopAgent>` back-pointer into
@@ -151,10 +306,32 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let templates = Arc::new(TemplateEngine::new());
 
-    let engine = Engine::new(sink, registry, templates, engine_config);
-    let run_id = new_run_id();
+    let engine = Engine::new(sink.clone(), registry, templates, engine_config);
 
     engine.run(&run_id, &pipeline, inputs).await?;
+
+    if let Some(rec) = recording_transport {
+        rec.flush().context("flushing LLM tape after run")?;
+    }
+
+    // Shut down MCP servers in declaration order. Best-effort per ADR 0007:
+    // a failing shutdown emits a warning but does not abort a successful run.
+    for client in &mcp_clients {
+        sink.record(Event::McpServerShuttingDown {
+            run_id: run_id.clone(),
+            server: client.server.clone(),
+        })
+        .await;
+        if let Err(e) = client.inner.lock().await.shutdown().await {
+            tracing::warn!(server = %client.server, error = ?e, "MCP server shutdown failed");
+        }
+        sink.record(Event::McpServerExited {
+            run_id: run_id.clone(),
+            server: client.server.clone(),
+        })
+        .await;
+    }
+
     Ok(())
 }
 

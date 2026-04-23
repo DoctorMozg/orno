@@ -20,6 +20,9 @@ pub enum CoreError {
 
     #[error(transparent)]
     Tool(#[from] ToolError),
+
+    #[error(transparent)]
+    Mcp(#[from] McpError),
 }
 
 #[derive(Debug, Error)]
@@ -217,6 +220,59 @@ pub enum LlmError {
     /// never falls through to a live call.
     #[error("replay tape miss for key `{key}`")]
     ReplayMiss { key: String },
+}
+
+/// Errors surfaced from [`crate::mcp::McpClient`] implementations.
+/// One variant per discernible cause so downstream consumers can branch
+/// without regex-matching the chain. No `rmcp` types appear here —
+/// `RmcpClient` maps them at the trait boundary (ADR 0007).
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum McpError {
+    #[error("failed to spawn MCP server `{server}`")]
+    SpawnFailed {
+        server: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("MCP handshake failed with server `{server}`")]
+    HandshakeFailed {
+        server: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("MCP server `{server}` tool call `{tool}` failed")]
+    CallFailed {
+        server: String,
+        tool: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// MCP-protocol-level tool error (server returned `isError: true`).
+    /// This is data, not a transport failure — the tool ran but reported
+    /// an error payload. Distinct from `CallFailed` which is a wire/transport
+    /// failure.
+    #[error("MCP server `{server}` tool `{tool}` reported error: {message}")]
+    ToolError {
+        server: String,
+        tool: String,
+        message: String,
+    },
+
+    #[error("MCP server `{server}` crashed mid-run")]
+    ServerCrashed { server: String },
+
+    #[error("MCP transport `{transport}` is not supported in this build")]
+    UnsupportedTransport { transport: String },
+
+    #[error("MCP server `{server}` shutdown timed out after {secs}s")]
+    ShutdownTimeout { server: String, secs: u64 },
+
+    #[error("MCP server `{server}` does not advertise tool `{tool}`")]
+    UnknownTool { server: String, tool: String },
 }
 
 /// Errors surfaced from [`crate::tool::ToolHandler::invoke`].

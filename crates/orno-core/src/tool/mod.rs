@@ -5,7 +5,9 @@
 
 pub mod bash;
 pub mod edit;
+pub mod mcp_handler;
 pub mod read;
+pub mod recording;
 pub mod set_state;
 pub mod subagent;
 pub mod web_fetch;
@@ -20,7 +22,9 @@ use crate::error::ToolError;
 
 pub use bash::BashHandler;
 pub use edit::EditHandler;
+pub use mcp_handler::{McpToolHandler, McpToolHandlerConfig};
 pub use read::ReadHandler;
+pub use recording::{RecordingToolHandler, ReplayToolHandler, ToolTapeEntry};
 pub use set_state::SetStateHandler;
 pub use subagent::SubagentHandler;
 pub use web_fetch::WebFetchHandler;

@@ -17,8 +17,12 @@ feature-depth = 1
 version = 2
 yanked  = "warn"
 ignore  = [
-    # Add entries as:
-    # { id = "RUSTSEC-YYYY-NNNN", reason = "why this is safe / not reachable" },
+    # `paste` is unmaintained (repo archived upstream). It reaches our tree
+    # as a transitive proc-macro dep of `rmcp` (ADR 0007: MCP client). No
+    # safe upgrade is available (pastey/with_builtin_macros are forks, not
+    # drop-in at rmcp's pinned version). Revisit when rmcp drops the dep
+    # or we switch MCP stacks.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained paste proc-macro reached via rmcp (ADR 0007); no safe upgrade yet" },
 ]
 
 # --- License policy (AGPL-3.0 project; only permissive deps allowed) ---

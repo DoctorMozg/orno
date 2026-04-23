@@ -193,4 +193,59 @@ pub enum Event {
         limit_secs: u64,
         elapsed_ms: u64,
     },
+    /// Emitted before spawning an MCP server declared in
+    /// `Pipeline.mcp_servers`. `transport` is `"stdio"` or `"http"`.
+    McpServerStarting {
+        run_id: String,
+        server: String,
+        transport: String,
+    },
+    /// Emitted after MCP `initialize` + `tools/list` complete.
+    /// `tool_count` is the number of tools the server advertised.
+    McpServerHandshaked {
+        run_id: String,
+        server: String,
+        tool_count: u32,
+    },
+    /// Emitted immediately before a `tools/call` is issued. `input_excerpt`
+    /// is the JSON arguments, redacted and head-truncated to the engine's
+    /// `max_output_bytes` cap.
+    McpToolCallSent {
+        run_id: String,
+        node_id: String,
+        server: String,
+        tool: String,
+        call_id: String,
+        input_excerpt: String,
+    },
+    /// Emitted immediately after a `tools/call` returns. `ok` discriminates
+    /// MCP-protocol-reported tool errors from successes. `output_excerpt`
+    /// is the content, redacted and head-truncated.
+    McpToolCallCompleted {
+        run_id: String,
+        node_id: String,
+        server: String,
+        tool: String,
+        call_id: String,
+        ok: bool,
+        output_excerpt: String,
+    },
+    /// Emitted before initiating a clean shutdown at run end.
+    McpServerShuttingDown {
+        run_id: String,
+        server: String,
+    },
+    /// Emitted after a clean shutdown completed (exit status on stdio,
+    /// connection close on http).
+    McpServerExited {
+        run_id: String,
+        server: String,
+    },
+    /// Emitted when the server crashed mid-run. Per ADR 0007 the owning
+    /// agent terminates with a tool-call failure.
+    McpServerCrashed {
+        run_id: String,
+        server: String,
+        reason: String,
+    },
 }
