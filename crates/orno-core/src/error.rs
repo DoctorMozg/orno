@@ -118,20 +118,21 @@ pub enum AgentError {
     #[error("agent exceeded budget: {kind:?}")]
     BudgetExceeded { kind: crate::events::BudgetKind },
 
-    /// A tool that requires `allow_mutations=true` was called but the
-    /// agent policy forbids mutations. The denial is fed back to the
-    /// model (ADR 0005 §3); this variant remains available for
-    /// strict-mode use.
+    /// Reserved for a future strict-termination mode. Effect denials are currently
+    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
+    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
     #[error("tool `{tool_name}` blocked by allow_mutations=false")]
     MutatingCallBlocked { tool_name: String },
 
-    /// A tool that requires `allow_network=true` was called but the
-    /// agent policy forbids network access.
+    /// Reserved for a future strict-termination mode. Effect denials are currently
+    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
+    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
     #[error("tool `{tool_name}` blocked by allow_network=false")]
     NetworkBlocked { tool_name: String },
 
-    /// A network tool was called against a domain that is either on the
-    /// `blocked_domains` list or not on the `allowed_domains` allowlist.
+    /// Reserved for a future strict-termination mode. Effect denials are currently
+    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
+    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
     #[error("tool `{tool_name}` blocked for domain `{domain}`")]
     DomainBlocked { tool_name: String, domain: String },
 

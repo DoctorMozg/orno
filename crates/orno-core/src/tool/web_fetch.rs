@@ -2,7 +2,9 @@
 //! Domain policy is enforced by `LoopAgent` before dispatch.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
@@ -11,6 +13,22 @@ use crate::error::ToolError;
 // the agent. Keeps a runaway page from blowing out the LLM context
 // window on the next turn.
 const MAX_BODY_BYTES: usize = 1_048_576;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WebFetchArgs {
+    #[schemars(description = "URL to fetch.")]
+    url: String,
+}
+
+/// List the top-level field names of a JSON-object argument bundle
+/// without echoing their values, for inclusion in `InvalidArgs`
+/// messages.
+fn arg_field_names(args: &Value) -> String {
+    args.as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct WebFetchHandler;
@@ -24,29 +42,27 @@ impl ToolHandler for WebFetchHandler {
         "HTTP GET a URL and return the response body and content-type. Up to 1 MiB."
     }
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "URL to fetch." }
-            },
-            "required": ["url"]
-        })
+        serde_json::to_value(schemars::schema_for!(WebFetchArgs)).expect("static schema")
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::Network
     }
     async fn invoke(&self, _inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let url =
-            args.get("url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::InvalidArgs {
-                    name: "WebFetch".to_string(),
-                    message: "missing required field `url`".to_string(),
-                })?;
+        // Retain the args' field names (not values) so the error message
+        // pins the offending field even when serde only reports a
+        // type-level mismatch (e.g. `invalid type: integer …, expected a
+        // string`). Values are omitted to avoid echoing caller-supplied
+        // payloads into the log.
+        let fields = arg_field_names(&args);
+        let WebFetchArgs { url } =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                name: "WebFetch".to_string(),
+                message: format!("{e} (fields: {fields})"),
+            })?;
 
         let client = reqwest::Client::new();
         let response = client
-            .get(url)
+            .get(&url)
             .send()
             .await
             .map_err(|err| ToolError::Invocation {
@@ -87,6 +103,7 @@ impl ToolHandler for WebFetchHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[tokio::test]
     async fn missing_url_arg_returns_invalid_args() {

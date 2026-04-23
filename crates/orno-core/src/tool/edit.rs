@@ -2,11 +2,24 @@
 //! Requires `allow_mutations`.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, instrument};
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EditArgs {
+    #[schemars(description = "File path to edit.")]
+    path: String,
+    #[schemars(description = "Unique substring to replace.")]
+    old_string: String,
+    #[schemars(description = "Replacement text.")]
+    new_string: String,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct EditHandler;
@@ -20,15 +33,7 @@ impl ToolHandler for EditHandler {
         "Replace old_string with new_string in the file at path. Fails if old_string is not unique or not found."
     }
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "old_string": { "type": "string", "description": "Unique substring to replace." },
-                "new_string": { "type": "string", "description": "Replacement text." }
-            },
-            "required": ["path", "old_string", "new_string"]
-        })
+        serde_json::to_value(schemars::schema_for!(EditArgs)).expect("static schema")
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutations
@@ -36,32 +41,14 @@ impl ToolHandler for EditHandler {
 
     #[instrument(skip(self, args), fields(tool.name = "Edit", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
-                name: "Edit".to_string(),
-                message: "missing or non-string `path`".to_string(),
-            })?
-            .to_string();
-
-        let old_string = args
-            .get("old_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
-                name: "Edit".to_string(),
-                message: "missing or non-string `old_string`".to_string(),
-            })?
-            .to_string();
-
-        let new_string = args
-            .get("new_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
-                name: "Edit".to_string(),
-                message: "missing or non-string `new_string`".to_string(),
-            })?
-            .to_string();
+        let EditArgs {
+            path,
+            old_string,
+            new_string,
+        } = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+            name: "Edit".to_string(),
+            message: e.to_string(),
+        })?;
 
         let original = std::fs::read_to_string(&path).map_err(|e| ToolError::Invocation {
             name: "Edit".to_string(),
@@ -99,6 +86,7 @@ impl ToolHandler for EditHandler {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[tokio::test]

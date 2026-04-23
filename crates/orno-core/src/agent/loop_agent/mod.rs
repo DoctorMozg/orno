@@ -742,7 +742,7 @@ mod tests {
 
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
-            sink,
+            sink: sink.clone(),
             redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
@@ -763,6 +763,24 @@ mod tests {
             "final output should carry the model's acknowledgment: {:?}",
             out.content,
         );
+
+        let events = sink.snapshot();
+        let denied_event = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolDenied { .. }))
+            .expect("ToolDenied must fire for a mutations denial");
+        if let Event::ToolDenied {
+            tool_name, reason, ..
+        } = &denied_event.event
+        {
+            assert_eq!(tool_name, "EchoTool");
+            assert!(
+                reason.contains("allow_mutations=false"),
+                "reason was: {reason}",
+            );
+        } else {
+            panic!("unexpected event type");
+        }
     }
 
     #[tokio::test]
@@ -1234,6 +1252,225 @@ mod tests {
         assert!(
             reason.contains("random.example"),
             "reason should name the rejected host: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_domains_matches_subdomain_by_suffix() {
+        // Suffix matching invariant: `blocked_domains: ["evil.com"]`
+        // must deny `sub.evil.com`, closing the footgun where naive
+        // equality let subdomains through.
+        use crate::tool::WebFetchHandler;
+
+        let sink = Arc::new(InMemorySink::new());
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "WebFetch",
+                serde_json::json!({ "url": "https://sub.evil.com/data" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![handler],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.blocked_domains = vec!["evil.com".into()];
+        req.allowed_tools = vec!["WebFetch".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("subdomain denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must fire for a subdomain of a blocked domain");
+        assert!(
+            reason.contains("sub.evil.com"),
+            "reason should name the rejected host: {reason:?}",
+        );
+        assert!(
+            reason.contains("blocked_domains"),
+            "reason should name the gate: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_domains_does_not_match_unrelated_host_with_shared_suffix() {
+        // Suffix matching must not misfire on `notevil.com` when
+        // `blocked_domains: ["evil.com"]`: the match requires either
+        // exact equality or a `.`-separated suffix, not a raw string
+        // suffix. Without this guard an attacker could register a
+        // sibling name that passes the filter.
+        //
+        // Uses `EchoTool` with `ToolEffect::Network` so the policy gate
+        // runs (examining the `url` arg) without the handler actually
+        // hitting the network.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "ok"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "EchoTool",
+                serde_json::json!({ "url": "https://notevil.com/data" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.blocked_domains = vec!["evil.com".into()];
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("unrelated host must not terminate");
+
+        let events = sink.snapshot();
+        let denied = events.iter().find_map(|e| match &e.event {
+            Event::ToolDenied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        });
+        assert!(
+            denied.is_none(),
+            "ToolDenied must NOT fire for notevil.com when only evil.com is blocked: {denied:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_domains_still_matches_exact_host() {
+        // Suffix matching must preserve the exact-equality case: the
+        // existing `evil.com` deny-all behavior must not regress.
+        use crate::tool::WebFetchHandler;
+
+        let sink = Arc::new(InMemorySink::new());
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "WebFetch",
+                serde_json::json!({ "url": "https://evil.com/data" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![handler],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.blocked_domains = vec!["evil.com".into()];
+        req.allowed_tools = vec!["WebFetch".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("exact-host denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must still fire on the exact blocked domain");
+        assert!(
+            reason.contains("evil.com"),
+            "reason should name the rejected host: {reason:?}",
+        );
+        assert!(
+            reason.contains("blocked_domains"),
+            "reason should name the gate: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_domains_matches_subdomain_by_suffix() {
+        // Mirror of the blocked-domain test: `allowed_domains:
+        // ["api.trusted.com"]` must ALLOW `sub.api.trusted.com` under
+        // suffix matching. An exact-match allowlist would force
+        // operators to enumerate every subdomain.
+        //
+        // Uses `EchoTool` with `ToolEffect::Network` so the policy gate
+        // runs (examining the `url` arg) without the handler actually
+        // hitting the network — the sibling `blocked_domains_*` tests
+        // use `WebFetchHandler` because they rely on the denial path
+        // firing before any network call, but the allowed path here
+        // would otherwise attempt a real DNS lookup.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "ok"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "EchoTool",
+                serde_json::json!({ "url": "https://sub.api.trusted.com/data" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.allowed_domains = vec!["api.trusted.com".into()];
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("subdomain of allowlisted host must not terminate");
+
+        let events = sink.snapshot();
+        let denied = events.iter().find_map(|e| match &e.event {
+            Event::ToolDenied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        });
+        assert!(
+            denied.is_none(),
+            "ToolDenied must NOT fire for sub.api.trusted.com on an api.trusted.com allowlist: {denied:?}",
         );
     }
 

@@ -5,7 +5,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 use tokio::process::Command;
 use tracing::{debug, instrument};
 
@@ -14,6 +16,19 @@ use crate::error::ToolError;
 
 /// Default `timeout_secs` when the caller omits the field.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BashArgs {
+    #[schemars(description = "Shell command to execute.")]
+    command: String,
+    #[schemars(description = "Max seconds to wait. Defaults to 60.")]
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[schemars(description = "Working directory override.")]
+    #[serde(default)]
+    cwd: Option<String>,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct BashHandler;
@@ -27,15 +42,7 @@ impl ToolHandler for BashHandler {
         "Run a shell command via /bin/sh -c and return stdout and stderr."
     }
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": { "type": "string", "description": "Shell command to execute." },
-                "timeout_secs": { "type": "integer", "description": "Max seconds to wait. Defaults to 60." },
-                "cwd": { "type": "string", "description": "Working directory override." }
-            },
-            "required": ["command"]
-        })
+        serde_json::to_value(schemars::schema_for!(BashArgs)).expect("static schema")
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::MutationsAndNetwork
@@ -43,21 +50,16 @@ impl ToolHandler for BashHandler {
 
     #[instrument(skip(self, args), fields(tool.name = "Bash", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
-                name: "Bash".to_string(),
-                message: "missing or non-string `command`".to_string(),
-            })?
-            .to_string();
+        let BashArgs {
+            command,
+            timeout_secs,
+            cwd,
+        } = serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+            name: "Bash".to_string(),
+            message: e.to_string(),
+        })?;
 
-        let timeout_secs = args
-            .get("timeout_secs")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
-
-        let cwd = args.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c")
@@ -109,6 +111,7 @@ impl ToolHandler for BashHandler {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[tokio::test]

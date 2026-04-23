@@ -59,6 +59,7 @@ impl GenAiTransport {
     /// a literal secret or an env var. Failing at run start rather
     /// than dispatch time is a Phase 7 improvement (`orno plan` will
     /// surface it).
+    #[must_use = "transport must be stored and threaded into the engine; dropping it discards per-provider client setup"]
     pub fn from_agents(
         agents: &BTreeMap<String, AgentConfig>,
         secrets: &BTreeMap<String, String>,

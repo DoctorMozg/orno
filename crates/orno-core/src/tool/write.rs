@@ -1,11 +1,22 @@
 //! `Write` tool — write a file (ADR 0008). Requires `allow_mutations`.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 use tracing::{debug, instrument};
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    #[schemars(description = "File path to write.")]
+    path: String,
+    #[schemars(description = "Content to write.")]
+    content: String,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct WriteHandler;
@@ -19,14 +30,7 @@ impl ToolHandler for WriteHandler {
         "Write content to a file at the given path, overwriting if it exists."
     }
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path to write." },
-                "content": { "type": "string", "description": "Content to write." }
-            },
-            "required": ["path", "content"]
-        })
+        serde_json::to_value(schemars::schema_for!(WriteArgs)).expect("static schema")
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutations
@@ -34,23 +38,11 @@ impl ToolHandler for WriteHandler {
 
     #[instrument(skip(self, args), fields(tool.name = "Write", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
+        let WriteArgs { path, content } =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 name: "Write".to_string(),
-                message: "missing or non-string `path`".to_string(),
-            })?
-            .to_string();
-
-        let content = args
-            .get("content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArgs {
-                name: "Write".to_string(),
-                message: "missing or non-string `content`".to_string(),
-            })?
-            .to_string();
+                message: e.to_string(),
+            })?;
 
         // Create parent dirs so writes to nested paths (e.g. `tmp/out/file.txt`)
         // succeed without the caller pre-creating the hierarchy.
@@ -78,6 +70,7 @@ impl ToolHandler for WriteHandler {
 mod tests {
     use super::*;
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[tokio::test]

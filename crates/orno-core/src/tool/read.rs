@@ -1,10 +1,19 @@
 //! `Read` tool — read a file's contents (ADR 0008). Read-only effect.
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadArgs {
+    #[schemars(description = "File path to read.")]
+    path: String,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct ReadHandler;
@@ -18,27 +27,19 @@ impl ToolHandler for ReadHandler {
         "Read the contents of a file at the given path. Returns the file's text content."
     }
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "description": "File path to read." }
-            },
-            "required": ["path"]
-        })
+        serde_json::to_value(schemars::schema_for!(ReadArgs)).expect("static schema")
     }
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }
     async fn invoke(&self, _inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let path =
-            args.get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::InvalidArgs {
-                    name: "Read".to_string(),
-                    message: "missing required field `path`".to_string(),
-                })?;
+        let ReadArgs { path } =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
+                name: "Read".to_string(),
+                message: e.to_string(),
+            })?;
 
-        std::fs::read_to_string(path).map_err(|err| ToolError::Invocation {
+        std::fs::read_to_string(&path).map_err(|err| ToolError::Invocation {
             name: "Read".to_string(),
             source: Box::new(err),
         })
@@ -48,6 +49,7 @@ impl ToolHandler for ReadHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::io::Write;
 
     #[tokio::test]

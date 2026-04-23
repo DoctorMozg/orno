@@ -1,7 +1,6 @@
 # yaml-language-server: $schema=../schemas/pipeline.schema.json
-# Minimal skeleton pipeline. Node execution is still a no-op today —
-# lifecycle events fire but the agent loop isn't wired yet. Regenerate
-# the schema after NodeKind changes: `orno schema > schemas/pipeline.schema.json`.
+# Minimal hello pipeline — one agent node with max_iterations=1 through LoopAgent.
+# Regenerate the schema after NodeKind changes: `orno schema > schemas/pipeline.schema.json`.
 
 version: 1
 

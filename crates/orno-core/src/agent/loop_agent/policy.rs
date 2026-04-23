@@ -81,7 +81,16 @@ impl LoopAgent {
                     .and_then(|u| reqwest::Url::parse(u).ok())
                     .and_then(|parsed| parsed.host_str().map(str::to_string))
                 {
-                    if policy.blocked_domains.iter().any(|d| d == &host) {
+                    // Suffix match: `d` matches host `h` if `h == d` or
+                    // `h` ends with `.d`. This closes the footgun where
+                    // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
+                    // through under naive equality, and applies the same
+                    // rule to the allowlist so operators can whitelist a
+                    // parent domain without enumerating every subdomain.
+                    let host_matches = |d: &String| -> bool {
+                        host == *d || host.ends_with(&format!(".{d}"))
+                    };
+                    if policy.blocked_domains.iter().any(host_matches) {
                         return Ok(self
                             .deny(
                                 &inv,
@@ -91,7 +100,7 @@ impl LoopAgent {
                             .await);
                     }
                     if !policy.allowed_domains.is_empty()
-                        && !policy.allowed_domains.iter().any(|d| d == &host)
+                        && !policy.allowed_domains.iter().any(host_matches)
                     {
                         return Ok(self
                             .deny(
