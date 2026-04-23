@@ -1,157 +1,25 @@
-//! Production `LlmTransport` implementation wrapping the `genai` crate.
+//! Conversion layer between orno-owned LLM types and `genai`.
 //!
-//! ADR 0002 keeps `genai` types behind this trait — every `genai::*` import
-//! lives in this file, `Client::default()` / `Client::builder()` stay
-//! internal, and the public surface returns only `LlmResponse` /
-//! `LlmError`. Adding a provider means adding a match arm to
-//! [`build_client`]; the caller sees no churn.
-//!
-//! Provider routing honors `AgentConfig.provider` (ADR 0002 amendment,
-//! Phase 4 plan). Each provider key is pinned to a specific
-//! `AdapterKind` via a `ServiceTargetResolver`, so `model: "gpt-5"` with
-//! `provider: anthropic` fails fast at the API rather than silently
-//! routing to `OpenAI` because the model prefix matched.
+//! Kept in a sibling file of [`super`] because every `genai::*` import
+//! the transport needs lives in one of two places: the message/tool
+//! translation helpers below, or the provider-pinning resolver in
+//! [`build_client`]. Isolating them here lets `super::mod.rs` contain
+//! only the trait impl + struct without a wall of conversion glue.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use genai::adapter::AdapterKind;
-use genai::chat::{
-    ChatMessage, ChatOptions, ChatRequest, StopReason, Tool, ToolCall as GenAiToolCall, ToolName,
-    ToolResponse,
-};
+use genai::chat::{ChatMessage, Tool, ToolCall as GenAiToolCall, ToolName, ToolResponse};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
-use tracing::instrument;
 
 use crate::error::LlmError;
-use crate::pipeline::AgentConfig;
-
-use super::{
-    LlmRequest, LlmResponse, LlmTransport, OrnoChatMessage, OrnoChatTool, OrnoChatToolCall, Usage,
-};
+use crate::llm::{OrnoChatMessage, OrnoChatTool, Usage};
 
 /// Providers known in v0.1. Kept explicit so a typo in a pipeline YAML
 /// surfaces as `ConfigError` at run start, not a confusing genai
 /// adapter-mapping error mid-run.
-const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "ollama", "openrouter"];
-
-#[derive(Debug)]
-pub struct GenAiTransport {
-    clients: HashMap<String, Arc<Client>>,
-}
-
-impl GenAiTransport {
-    /// Build a transport from the set of providers referenced by
-    /// `agents`. One `genai::Client` per distinct provider. Returns a
-    /// `ConfigError` for any provider name not in [`KNOWN_PROVIDERS`].
-    ///
-    /// `secrets` is the resolved `secrets.*` namespace from ADR 0020 —
-    /// values present here (typically from `--secrets-file`) are handed
-    /// to genai as literal auth data, taking precedence over the
-    /// provider's conventional env-var lookup. When a provider's
-    /// secret is absent from the map, the client falls back to
-    /// `AuthData::from_env(...)` so CI runners and replay tapes that
-    /// export keys in the shell keep working unchanged.
-    ///
-    /// API-key presence is NOT checked here — genai itself fails with
-    /// `RequiresApiKey` when the transport is invoked without either
-    /// a literal secret or an env var. Failing at run start rather
-    /// than dispatch time is a Phase 7 improvement (`orno plan` will
-    /// surface it).
-    pub fn from_agents(
-        agents: &BTreeMap<String, AgentConfig>,
-        secrets: &BTreeMap<String, String>,
-    ) -> Result<Self, LlmError> {
-        let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
-        for cfg in agents.values() {
-            if clients.contains_key(&cfg.provider) {
-                continue;
-            }
-            let client = build_client(&cfg.provider, secrets)?;
-            clients.insert(cfg.provider.clone(), Arc::new(client));
-        }
-        Ok(Self { clients })
-    }
-}
-
-#[async_trait]
-impl LlmTransport for GenAiTransport {
-    #[instrument(
-        skip(self, req),
-        fields(
-            llm.provider = %req.provider,
-            llm.model = %req.model,
-        ),
-    )]
-    async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
-        let client = self.clients.get(&req.provider).ok_or_else(|| {
-            LlmError::ConfigError(format!(
-                "provider `{}` was not registered at transport construction — known: {}",
-                req.provider,
-                KNOWN_PROVIDERS.join(", "),
-            ))
-        })?;
-
-        let mut chat = ChatRequest::new(vec![ChatMessage::user(req.prompt.clone())]);
-        if let Some(system) = &req.system {
-            chat = chat.with_system(system.clone());
-        }
-        for msg in &req.messages {
-            chat = chat.append_message(orno_msg_to_genai(msg));
-        }
-        if !req.tools.is_empty() {
-            chat = chat.with_tools(req.tools.iter().map(orno_tool_to_genai));
-        }
-
-        let mut options = ChatOptions::default();
-        if let Some(t) = req.temperature {
-            options = options.with_temperature(f64::from(t));
-        }
-        if let Some(max) = req.max_tokens {
-            options = options.with_max_tokens(max);
-        }
-
-        let response = client
-            .exec_chat(req.model.as_str(), chat, Some(&options))
-            .await
-            .map_err(|err| map_genai_error(&req.provider, &req.model, err))?;
-
-        let finish_reason = response.stop_reason.as_ref().map(|r| r.raw().to_string());
-        let usage = convert_usage(&response.usage);
-        let is_tool_call = matches!(response.stop_reason, Some(StopReason::ToolCall(_)));
-
-        if is_tool_call {
-            let tool_calls = response
-                .into_tool_calls()
-                .into_iter()
-                .map(|c| OrnoChatToolCall {
-                    call_id: c.call_id,
-                    fn_name: c.fn_name,
-                    fn_arguments: c.fn_arguments,
-                })
-                .collect();
-            return Ok(LlmResponse {
-                content: String::new(),
-                finish_reason,
-                usage: Some(usage),
-                tool_calls,
-            });
-        }
-
-        let content = response
-            .into_first_text()
-            .ok_or_else(|| LlmError::ParseError("provider returned no text content".to_string()))?;
-
-        Ok(LlmResponse {
-            content,
-            finish_reason,
-            usage: Some(usage),
-            tool_calls: Vec::new(),
-        })
-    }
-}
+pub(super) const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "ollama", "openrouter"];
 
 /// Pick the `AuthData` the resolver will hand genai for a given
 /// provider. CLI-resolved secrets (ADR 0020 `secrets.*` namespace)
@@ -176,7 +44,10 @@ fn resolve_auth(env_name: &str, secrets: &BTreeMap<String, String>) -> AuthData 
 /// resolver has no reason to consult `std::env` at request time when
 /// the CLI already resolved the secret. `AuthData::clone()` returns
 /// a fresh owned value per call; the capture stays `Fn`, not `FnMut`.
-fn build_client(provider: &str, secrets: &BTreeMap<String, String>) -> Result<Client, LlmError> {
+pub(super) fn build_client(
+    provider: &str,
+    secrets: &BTreeMap<String, String>,
+) -> Result<Client, LlmError> {
     match provider {
         "openai" => {
             let auth = resolve_auth("OPENAI_API_KEY", secrets);
@@ -243,7 +114,7 @@ fn build_client(provider: &str, secrets: &BTreeMap<String, String>) -> Result<Cl
 /// typed variants (`AuthFailed`, `RateLimited`, `ModelNotFound`);
 /// everything else falls through to `ApiError` (wire-level) or
 /// `Transport` / `ParseError` (local problem).
-fn map_genai_error(provider: &str, model: &str, err: genai::Error) -> LlmError {
+pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) -> LlmError {
     use genai::Error as G;
     match err {
         G::HttpError { status, body, .. } => {
@@ -289,7 +160,7 @@ fn status_to_error(provider: &str, model: &str, status: u16, body: String) -> Ll
 /// `Usage` is `u32`-tight because the budget enforcer math assumes
 /// non-negative counters. Negative genai values — which shouldn't
 /// happen but are representable — collapse to 0.
-fn convert_usage(u: &genai::chat::Usage) -> Usage {
+pub(super) fn convert_usage(u: &genai::chat::Usage) -> Usage {
     #[allow(clippy::cast_sign_loss)] // negatives clamped to 0 above
     fn nonneg(v: Option<i32>) -> u32 {
         match v {
@@ -309,7 +180,7 @@ fn convert_usage(u: &genai::chat::Usage) -> Usage {
 /// (ADR 0002). `ToolCalls` collapses to a single assistant turn via
 /// `ChatMessage::from(Vec<ToolCall>)`; `ToolResult` becomes a `Tool`-role
 /// message carrying a `ToolResponse`.
-fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
+pub(super) fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
     match msg {
         OrnoChatMessage::User { content } => ChatMessage::user(content.clone()),
         OrnoChatMessage::Assistant { content } => ChatMessage::assistant(content.clone()),
@@ -334,7 +205,7 @@ fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
 /// Translate orno's tool metadata into the genai `Tool` shape. Custom tool
 /// names always land as `ToolName::Custom`; orno exposes no built-ins on this
 /// surface.
-fn orno_tool_to_genai(t: &OrnoChatTool) -> Tool {
+pub(super) fn orno_tool_to_genai(t: &OrnoChatTool) -> Tool {
     Tool::new(ToolName::Custom(t.name.clone()))
         .with_description(t.description.clone())
         .with_schema(t.schema.clone())
@@ -357,27 +228,6 @@ impl std::error::Error for GenAiErrorAdapter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unknown_provider_rejected_at_construction() {
-        let mut agents = BTreeMap::new();
-        agents.insert(
-            "bad".to_string(),
-            AgentConfig {
-                model: "x".into(),
-                provider: "not-a-real-provider".into(),
-                system: None,
-                allowed_tools: Vec::new(),
-                policy: default_policy(),
-            },
-        );
-        let err = GenAiTransport::from_agents(&agents, &BTreeMap::new())
-            .expect_err("must reject unknown provider");
-        assert!(
-            matches!(err, LlmError::ConfigError(msg) if msg.contains("not-a-real-provider")),
-            "expected ConfigError naming the bad provider",
-        );
-    }
 
     #[test]
     fn resolve_auth_prefers_cli_secret_over_env_lookup() {
@@ -511,20 +361,5 @@ mod tests {
             genai_tool.description.as_deref(),
             Some("Looks up the current weather"),
         );
-    }
-
-    fn default_policy() -> crate::pipeline::AgentPolicy {
-        crate::pipeline::AgentPolicy {
-            max_iterations: 1,
-            max_total_tokens: 0,
-            max_tool_calls: 0,
-            max_subagent_depth: 0,
-            allow_mutations: false,
-            allow_network: false,
-            allow_context_writes: false,
-            allowed_domains: Vec::new(),
-            blocked_domains: Vec::new(),
-            on_parse_error: crate::pipeline::OnParseError::Fail,
-        }
     }
 }

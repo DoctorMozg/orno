@@ -270,3 +270,14 @@ controls failure-WARN detail; nothing on the stderr side grows.
   once a real consumer asks for tail-line transport summaries.
 - **`Event::AgentIterationStarted` / `ToolCallRecorded`** for the
   Phase 5 agent loop. Out of scope here.
+
+## Amendments
+
+- **File path — `LlmFailure::from_llm_error`.** The classifier originally
+  lived in `crates/orno-core/src/events/mod.rs`; it now lives in
+  `crates/orno-core/src/events/failure.rs` alongside the `LlmFailure`
+  type itself. The `events` module was split into `event.rs`,
+  `failure.rs`, and `mod.rs` (envelope + `truncate_excerpt` helper) to
+  keep each file under the 300-LOC soft cap. Public paths are
+  unchanged: `crate::events::{LlmFailure, NodeFailure, Event}` still
+  resolve because `events/mod.rs` re-exports them.

@@ -325,6 +325,15 @@
           "items": {
             "type": "string"
           }
+        },
+        "timeout": {
+          "description": "Per-node wall-clock budget in seconds (ADR 0017 §2). When elapsed\nbefore the executor returns, `Engine::dispatch_node` cancels via\n`tokio::time::timeout`, emits `Event::NodeTimedOut`, and records\n`NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means\nno wall-clock budget on this node.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "oneOf": [

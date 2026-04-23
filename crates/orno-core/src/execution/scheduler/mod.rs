@@ -8,21 +8,28 @@
 //! cascade through `DagWalker::complete` which returns the newly-
 //! skipped descendants; the engine emits their `NodeSkipped`
 //! events in causal order before pulling the next ready node.
+//!
+//! Layout: per-node dispatch logic (executor lookup, template render,
+//! timeout wrapping, payload classification) lives in [`dispatch`] so
+//! this file stays focused on orchestration (walker loop,
+//! `RunFinished` aggregates, engine construction).
+
+mod dispatch;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde_json::Value;
 use tracing::instrument;
 
 use crate::error::CoreError;
-use crate::events::{Event, EventSink, NodeFailure};
+use crate::events::{Event, EventSink};
 use crate::execution::context::Context;
 use crate::execution::walker::DagWalker;
-use crate::node::{NodeRegistry, NodeResponse, kind_str, render_request};
+use crate::node::NodeRegistry;
 use crate::pipeline::Pipeline;
-use crate::pipeline::schema::NodeKind;
 use crate::pipeline::template::TemplateEngine;
+
+use dispatch::DispatchOutcome;
 
 /// Inputs resolved from CLI flags + `.env` files before a run begins
 /// (ADR 0020). The engine trusts these as the final values for the
@@ -71,10 +78,13 @@ impl Default for EngineConfig {
 /// [`EventSink`]. Parallelism is deferred (ADR 0021); a single
 /// `Engine` dispatches serially in YAML source order among ties.
 pub struct Engine {
-    sink: Arc<dyn EventSink>,
-    registry: Arc<NodeRegistry>,
-    templates: Arc<TemplateEngine>,
-    config: EngineConfig,
+    // Fields are `pub(super)` so `dispatch.rs` (a submodule of
+    // `scheduler`) can read them from its `impl Engine` block without
+    // opening the whole crate to the internals.
+    pub(super) sink: Arc<dyn EventSink>,
+    pub(super) registry: Arc<NodeRegistry>,
+    pub(super) templates: Arc<TemplateEngine>,
+    pub(super) config: EngineConfig,
 }
 
 impl Engine {
@@ -217,252 +227,13 @@ impl Engine {
 
         Ok(())
     }
-
-    /// Dispatch a single ready node. Every failure mode (missing
-    /// executor, template render error, executor error, non-zero shell
-    /// exit) collapses to `ok = false` with a populated `failure` and
-    /// a structured WARN on stderr. The executor's payload is returned
-    /// even on failure so the engine can fold it into `Context` —
-    /// downstream templates that read `node.<id>.stderr` for recovery
-    /// branches must see the data even when the producer node failed.
-    async fn dispatch_node(
-        &self,
-        run_id: &str,
-        node: &crate::pipeline::Node,
-        context: &Context,
-        agents: &BTreeMap<String, crate::pipeline::AgentConfig>,
-        redactor: &crate::events::Redactor,
-    ) -> DispatchOutcome {
-        let kind = kind_str(&node.kind);
-        let Some(exec) = self.registry.get(kind) else {
-            tracing::warn!(
-                node.id = %node.id,
-                node.kind = kind,
-                "no executor registered for kind",
-            );
-            return DispatchOutcome::failed(NodeFailure::NoExecutorRegistered {
-                node_kind: kind.to_string(),
-            });
-        };
-
-        let req = match render_request(&node.kind, &self.templates, context, agents) {
-            Ok(req) => req,
-            Err(err) => {
-                // Redact before logging: a template error's Display chain
-                // can quote the offending expression, which may include a
-                // rendered `secrets.*` value (ADR 0020).
-                let error = redactor.redact(&format!("{err:#}")).into_owned();
-                tracing::warn!(
-                    node.id = %node.id,
-                    node.kind = kind,
-                    error = %error,
-                    "render_request failed",
-                );
-                return DispatchOutcome::failed(NodeFailure::TemplateRenderFailed { error });
-            }
-        };
-
-        match exec.execute(run_id, &node.id, req).await {
-            Ok(resp) => {
-                let ok = node_response_ok(&node.kind, &resp);
-                if ok {
-                    return DispatchOutcome::ok(resp.output);
-                }
-                // The pre-fix silent path: a shell node that ran and
-                // exited non-zero. The captured stderr/stdout used to
-                // be thrown away, leaving only `ok:false` in the event
-                // stream and no warn anywhere. Now we emit a typed
-                // `NodeFailure` on the wire, log a structured WARN, and
-                // still hand `resp.output` back to Context.
-                let exit_code = resp.output.get("exit_code").and_then(Value::as_i64);
-                let stderr_full = resp.output.get("stderr").and_then(Value::as_str);
-                let stderr_tail = stderr_full.map(|s| {
-                    redactor
-                        .redact(&truncate_tail(s, self.config.max_output_bytes))
-                        .into_owned()
-                });
-                let stdout_tail = if self.config.verbose {
-                    resp.output
-                        .get("stdout")
-                        .and_then(Value::as_str)
-                        .map(|s| {
-                            redactor
-                                .redact(&truncate_tail(s, self.config.max_output_bytes))
-                                .into_owned()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                tracing::warn!(
-                    node.id = %node.id,
-                    node.kind = kind,
-                    exit_code = exit_code.unwrap_or(-1),
-                    stderr_tail = %stderr_tail.as_deref().unwrap_or(""),
-                    stdout_tail = %stdout_tail,
-                    "node returned failure in payload",
-                );
-                DispatchOutcome {
-                    ok: false,
-                    failure: Some(NodeFailure::NodePayloadFailure {
-                        exit_code,
-                        stderr_tail,
-                    }),
-                    // Failed payload still flows to Context so a
-                    // downstream `gate` / recovery node can read
-                    // `node.<id>.stderr` and decide what to do.
-                    output: Some(resp.output),
-                }
-            }
-            Err(err) => {
-                // Walk the full `source()` chain — thiserror's Display
-                // only renders the top-level variant, so a `NodeError::
-                // Execution { source: AgentError::BudgetExceeded(...) }`
-                // would otherwise surface as the opaque
-                // ``node `digest` failed`` without the underlying cause
-                // that the operator actually needs to see. Redact and
-                // cap because an LLM transport error can surface a
-                // multi-KB HTML body and a rendered prompt can carry
-                // a secret value.
-                let error = truncate_tail(
-                    &redactor.redact(&render_error_chain(&err)),
-                    self.config.max_output_bytes,
-                );
-                tracing::warn!(
-                    node.id = %node.id,
-                    node.kind = kind,
-                    error = %error,
-                    "node execution failed",
-                );
-                DispatchOutcome::failed(NodeFailure::ExecutorError { error })
-            }
-        }
-    }
-}
-
-/// Result of `Engine::dispatch_node`. A struct rather than a tuple
-/// because the success/failure invariant is now load-bearing
-/// (`failure.is_some() ⇔ !ok`) and the field count grew from two
-/// to three when `Phase 2` started recording payload-on-failure.
-struct DispatchOutcome {
-    ok: bool,
-    failure: Option<NodeFailure>,
-    output: Option<Value>,
-}
-
-impl DispatchOutcome {
-    fn ok(output: Value) -> Self {
-        Self {
-            ok: true,
-            failure: None,
-            output: Some(output),
-        }
-    }
-
-    /// A failure with no executor output to record — used for the
-    /// no-executor, template-render, and executor-Err paths.
-    fn failed(failure: NodeFailure) -> Self {
-        Self {
-            ok: false,
-            failure: Some(failure),
-            output: None,
-        }
-    }
-}
-
-/// Render an error with its full `source()` chain. `thiserror`'s
-/// `Display` only emits the top-level variant — for a terminal like
-/// `NodeError::Execution { source: AgentError::BudgetExceeded {..} }`
-/// the raw `Display` reads as `node `digest` failed`, hiding the
-/// budget-breach that the operator actually needs to see. Each link
-/// is joined with `: ` so the output reads as a single diagnostic
-/// line. The `'static` bound is the same one `std::error::Error`'s
-/// inherent `source()` walker requires — `NodeError` satisfies it.
-fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = err.to_string();
-    let mut current = err.source();
-    while let Some(src) = current {
-        out.push_str(": ");
-        out.push_str(&src.to_string());
-        current = src.source();
-    }
-    out
-}
-
-/// Keep the **last** `max_bytes` of a string, on a UTF-8 boundary.
-/// Last bytes win because the trailing fragment of a tool's stderr
-/// is almost always where the actionable error sits — earlier output
-/// is setup noise. Returns the input unchanged when it already fits.
-fn truncate_tail(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let cut = s.len() - max_bytes;
-    let mut start = cut;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &s[start..])
-}
-
-/// Classify a successful `NodeResponse` against the originating node kind.
-/// Only shell nodes treat their payload's `exit_code` as a failure signal;
-/// agent and any future kinds default to success when `execute` returns `Ok`
-/// so an agent payload that happens to carry an `exit_code` key is never
-/// misread as a shell exit.
-///
-/// Distinguishes "key absent" (forward-compat success — a future shell
-/// executor variant may omit it) from "key present but not a valid
-/// integer" (a contract violation by the executor; logged and treated as
-/// failure rather than silently passed).
-fn node_response_ok(kind: &NodeKind, resp: &NodeResponse) -> bool {
-    match kind {
-        NodeKind::Shell(_) => match resp.output.get("exit_code") {
-            None => true,
-            Some(v) => {
-                if let Some(code) = v.as_i64() {
-                    code == 0
-                } else {
-                    tracing::warn!(
-                        exit_code = ?v,
-                        "shell exit_code is not an integer; treating as failure",
-                    );
-                    false
-                }
-            }
-        },
-        _ => true,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::InMemorySink;
-    use crate::pipeline::schema::{AgentNode, Node, Pipeline, ShellNode};
-    use serde_json::json;
-
-    fn shell_kind() -> NodeKind {
-        NodeKind::Shell(ShellNode {
-            command: "echo".to_string(),
-            args: Vec::new(),
-            stdin: None,
-        })
-    }
-
-    fn agent_kind() -> NodeKind {
-        NodeKind::Agent(AgentNode {
-            agent: "dummy".to_string(),
-            initial_prompt: String::new(),
-        })
-    }
-
-    fn resp(output: Value) -> NodeResponse {
-        NodeResponse {
-            node_id: "n".to_string(),
-            output,
-        }
-    }
+    use crate::events::{InMemorySink, NodeFailure};
+    use crate::pipeline::schema::{Node, NodeKind, Pipeline, ShellNode};
 
     /// Build a `Pipeline` carrying the given nodes and no vars/env/secrets.
     fn pipeline_of(nodes: Vec<Node>) -> Pipeline {
@@ -486,51 +257,55 @@ mod tests {
                 stdin: None,
             }),
             needs: needs.iter().map(|s| (*s).to_string()).collect(),
+            timeout: None,
         }
     }
 
-    #[test]
-    fn shell_zero_exit_is_ok() {
-        assert!(node_response_ok(
-            &shell_kind(),
-            &resp(json!({"exit_code": 0, "stdout": "", "stderr": ""})),
-        ));
+    // Tracing-capture helpers used by the failure-logging regression
+    // tests. Kept inside `mod tests` so they remain a strictly test-only
+    // surface — production code only uses the `tracing` macro crate,
+    // not `tracing-subscriber`.
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for BufferWriter {
+        type Writer = BufferGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferGuard(self.0.clone())
+        }
     }
 
-    #[test]
-    fn shell_nonzero_exit_is_fail() {
-        assert!(!node_response_ok(
-            &shell_kind(),
-            &resp(json!({"exit_code": 2, "stdout": "", "stderr": ""})),
-        ));
+    struct BufferGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer mutex").write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
-    #[test]
-    fn shell_missing_exit_code_is_ok() {
-        // Defensive: if a future ShellExecutor variant omits exit_code,
-        // fall back to success rather than flagging the node failed.
-        assert!(node_response_ok(&shell_kind(), &resp(json!({}))));
+    /// Build a JSON tracing subscriber whose output is captured in
+    /// `buf`. Caller installs it via `set_default`; the returned guard
+    /// must outlive the work-under-test. Per-thread default propagates
+    /// to async tasks only on `current_thread` runtimes — every test
+    /// using this helper marks `flavor = "current_thread"`.
+    fn capture_subscriber(buf: &Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_writer(BufferWriter(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .json()
+            .finish()
     }
 
-    #[test]
-    fn shell_null_exit_code_is_fail() {
-        // An `exit_code: null` payload is a contract violation (the key
-        // is present but unusable) — must surface as failure rather than
-        // being silently treated as success the way an absent key is.
-        assert!(!node_response_ok(
-            &shell_kind(),
-            &resp(json!({"exit_code": null, "stdout": "", "stderr": ""})),
-        ));
-    }
-
-    #[test]
-    fn agent_payload_with_exit_code_is_still_ok() {
-        // Regression guard: an agent response whose JSON payload happens
-        // to contain an `exit_code` field must not be misread as failed.
-        assert!(node_response_ok(
-            &agent_kind(),
-            &resp(json!({"exit_code": 1, "assistant": "done"})),
-        ));
+    fn capture_drain(buf: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(buf.lock().expect("buffer mutex").clone())
+            .expect("captured tracing output is valid UTF-8")
     }
 
     #[tokio::test]
@@ -631,53 +406,6 @@ mod tests {
             Some(false),
             "run must report ok:false when any node fails, even with a succeeding sibling",
         );
-    }
-
-    // Tracing-capture helpers used by the failure-logging regression
-    // tests. Kept inside `mod tests` so they remain a strictly test-only
-    // surface — production code only uses the `tracing` macro crate,
-    // not `tracing-subscriber`.
-    use std::io::Write;
-    use std::sync::Mutex;
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> MakeWriter<'a> for BufferWriter {
-        type Writer = BufferGuard;
-        fn make_writer(&'a self) -> Self::Writer {
-            BufferGuard(self.0.clone())
-        }
-    }
-
-    struct BufferGuard(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for BufferGuard {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("buffer mutex").write(buf)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Build a JSON tracing subscriber whose output is captured in
-    /// `buf`. Caller installs it via `set_default`; the returned guard
-    /// must outlive the work-under-test. Per-thread default propagates
-    /// to async tasks only on `current_thread` runtimes — every test
-    /// using this helper marks `flavor = "current_thread"`.
-    fn capture_subscriber(buf: &Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send + Sync {
-        tracing_subscriber::fmt()
-            .with_writer(BufferWriter(buf.clone()))
-            .with_max_level(tracing::Level::WARN)
-            .json()
-            .finish()
-    }
-
-    fn capture_drain(buf: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8(buf.lock().expect("buffer mutex").clone())
-            .expect("captured tracing output is valid UTF-8")
     }
 
     #[tokio::test]
@@ -803,6 +531,7 @@ mod tests {
                 stdin: None,
             }),
             needs: Vec::new(),
+            timeout: None,
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
@@ -865,6 +594,7 @@ mod tests {
                     stdin: None,
                 }),
                 needs: Vec::new(),
+                timeout: None,
             },
             // `recover` does NOT depend on `fail` (depending would
             // skip-cascade it). The point is to prove the *Context*
@@ -921,6 +651,7 @@ mod tests {
                 stdin: None,
             }),
             needs: Vec::new(),
+            timeout: None,
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
@@ -998,85 +729,123 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_error_chain_walks_source_links() {
-        // A `thiserror` Display on `NodeError::Execution` only renders
-        // the top-level variant. The operator needs the actual cause
-        // (e.g. `agent exceeded budget: Tokens` under `node `digest`
-        // failed`) to act on the failure. This guards the chain walker
-        // that restores that information.
-        use crate::error::{AgentError, NodeError};
-        use crate::events::BudgetKind;
-        let err = NodeError::Execution {
-            id: "digest".to_string(),
-            source: Box::new(AgentError::BudgetExceeded {
-                kind: BudgetKind::Tokens,
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_node_timeout_fires_and_emits_node_timed_out_and_failure() {
+        use crate::node::shell::ShellExecutor;
+
+        let pipeline = pipeline_of(vec![Node {
+            id: "slow".to_string(),
+            kind: NodeKind::Shell(ShellNode {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 10".to_string()],
+                stdin: None,
             }),
-        };
-        let rendered = render_error_chain(&err);
+            needs: Vec::new(),
+            timeout: Some(1),
+        }]);
+        let sink = Arc::new(InMemorySink::new());
+        let mut reg = NodeRegistry::new();
+        reg.register("shell", Arc::new(ShellExecutor));
+        let registry = Arc::new(reg);
+        let templates = Arc::new(TemplateEngine::new());
+        let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
+
+        engine
+            .run("run_test", &pipeline, RunInputs::default())
+            .await
+            .expect("engine::run returns Ok even when a node times out");
+
+        let envelopes = sink.snapshot();
+        let timed_out_idx = envelopes
+            .iter()
+            .position(|e| matches!(e.event, Event::NodeTimedOut { .. }))
+            .expect("Event::NodeTimedOut must fire on timeout");
+        let finished_idx = envelopes
+            .iter()
+            .position(|e| matches!(e.event, Event::NodeFinished { ok: false, .. }))
+            .expect("NodeFinished(ok: false) must fire");
         assert!(
-            rendered.contains("node `digest` failed"),
-            "rendered chain missing top-level message: {rendered}",
+            timed_out_idx < finished_idx,
+            "NodeTimedOut must precede NodeFinished in stream order",
         );
+
+        if let Event::NodeTimedOut {
+            limit_secs,
+            elapsed_ms,
+            node_id,
+            ..
+        } = &envelopes[timed_out_idx].event
+        {
+            assert_eq!(node_id, "slow");
+            assert_eq!(*limit_secs, 1);
+            assert!(
+                *elapsed_ms >= 1000,
+                "elapsed_ms should be >= 1000: {elapsed_ms}"
+            );
+        }
+
+        let failure = envelopes
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::NodeFinished { failure, .. } => failure.clone(),
+                _ => None,
+            })
+            .expect("NodeFinished must carry a failure");
         assert!(
-            rendered.contains("agent exceeded budget"),
-            "rendered chain missing nested source: {rendered}",
+            matches!(failure, NodeFailure::TimedOut { limit_secs: 1 }),
+            "failure must classify as TimedOut(1): {failure:?}",
         );
-        assert!(
-            rendered.contains("Tokens"),
-            "rendered chain missing BudgetKind classifier: {rendered}",
-        );
+
+        let failed_nodes = envelopes
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::RunFinished { failed_nodes, .. } => Some(failed_nodes.clone()),
+                _ => None,
+            })
+            .expect("RunFinished must be present");
+        assert_eq!(failed_nodes, vec!["slow".to_string()]);
     }
 
-    #[test]
-    fn render_error_chain_handles_terminal_error() {
-        // An error with no source must still render its own Display
-        // without trailing separators or panics — the walker stops
-        // cleanly at the first `source() -> None`.
-        use crate::error::NodeError;
-        let err = NodeError::NotImplemented {
-            id: "stub".to_string(),
-        };
-        let rendered = render_error_chain(&err);
-        assert!(rendered.contains("not implemented"));
+    #[tokio::test]
+    async fn timeout_none_lets_node_run_to_completion() {
+        use crate::node::shell::ShellExecutor;
+
+        let pipeline = pipeline_of(vec![Node {
+            id: "quick".to_string(),
+            kind: NodeKind::Shell(ShellNode {
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 0.2 && echo done".to_string()],
+                stdin: None,
+            }),
+            needs: Vec::new(),
+            timeout: None,
+        }]);
+        let sink = Arc::new(InMemorySink::new());
+        let mut reg = NodeRegistry::new();
+        reg.register("shell", Arc::new(ShellExecutor));
+        let registry = Arc::new(reg);
+        let templates = Arc::new(TemplateEngine::new());
+        let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
+
+        engine
+            .run("run_test", &pipeline, RunInputs::default())
+            .await
+            .expect("engine::run succeeds");
+
+        let envelopes = sink.snapshot();
         assert!(
-            !rendered.ends_with(": "),
-            "trailing separator leaked: {rendered}",
+            !envelopes
+                .iter()
+                .any(|e| matches!(e.event, Event::NodeTimedOut { .. })),
+            "NodeTimedOut must not fire when timeout is None",
         );
-    }
-
-    #[test]
-    fn truncate_tail_keeps_trailing_window() {
-        // Last bytes win because the tail of stderr is where the cause
-        // typically sits (stack trace, fatal: line). The leading "…"
-        // marker is the only signal that truncation happened.
-        let s: String = (0u8..100).map(|i| char::from(b'a' + (i % 26))).collect();
-        let cut = truncate_tail(&s, 10);
-        assert!(cut.starts_with('…'), "marker missing: {cut}");
-        assert_eq!(
-            cut.chars().count(),
-            11,
-            "expected 1 marker + 10 chars: {cut}"
-        );
-        assert!(s.ends_with(&cut[cut.char_indices().nth(1).unwrap().0..]));
-    }
-
-    #[test]
-    fn truncate_tail_passthrough_when_within_cap() {
-        assert_eq!(truncate_tail("short", 100), "short");
-    }
-
-    #[test]
-    fn truncate_tail_respects_utf8_boundaries() {
-        // Multi-byte chars at the boundary must not be split. Each "❤"
-        // is 3 bytes; cap of 4 must round forward to a boundary, not
-        // emit broken UTF-8.
-        let s = "abc❤def❤ghi";
-        let cut = truncate_tail(s, 4);
-        // The function returns a String; if the slice was mid-codepoint
-        // the format! would have panicked, so a successful return is
-        // already proof of boundary safety.
-        assert!(cut.starts_with('…'));
-        assert!(s.ends_with(cut.trim_start_matches('…')));
+        let ok = envelopes
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::NodeFinished { ok, .. } => Some(*ok),
+                _ => None,
+            })
+            .expect("NodeFinished present");
+        assert!(ok, "node with timeout=None must succeed");
     }
 }

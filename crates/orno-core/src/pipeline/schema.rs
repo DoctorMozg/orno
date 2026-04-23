@@ -52,6 +52,13 @@ pub struct Node {
     pub kind: NodeKind,
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Per-node wall-clock budget in seconds (ADR 0017 §2). When elapsed
+    /// before the executor returns, `Engine::dispatch_node` cancels via
+    /// `tokio::time::timeout`, emits `Event::NodeTimedOut`, and records
+    /// `NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means
+    /// no wall-clock budget on this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell` —

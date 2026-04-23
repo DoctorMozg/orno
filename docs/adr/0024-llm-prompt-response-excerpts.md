@@ -230,3 +230,17 @@ or embedder without secrets pays no redaction cost because
   response, not an excerpt. When `ReplayTransport` lands, it will
   record against the unbounded `LlmRequest.prompt` /
   `LlmResponse.content` — orthogonal to the excerpt wire format.
+
+## Amendments
+
+- **File path — `LoopAgent` and its tests.** The agent impl originally
+  lived in one file at `crates/orno-core/src/agent/loop_agent.rs`; it
+  now lives in a directory split into `mod.rs` (struct + constructors
+  + trivial helpers + the four excerpt tests cited above), `policy.rs`
+  (effect-gate and parse-retry helpers), and `run.rs` (the
+  `impl Agent for LoopAgent` body). The public import path
+  `crate::agent::loop_agent::{LoopAgent, LoopAgentConfig}` is
+  unchanged — `agent/mod.rs` still re-exports `LoopAgent` /
+  `LoopAgentConfig`, and the four excerpt tests remain in the same
+  `#[cfg(test)] mod tests` but under the new `mod.rs` path. Tests
+  invoked via `cargo test -p orno-core` discover them identically.

@@ -112,6 +112,7 @@ mod tests {
                 stdin: None,
             }),
             needs: needs.iter().map(|s| (*s).to_string()).collect(),
+            timeout: None,
         }
     }
 

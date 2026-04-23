@@ -24,20 +24,19 @@
 //! `subagent.<child>` → `subagent_<child>` before the schema reaches
 //! the LLM, and reverse-translate when routing the model's tool call
 //! back to a handler.
+//!
+//! Module layout: `mod.rs` owns the struct and its trivial helpers plus
+//! all unit tests; `policy.rs` owns the effect-gate and parse-retry
+//! helpers; `run.rs` owns the `impl Agent for LoopAgent` body.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+mod policy;
+mod run;
 
-use async_trait::async_trait;
-use serde_json::{Map, Value};
-use tracing::instrument;
+use std::sync::Arc;
 
-use crate::error::{AgentError, ToolError};
-use crate::events::{BudgetKind, Event, EventSink, LlmFailure, Redactor, truncate_excerpt};
-use crate::llm::{LlmRequest, LlmTransport, OrnoChatMessage, OrnoChatTool, OrnoChatToolCall};
-use crate::tool::{StateHandle, ToolEffect, ToolHandler, ToolInvocation};
-
-use super::{Agent, AgentOutput, AgentRequest};
+use crate::events::{EventSink, Redactor, truncate_excerpt};
+use crate::llm::LlmTransport;
+use crate::tool::ToolHandler;
 
 /// Default cap on the body excerpt captured into `LlmFailure::ApiError`
 /// when the agent was constructed without a caller-supplied bound.
@@ -133,387 +132,19 @@ impl LoopAgent {
             yaml_name.to_string()
         }
     }
-
-    /// Apply the effect-based policy gate and invoke the handler. Per
-    /// ADR 0005 §3 a policy denial is *not* a terminal error — it is
-    /// fed back to the model as a `ToolResult` denial string so the
-    /// model can adapt. A handler error still terminates the loop via
-    /// [`AgentError::Tool`].
-    async fn check_policy_and_invoke(
-        &self,
-        handler: &Arc<dyn ToolHandler>,
-        tool_call: &OrnoChatToolCall,
-        policy: &crate::pipeline::AgentPolicy,
-        inv: ToolInvocation<'_>,
-    ) -> Result<String, AgentError> {
-        match handler.effect() {
-            ToolEffect::Mutations => {
-                if !policy.allow_mutations {
-                    return Ok(format!(
-                        "denied: tool `{}` blocked by allow_mutations=false",
-                        tool_call.fn_name,
-                    ));
-                }
-            }
-            ToolEffect::Network => {
-                if !policy.allow_network {
-                    return Ok(format!(
-                        "denied: tool `{}` blocked by allow_network=false",
-                        tool_call.fn_name,
-                    ));
-                }
-            }
-            ToolEffect::MutationsAndNetwork => {
-                if !policy.allow_mutations {
-                    return Ok(format!(
-                        "denied: tool `{}` blocked by allow_mutations=false",
-                        tool_call.fn_name,
-                    ));
-                }
-                if !policy.allow_network {
-                    return Ok(format!(
-                        "denied: tool `{}` blocked by allow_network=false",
-                        tool_call.fn_name,
-                    ));
-                }
-            }
-            ToolEffect::ContextSelf => {
-                if !policy.allow_context_writes {
-                    return Ok(format!(
-                        "denied: tool `{}` blocked by allow_context_writes=false",
-                        tool_call.fn_name,
-                    ));
-                }
-            }
-            ToolEffect::ReadOnly => {}
-        }
-
-        match handler.invoke(inv, tool_call.fn_arguments.clone()).await {
-            Ok(output) => Ok(output),
-            // A stub handler that declared itself NotImplemented is a
-            // predictable condition — feed it back to the model rather
-            // than terminating the loop, matching the denial semantics.
-            Err(ToolError::NotImplemented { name, feature }) => Ok(format!(
-                "error: tool `{name}` not yet implemented: {feature}",
-            )),
-            Err(source) => Err(AgentError::Tool {
-                name: tool_call.fn_name.clone(),
-                source,
-            }),
-        }
-    }
-}
-
-/// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
-/// `None` when no `SetState` call landed — keeps the wire shape of
-/// `nodes.<id>` unchanged for pipelines that never opt into the feature
-/// (ADR 0025 §2). A poisoned mutex also reports `None` since the
-/// offending panic has already terminated the relevant tool call; a
-/// partial buffer would be worse than no state.
-fn final_state(buf: &Mutex<Value>) -> Option<Value> {
-    let guard = buf.lock().ok()?;
-    match &*guard {
-        Value::Object(m) if m.is_empty() => None,
-        other => Some(other.clone()),
-    }
-}
-
-#[async_trait]
-impl Agent for LoopAgent {
-    #[instrument(
-        skip(self, req),
-        fields(
-            node.id = %node_id,
-            pipeline.run_id = %run_id,
-            llm.provider = %req.provider,
-            llm.model = %req.model,
-            agent.depth = req.depth,
-        ),
-    )]
-    async fn run(
-        &self,
-        run_id: &str,
-        node_id: &str,
-        req: AgentRequest,
-    ) -> Result<AgentOutput, AgentError> {
-        if req.policy.max_iterations == 0 {
-            return Err(AgentError::InvalidPolicy(
-                "max_iterations must be >= 1".to_string(),
-            ));
-        }
-
-        // Cross-check: every entry in `allowed_tools` must correspond
-        // to a registered handler. Catching mismatches up-front means
-        // the model never sees a tool schema it can't actually call.
-        for name in &req.allowed_tools {
-            if self.find_handler(name).is_none() {
-                return Err(AgentError::UnknownToolCalled { name: name.clone() });
-            }
-        }
-
-        // Per-node state buffer for the `SetState` builtin (ADR 0025).
-        // One object per `run()` call, visible only to tool dispatches
-        // inside this loop. Subagent recursion calls `run()` again and
-        // gets a fresh buffer — child state never leaks into the parent.
-        let state_buffer: Mutex<Value> = Mutex::new(Value::Object(Map::new()));
-        let state_handle = StateHandle::new(&state_buffer);
-
-        // Build the tool definitions the LLM sees on each request —
-        // intersection of `allowed_tools` and the registered handler
-        // set. Empty vector when the agent declared no tools.
-        let declared_tools: Vec<OrnoChatTool> = self
-            .config
-            .tools
-            .iter()
-            .filter(|h| req.allowed_tools.iter().any(|n| n == h.name()))
-            .map(|h| OrnoChatTool {
-                name: Self::to_wire_name(h.name()),
-                description: h.description().to_string(),
-                schema: h.schema(),
-            })
-            .collect();
-
-        // Reverse map: wire name the LLM sends back → YAML name we
-        // registered under. Only dotted YAML names appear here with a
-        // non-identity mapping, but we populate the full allowed set so
-        // an unexpected wire format still resolves correctly.
-        let wire_to_yaml: HashMap<String, String> = self
-            .config
-            .tools
-            .iter()
-            .filter(|h| req.allowed_tools.iter().any(|n| n == h.name()))
-            .map(|h| {
-                let yaml = h.name().to_string();
-                (Self::to_wire_name(&yaml), yaml)
-            })
-            .collect();
-
-        let prompt_excerpt = self.excerpt_for_wire(&req.initial_prompt);
-        let system_excerpt = req.system.as_deref().map(|s| self.excerpt_for_wire(s));
-
-        let max_tokens = (req.policy.max_total_tokens > 0)
-            .then(|| u32::try_from(req.policy.max_total_tokens).unwrap_or(u32::MAX));
-
-        // Growing conversation history across iterations. The initial
-        // user turn rides in `LlmRequest.prompt`; this vector captures
-        // assistant tool-call turns and their paired `ToolResult`s so
-        // the model can reason over what it already did.
-        let mut messages: Vec<OrnoChatMessage> = Vec::new();
-        let mut tool_call_count: u32 = 0;
-        let mut total_tokens: u64 = 0;
-
-        for iteration in 0..req.policy.max_iterations {
-            self.config
-                .sink
-                .record(Event::AgentIterationStarted {
-                    run_id: run_id.to_string(),
-                    node_id: node_id.to_string(),
-                    iteration,
-                })
-                .await;
-
-            let llm_req = LlmRequest {
-                provider: req.provider.clone(),
-                model: req.model.clone(),
-                prompt: req.initial_prompt.clone(),
-                system: req.system.clone(),
-                temperature: None,
-                max_tokens,
-                messages: messages.clone(),
-                tools: declared_tools.clone(),
-            };
-
-            self.config
-                .sink
-                .record(Event::LlmRequestStarted {
-                    run_id: run_id.to_string(),
-                    node_id: node_id.to_string(),
-                    provider: req.provider.clone(),
-                    model: req.model.clone(),
-                    prompt_excerpt: prompt_excerpt.clone(),
-                    system_excerpt: system_excerpt.clone(),
-                })
-                .await;
-
-            let response = match self.config.transport.complete(llm_req).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    let failure =
-                        LlmFailure::from_llm_error(&err, self.config.body_excerpt_max_bytes);
-                    self.config
-                        .sink
-                        .record(Event::LlmRequestFailed {
-                            run_id: run_id.to_string(),
-                            node_id: node_id.to_string(),
-                            provider: req.provider.clone(),
-                            model: req.model.clone(),
-                            failure,
-                        })
-                        .await;
-                    return Err(AgentError::from(err));
-                }
-            };
-
-            // ADR 0023: every `LlmRequestStarted` must be paired with a
-            // terminal envelope. Emit `LlmResponseReceived` BEFORE any
-            // post-response budget check so a token-budget breach at the
-            // end of an iteration does not leave the `LlmRequestStarted`
-            // dangling on the wire. The consumer's pairing logic can
-            // then rely on the invariant unconditionally.
-            let content_excerpt = self.excerpt_for_wire(&response.content);
-            self.config
-                .sink
-                .record(Event::LlmResponseReceived {
-                    run_id: run_id.to_string(),
-                    node_id: node_id.to_string(),
-                    finish_reason: response.finish_reason.clone(),
-                    usage: response.usage.clone(),
-                    content_excerpt,
-                })
-                .await;
-
-            if let Some(usage) = &response.usage {
-                total_tokens = total_tokens.saturating_add(u64::from(usage.total_tokens));
-                if req.policy.max_total_tokens > 0 && total_tokens > req.policy.max_total_tokens {
-                    return Err(AgentError::BudgetExceeded {
-                        kind: BudgetKind::Tokens,
-                    });
-                }
-            }
-
-            // No tool calls → the model produced a final text answer.
-            if response.tool_calls.is_empty() {
-                // ADR 0025 §2: the `state` field is `None` when the
-                // agent made no `SetState` calls. An empty buffer maps
-                // to `None` so pipelines that never use the feature see
-                // no shape change on `nodes.<id>`.
-                let state = final_state(&state_buffer);
-                return Ok(AgentOutput {
-                    content: response.content,
-                    finish_reason: response.finish_reason,
-                    usage: response.usage,
-                    iterations: iteration,
-                    total_tokens,
-                    state,
-                });
-            }
-
-            // Record the assistant's tool-call turn so the next LLM
-            // request carries the full causal chain.
-            messages.push(OrnoChatMessage::ToolCalls {
-                calls: response.tool_calls.clone(),
-            });
-
-            for tool_call in &response.tool_calls {
-                tool_call_count = tool_call_count.saturating_add(1);
-                if req.policy.max_tool_calls > 0 && tool_call_count > req.policy.max_tool_calls {
-                    return Err(AgentError::BudgetExceeded {
-                        kind: BudgetKind::ToolCalls,
-                    });
-                }
-
-                let yaml_name = wire_to_yaml
-                    .get(&tool_call.fn_name)
-                    .cloned()
-                    .unwrap_or_else(|| tool_call.fn_name.clone());
-
-                // ADR 0006: subagent calls are routed through the
-                // recursion-depth gate before dispatch. If the gate
-                // fires, the child loop is never entered; the parent's
-                // next LLM turn carries a denial string as the tool's
-                // result so the model can adapt (ADR 0005 §3).
-                let result_content = if yaml_name.starts_with(SUBAGENT_PREFIX) {
-                    let child_depth = req.depth.saturating_add(1);
-                    let child_agent = yaml_name
-                        .strip_prefix(SUBAGENT_PREFIX)
-                        .unwrap_or(&yaml_name)
-                        .to_string();
-                    if child_depth > req.policy.max_subagent_depth {
-                        self.config
-                            .sink
-                            .record(Event::SubagentDepthExceeded {
-                                run_id: run_id.to_string(),
-                                parent_node_id: node_id.to_string(),
-                                attempted_child_agent: child_agent.clone(),
-                                depth_attempted: child_depth,
-                                max_depth: req.policy.max_subagent_depth,
-                            })
-                            .await;
-                        format!(
-                            "denied: subagent `{child_agent}` would run at depth {child_depth}, \
-                             exceeding max_subagent_depth={} (ADR 0006)",
-                            req.policy.max_subagent_depth,
-                        )
-                    } else {
-                        let handler = self.find_handler(&yaml_name).ok_or_else(|| {
-                            AgentError::UnknownToolCalled {
-                                name: tool_call.fn_name.clone(),
-                            }
-                        })?;
-                        let inv = ToolInvocation {
-                            run_id,
-                            node_id,
-                            call_id: &tool_call.call_id,
-                            depth: req.depth,
-                            state_handle: Some(state_handle),
-                        };
-                        self.check_policy_and_invoke(handler, tool_call, &req.policy, inv)
-                            .await?
-                    }
-                } else {
-                    let handler = self.find_handler(&yaml_name).ok_or_else(|| {
-                        AgentError::UnknownToolCalled {
-                            name: tool_call.fn_name.clone(),
-                        }
-                    })?;
-                    let inv = ToolInvocation {
-                        run_id,
-                        node_id,
-                        call_id: &tool_call.call_id,
-                        depth: req.depth,
-                        state_handle: Some(state_handle),
-                    };
-                    self.check_policy_and_invoke(handler, tool_call, &req.policy, inv)
-                        .await?
-                };
-
-                let input_excerpt = self.excerpt_for_wire(
-                    &serde_json::to_string(&tool_call.fn_arguments).unwrap_or_default(),
-                );
-                let output_excerpt = self.excerpt_for_wire(&result_content);
-                self.config
-                    .sink
-                    .record(Event::ToolCallRecorded {
-                        run_id: run_id.to_string(),
-                        node_id: node_id.to_string(),
-                        tool_name: tool_call.fn_name.clone(),
-                        call_id: tool_call.call_id.clone(),
-                        input_excerpt,
-                        output_excerpt,
-                    })
-                    .await;
-
-                messages.push(OrnoChatMessage::ToolResult {
-                    call_id: tool_call.call_id.clone(),
-                    content: result_content,
-                });
-            }
-        }
-
-        Err(AgentError::IterationLimitExceeded {
-            max: req.policy.max_iterations,
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::LlmError;
-    use crate::events::InMemorySink;
-    use crate::llm::{DummyTransport, LlmResponse, dummy::ScriptedTransport};
+    use crate::agent::{Agent, AgentRequest};
+    use crate::error::{AgentError, LlmError, ToolError};
+    use crate::events::{BudgetKind, Event, InMemorySink, LlmFailure};
+    use crate::llm::{DummyTransport, LlmRequest, LlmResponse, dummy::ScriptedTransport};
     use crate::pipeline::{AgentPolicy, OnParseError};
+    use crate::tool::{ToolEffect, ToolInvocation};
     use async_trait::async_trait;
+    use std::sync::Mutex;
 
     /// Transport stub that returns a caller-chosen `LlmError`. Lives in
     /// the test module because production code never wants a transport
@@ -1421,6 +1052,380 @@ mod tests {
                 output_excerpt.contains("dotted ok"),
                 "handler output must be the dotted echo's fixed string: {output_excerpt:?}",
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn network_denied_feeds_back_as_tool_result_and_loop_continues() {
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "net done"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response("c1", "EchoTool", serde_json::json!({})),
+            ScriptedTransport::text_response("understood, I cannot reach network"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = false;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("network denial must feed back, not terminate");
+
+        assert!(
+            out.content.contains("cannot reach network"),
+            "final output should carry the model's acknowledgment: {:?}",
+            out.content,
+        );
+
+        let events = sink.snapshot();
+        let recorded = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+            .expect("ToolCallRecorded must fire for a denied network call");
+        if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+            assert!(
+                output_excerpt.contains("allow_network=false"),
+                "denial excerpt must name the gate: {output_excerpt:?}",
+            );
+        }
+        let tool_denied = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolDenied { .. }))
+            .expect("ToolDenied must fire for a network denial");
+        if let Event::ToolDenied {
+            tool_name, reason, ..
+        } = &tool_denied.event
+        {
+            assert_eq!(tool_name, "EchoTool");
+            assert!(
+                reason.contains("allow_network=false"),
+                "ToolDenied.reason must name the gate: {reason:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_blocked_feeds_back_and_emits_tool_denied_event() {
+        use crate::tool::WebFetchHandler;
+
+        let sink = Arc::new(InMemorySink::new());
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "WebFetch",
+                serde_json::json!({ "url": "https://evil.com/data" }),
+            ),
+            ScriptedTransport::text_response("acknowledging domain denial"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![handler],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.blocked_domains = vec!["evil.com".into()];
+        req.allowed_tools = vec!["WebFetch".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("domain denial must feed back, not terminate");
+        assert!(
+            out.content.contains("acknowledging domain denial"),
+            "parent should continue after denial: {:?}",
+            out.content,
+        );
+
+        let events = sink.snapshot();
+        let tool_denied = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolDenied { .. }))
+            .expect("ToolDenied must fire for a blocked domain");
+        if let Event::ToolDenied { reason, .. } = &tool_denied.event {
+            assert!(
+                reason.contains("evil.com"),
+                "reason should name the domain: {reason:?}",
+            );
+            assert!(
+                reason.contains("blocked_domains"),
+                "reason should name the gate: {reason:?}",
+            );
+        }
+
+        let recorded = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+            .expect("ToolCallRecorded must still fire for a domain-blocked call");
+        if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+            assert!(
+                output_excerpt.starts_with("denied: tool `WebFetch`"),
+                "denial string must route through the tool result: {output_excerpt:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_domains_allowlist_denies_host_not_in_list() {
+        use crate::tool::WebFetchHandler;
+
+        let sink = Arc::new(InMemorySink::new());
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "WebFetch",
+                serde_json::json!({ "url": "https://random.example/data" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![handler],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.policy.allowed_domains = vec!["api.trusted.com".into()];
+        req.allowed_tools = vec!["WebFetch".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("allowlist denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must fire when host is not on allowlist");
+        assert!(
+            reason.contains("allowed_domains"),
+            "reason should name the gate: {reason:?}",
+        );
+        assert!(
+            reason.contains("random.example"),
+            "reason should name the rejected host: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_once_feeds_invalid_args_back_as_tool_result() {
+        struct FlakyParse {
+            attempts: Mutex<u32>,
+        }
+        #[async_trait]
+        impl ToolHandler for FlakyParse {
+            fn name(&self) -> &str {
+                "FlakyParse"
+            }
+            fn description(&self) -> &str {
+                "Fails with InvalidArgs once."
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn effect(&self) -> ToolEffect {
+                ToolEffect::ReadOnly
+            }
+            async fn invoke(
+                &self,
+                _inv: ToolInvocation<'_>,
+                _args: serde_json::Value,
+            ) -> Result<String, ToolError> {
+                let mut n = self.attempts.lock().expect("mutex");
+                *n += 1;
+                if *n == 1 {
+                    Err(ToolError::InvalidArgs {
+                        name: "FlakyParse".into(),
+                        message: "missing field `x`".into(),
+                    })
+                } else {
+                    Ok("second call ok".into())
+                }
+            }
+        }
+
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(FlakyParse {
+            attempts: Mutex::new(0),
+        });
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response("c1", "FlakyParse", serde_json::json!({})),
+            ScriptedTransport::tool_call_response("c2", "FlakyParse", serde_json::json!({})),
+            ScriptedTransport::text_response("done"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink,
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 5;
+        req.policy.on_parse_error = OnParseError::RetryOnce;
+        req.allowed_tools = vec!["FlakyParse".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("RetryOnce must feed back, loop continues");
+        assert!(out.content.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn retry_once_second_parse_error_on_same_call_id_terminates_with_parse_failed() {
+        struct AlwaysInvalid;
+        #[async_trait]
+        impl ToolHandler for AlwaysInvalid {
+            fn name(&self) -> &str {
+                "AlwaysInvalid"
+            }
+            fn description(&self) -> &str {
+                "Always returns InvalidArgs."
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn effect(&self) -> ToolEffect {
+                ToolEffect::ReadOnly
+            }
+            async fn invoke(
+                &self,
+                _inv: ToolInvocation<'_>,
+                _args: serde_json::Value,
+            ) -> Result<String, ToolError> {
+                Err(ToolError::InvalidArgs {
+                    name: "AlwaysInvalid".into(),
+                    message: "bad schema".into(),
+                })
+            }
+        }
+
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(AlwaysInvalid);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response("same", "AlwaysInvalid", serde_json::json!({})),
+            ScriptedTransport::tool_call_response("same", "AlwaysInvalid", serde_json::json!({})),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink,
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 5;
+        req.policy.on_parse_error = OnParseError::RetryOnce;
+        req.allowed_tools = vec!["AlwaysInvalid".into()];
+
+        let err = agent
+            .run("run_test", "n", req)
+            .await
+            .expect_err("second InvalidArgs on same call_id must terminate");
+        match err {
+            AgentError::ParseFailed { tool, error } => {
+                assert_eq!(tool, "AlwaysInvalid");
+                assert!(error.contains("bad schema"));
+            }
+            other => panic!("expected ParseFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_parse_error_fail_terminates_on_first_invalid_args() {
+        struct InvalidOnce;
+        #[async_trait]
+        impl ToolHandler for InvalidOnce {
+            fn name(&self) -> &str {
+                "InvalidOnce"
+            }
+            fn description(&self) -> &str {
+                "InvalidArgs."
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn effect(&self) -> ToolEffect {
+                ToolEffect::ReadOnly
+            }
+            async fn invoke(
+                &self,
+                _inv: ToolInvocation<'_>,
+                _args: serde_json::Value,
+            ) -> Result<String, ToolError> {
+                Err(ToolError::InvalidArgs {
+                    name: "InvalidOnce".into(),
+                    message: "missing x".into(),
+                })
+            }
+        }
+
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(InvalidOnce);
+
+        let transport = ScriptedTransport::new(vec![ScriptedTransport::tool_call_response(
+            "c1",
+            "InvalidOnce",
+            serde_json::json!({}),
+        )]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink,
+            redactor: Arc::new(crate::events::Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.on_parse_error = OnParseError::Fail;
+        req.allowed_tools = vec!["InvalidOnce".into()];
+
+        let err = agent
+            .run("run_test", "n", req)
+            .await
+            .expect_err("OnParseError::Fail must terminate on first InvalidArgs");
+        match err {
+            AgentError::ParseFailed { tool, .. } => assert_eq!(tool, "InvalidOnce"),
+            other => panic!("expected ParseFailed, got {other:?}"),
         }
     }
 }
