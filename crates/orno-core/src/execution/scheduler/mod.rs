@@ -112,6 +112,10 @@ impl Engine {
     /// process-level error. `Err(CoreError)` is reserved for setup
     /// failures that prevent the run from starting at all (invalid
     /// graph, walker construction error).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "dispatch loop; complexity justified by ADR 0021 event sequencing"
+    )]
     #[instrument(skip(self, pipeline, inputs), fields(pipeline.run_id = %run_id))]
     pub async fn run(
         &self,
@@ -341,7 +345,7 @@ mod tests {
         match failure {
             Some(NodeFailure::NoExecutorRegistered { node_kind }) => {
                 assert_eq!(node_kind, "shell", "node_kind must echo the YAML kind");
-            }
+            },
             other => panic!("expected NoExecutorRegistered, got {other:?}"),
         }
         let run_ok = envelopes.iter().find_map(|e| match &e.event {
@@ -392,7 +396,7 @@ mod tests {
                 Event::NodeFinished { node_id, ok, .. } if node_id == "fail" => fail_ok = Some(*ok),
                 Event::NodeFinished { node_id, ok, .. } if node_id == "ok" => ok_ok = Some(*ok),
                 Event::RunFinished { ok, .. } => run_ok = Some(*ok),
-                _ => {}
+                _ => {},
             }
         }
         assert_eq!(fail_ok, Some(false), "failing node must report ok:false");
@@ -567,7 +571,7 @@ mod tests {
                     tail.contains("visible-cause"),
                     "stderr_tail must surface the actual cause: {tail}",
                 );
-            }
+            },
             other => panic!("expected NodePayloadFailure, got {other:?}"),
         }
     }
@@ -729,6 +733,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration test scenario; long by necessity"
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn shell_node_timeout_fires_and_emits_node_timed_out_and_failure() {
         use crate::node::shell::ShellExecutor;

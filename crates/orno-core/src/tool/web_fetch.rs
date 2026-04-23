@@ -99,7 +99,7 @@ mod tests {
             ToolError::InvalidArgs { name, message } => {
                 assert_eq!(name, "WebFetch");
                 assert!(message.contains("url"), "unexpected message: {message}");
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }
@@ -115,7 +115,7 @@ mod tests {
             ToolError::InvalidArgs { name, message } => {
                 assert_eq!(name, "WebFetch");
                 assert!(message.contains("url"), "unexpected message: {message}");
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }

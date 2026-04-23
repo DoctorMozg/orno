@@ -241,7 +241,7 @@ mod tests {
                     "excerpt larger than cap+marker: {} bytes",
                     body_excerpt.len(),
                 );
-            }
+            },
             other => panic!("expected ApiError, got {other:?}"),
         }
     }
@@ -259,7 +259,7 @@ mod tests {
                     message.contains("payload too large"),
                     "lost cause: {message}"
                 );
-            }
+            },
             other => panic!("expected Other, got {other:?}"),
         }
     }

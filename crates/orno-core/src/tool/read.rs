@@ -77,7 +77,7 @@ mod tests {
             ToolError::InvalidArgs { name, message } => {
                 assert_eq!(name, "Read");
                 assert!(message.contains("path"), "unexpected message: {message}");
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }

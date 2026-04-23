@@ -151,7 +151,7 @@ mod tests {
                     message.contains("not found"),
                     "message should mention 'not found': {message}"
                 );
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }
@@ -182,7 +182,7 @@ mod tests {
                     message.contains("not unique") && message.contains('2'),
                     "message should mention uniqueness and count: {message}"
                 );
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }
@@ -205,7 +205,7 @@ mod tests {
                     message.contains("old_string"),
                     "message should name the missing field: {message}"
                 );
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }

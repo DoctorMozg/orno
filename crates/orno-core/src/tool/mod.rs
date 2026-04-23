@@ -104,15 +104,11 @@ impl<'a> StateHandle<'a> {
     }
 }
 
-// Explicit `'a` on the impl binds the `&'a str` parameter in `for_test`
-// to the `Self` return type. Eliding to `impl ToolInvocation<'_>` would
-// sever that link, so the explicit form stays with a targeted allow.
-#[allow(clippy::elidable_lifetime_names)]
+#[cfg(test)]
 impl<'a> ToolInvocation<'a> {
     /// Shorthand used by handler unit tests that do not care about run
     /// / node identity. Keeps test bodies from repeating the same four
     /// placeholder fields in every assertion.
-    #[cfg(test)]
     pub(crate) fn for_test(call_id: &'a str) -> Self {
         Self {
             run_id: "run_test",

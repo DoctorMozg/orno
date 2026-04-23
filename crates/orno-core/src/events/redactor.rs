@@ -79,14 +79,14 @@ impl Redactor {
             Value::String(s) => Value::String(self.redact(s).into_owned()),
             Value::Array(items) => {
                 Value::Array(items.iter().map(|i| self.redact_json(i)).collect())
-            }
+            },
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, val) in map {
                     out.insert(k.clone(), self.redact_json(val));
                 }
                 Value::Object(out)
-            }
+            },
             // Non-string primitives cannot carry a secret by themselves —
             // return unchanged so the caller skips any allocation.
             other => other.clone(),

@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::error::{AgentError, ToolError};
 use crate::events::Event;
 use crate::llm::OrnoChatToolCall;
+use crate::pipeline::AgentPolicy;
 use crate::tool::{ToolEffect, ToolHandler, ToolInvocation};
 
 use super::LoopAgent;
@@ -42,11 +43,15 @@ impl LoopAgent {
     /// fed back to the model as a `ToolResult` denial string so the
     /// model can adapt. A handler error still terminates the loop via
     /// [`AgentError::Tool`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "policy gate enumerates every ToolEffect variant inline per ADR 0005 §3"
+    )]
     async fn check_policy_and_invoke(
         &self,
         handler: &Arc<dyn ToolHandler>,
         tool_call: &OrnoChatToolCall,
-        policy: &crate::pipeline::AgentPolicy,
+        policy: &AgentPolicy,
         inv: ToolInvocation<'_>,
     ) -> Result<String, AgentError> {
         match handler.effect() {
@@ -56,7 +61,7 @@ impl LoopAgent {
                         .deny(&inv, &tool_call.fn_name, "allow_mutations=false".into())
                         .await);
                 }
-            }
+            },
             ToolEffect::Network => {
                 if !policy.allow_network {
                     return Ok(self
@@ -97,7 +102,7 @@ impl LoopAgent {
                             .await);
                     }
                 }
-            }
+            },
             ToolEffect::MutationsAndNetwork => {
                 if !policy.allow_mutations {
                     return Ok(self
@@ -112,7 +117,7 @@ impl LoopAgent {
                 // Intentionally NOT subject to the domain gate —
                 // MutationsAndNetwork is Bash, which does not surface
                 // a URL in its arguments.
-            }
+            },
             ToolEffect::ContextSelf => {
                 if !policy.allow_context_writes {
                     return Ok(self
@@ -123,8 +128,8 @@ impl LoopAgent {
                         )
                         .await);
                 }
-            }
-            ToolEffect::ReadOnly => {}
+            },
+            ToolEffect::ReadOnly => {},
         }
 
         match handler.invoke(inv, tool_call.fn_arguments.clone()).await {
@@ -147,11 +152,15 @@ impl LoopAgent {
     /// `RetryOnce` feeds the `InvalidArgs` message back to the model as
     /// a tool result; the second breach on the same `call_id`
     /// terminates with [`AgentError::ParseFailed`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "parse-retry wraps check_policy_and_invoke; collapsing into a struct would add indirection without simplifying calls"
+    )]
     pub(super) async fn invoke_with_parse_retry(
         &self,
         handler: &Arc<dyn ToolHandler>,
         tool_call: &OrnoChatToolCall,
-        policy: &crate::pipeline::AgentPolicy,
+        policy: &AgentPolicy,
         inv: ToolInvocation<'_>,
         retried: &mut HashSet<String>,
     ) -> Result<String, AgentError> {
@@ -169,7 +178,7 @@ impl LoopAgent {
                 {
                     retried.insert(tool_call.call_id.clone());
                     Ok(format!("tool args invalid: {message}"))
-                }
+                },
                 _ => Err(AgentError::ParseFailed {
                     tool: name,
                     error: message,

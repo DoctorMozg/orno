@@ -338,11 +338,11 @@ mod tests {
                         "expected AuthFailed classification, got {failure:?}",
                     );
                     failed_idx = Some(i);
-                }
+                },
                 Event::LlmResponseReceived { .. } => {
                     panic!("LlmResponseReceived must not fire on a transport failure");
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         let started = started_idx.expect("LlmRequestStarted must still fire");
@@ -411,7 +411,7 @@ mod tests {
             "OPENROUTER_API_KEY".to_string(),
             "sk-very-secret-12345".to_string(),
         );
-        let redactor = Arc::new(crate::events::Redactor::new(&secret_map));
+        let redactor = Arc::new(Redactor::new(&secret_map));
 
         let sink = Arc::new(InMemorySink::new());
         let agent = LoopAgent::new(LoopAgentConfig {
@@ -459,7 +459,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(DummyTransport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 32,
             tools: Vec::new(),
         });
@@ -569,7 +569,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -606,7 +606,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -644,7 +644,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -682,7 +682,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -743,7 +743,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -781,7 +781,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -817,7 +817,7 @@ mod tests {
         use crate::tool::SetStateHandler;
 
         let sink = Arc::new(InMemorySink::new());
-        let redactor = Arc::new(crate::events::Redactor::default());
+        let redactor = Arc::new(Redactor::default());
         let state_tool = Arc::new(SetStateHandler::new(redactor.clone(), 2048));
 
         let transport = ScriptedTransport::new(vec![
@@ -900,7 +900,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![dotted],
         });
@@ -969,7 +969,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: Vec::new(),
         });
@@ -1021,7 +1021,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![dotted],
         });
@@ -1068,7 +1068,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -1135,7 +1135,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![handler],
         });
@@ -1203,7 +1203,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink: sink.clone(),
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![handler],
         });
@@ -1288,7 +1288,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -1345,7 +1345,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });
@@ -1363,7 +1363,7 @@ mod tests {
             AgentError::ParseFailed { tool, error } => {
                 assert_eq!(tool, "AlwaysInvalid");
                 assert!(error.contains("bad schema"));
-            }
+            },
             other => panic!("expected ParseFailed, got {other:?}"),
         }
     }
@@ -1409,7 +1409,7 @@ mod tests {
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
             sink,
-            redactor: Arc::new(crate::events::Redactor::default()),
+            redactor: Arc::new(Redactor::default()),
             body_excerpt_max_bytes: 256,
             tools: vec![tool],
         });

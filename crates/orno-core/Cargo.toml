@@ -8,26 +8,8 @@ repository.workspace = true
 authors.workspace = true
 description = "Core library for the orno CI-native multi-agent orchestrator."
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-# Config structs legitimately enumerate many boolean capability flags;
-# wire-shape fields mirror provider APIs and can't be renamed freely;
-# skeleton stubs return Result to preserve the future signature.
-struct_excessive_bools = "allow"
-struct_field_names = "allow"
-unnecessary_wraps = "allow"
-# `ToolHandler::{name,description}` return `&str` bound to `&self` so
-# `SubagentHandler` can yield a field reference (`&self.yaml_name`, a
-# dynamic `subagent.<agent>` string built at pipeline load). Builtin
-# handlers return string literals, which the lint wants upgraded to
-# `&'static str` — but that would break the dynamic-name impl.
-unnecessary_literal_bound = "allow"
+[lints]
+workspace = true
 
 [dependencies]
 thiserror = { workspace = true }

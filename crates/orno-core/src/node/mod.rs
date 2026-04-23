@@ -139,7 +139,7 @@ pub fn render_request(
                 policy: cfg.policy.clone(),
                 allowed_tools: cfg.allowed_tools.clone(),
             }))
-        }
+        },
         NodeKind::Shell(n) => {
             let command = tmpl.render("shell.command", &n.command, &ctx_json)?;
             let mut args = Vec::with_capacity(n.args.len());
@@ -155,7 +155,7 @@ pub fn render_request(
                 args,
                 stdin,
             }))
-        }
+        },
     }
 }
 

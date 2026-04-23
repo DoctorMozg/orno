@@ -147,10 +147,10 @@ impl ToolHandler for SetStateHandler {
                 match previous {
                     Some(prev) => {
                         map.insert(key.to_string(), prev);
-                    }
+                    },
                     None => {
                         map.remove(key);
-                    }
+                    },
                 }
             }
             return Err(ToolError::StateTooLarge {
@@ -313,7 +313,7 @@ mod tests {
             ToolError::InvalidArgs { name, message } => {
                 assert_eq!(name, TOOL_NAME);
                 assert!(message.contains('.') || message.contains("invalid"));
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
         assert!(
@@ -403,7 +403,7 @@ mod tests {
                 assert_eq!(name, TOOL_NAME);
                 assert!(bytes > cap, "bytes {bytes} must exceed cap {cap}");
                 assert_eq!(cap, 64);
-            }
+            },
             other => panic!("expected StateTooLarge, got {other:?}"),
         }
 
@@ -420,7 +420,7 @@ mod tests {
         let buf = empty_buffer();
         let h = handler(Redactor::default(), 32);
         let big = "y".repeat(200);
-        let _ = h
+        let _unused = h
             .invoke(
                 invocation_with(&buf, "c1"),
                 json!({ "key": "plan", "value": big }),

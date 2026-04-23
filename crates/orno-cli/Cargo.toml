@@ -12,15 +12,8 @@ description = "Command-line interface for the orno orchestrator."
 name = "orno"
 path = "src/main.rs"
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-# Keep subcommand handlers uniformly returning `Result<()>` so the main
-# dispatch match arm is symmetric even when the body can't fail.
-unnecessary_wraps = "allow"
+[lints]
+workspace = true
 
 [dependencies]
 orno-core = { workspace = true }

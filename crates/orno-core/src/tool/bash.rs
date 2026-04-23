@@ -173,7 +173,7 @@ mod tests {
             ToolError::InvalidArgs { name, message } => {
                 assert_eq!(name, "Bash");
                 assert!(message.contains("command"), "unexpected message: {message}");
-            }
+            },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
     }

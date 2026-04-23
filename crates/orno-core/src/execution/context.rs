@@ -298,7 +298,7 @@ mod tests {
         right_secrets.insert("S".to_string(), "right_s".to_string());
         let right = Context::new(BTreeMap::new(), right_env, right_secrets);
 
-        let _ = left.merge(right);
+        drop(left.merge(right));
 
         let snapshot = left.snapshot_for_template();
         assert_eq!(snapshot["env"]["X"], json!("left"));

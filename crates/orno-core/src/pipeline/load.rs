@@ -18,6 +18,10 @@ pub fn load_from_path(path: &Path) -> Result<Pipeline, PipelineError> {
 }
 
 /// Validate semantic constraints that serde alone cannot enforce.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validation covers all schema constraints; acceptable until v0.1.0 node types stabilize"
+)]
 pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
     if pipeline.nodes.is_empty() {
         return Err(PipelineError::Validation("pipeline has no nodes".into()));

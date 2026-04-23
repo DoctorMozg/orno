@@ -169,7 +169,7 @@ impl Agent for LoopAgent {
                         })
                         .await;
                     return Err(AgentError::from(err));
-                }
+                },
             };
 
             // ADR 0023: every `LlmRequestStarted` must be paired with a

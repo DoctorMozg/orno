@@ -1,3 +1,8 @@
+#![allow(missing_docs)] // binary crate; docs target is orno-core
+#![allow(unreachable_pub)] // clap derive produces pub types we don't re-export
+#![allow(clippy::print_stdout)] // CLI subcommands (schema, validate) write to stdout intentionally
+#![allow(clippy::print_stderr)] // main() error handler writes to stderr intentionally
+
 mod cli;
 mod commands;
 
@@ -58,7 +63,7 @@ async fn dispatch(args: Cli) -> Result<()> {
                 }),
             };
             commands::run::run(&pipeline, flags).await
-        }
+        },
         Command::Validate { pipeline } => commands::validate::run(&pipeline),
         Command::Schema => commands::schema::run(),
         Command::Completions { shell } => commands::completions::run(shell),

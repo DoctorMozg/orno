@@ -1,1 +1,63 @@
+# Mirror rust-toolchain.toml channel so MSRV-aware lints don't suggest APIs
+# unavailable on the pinned version.
+msrv = "1.95"
+
+# Pre-publish: we haven't committed to an external API surface yet.
+# Revisit after the first crates.io release.
 avoid-breaking-exported-api = false
+
+# --- Complexity thresholds (stricter than defaults) ---
+cognitive-complexity-threshold = 20   # default 25
+too-many-arguments-threshold   = 5    # default 7; CLAUDE.md: >4 params wants a struct
+too-many-lines-threshold       = 60   # default 100
+type-complexity-threshold      = 200  # default 250
+trivial-copy-size-limit        = 16   # default 8; 2x covers u64/(u32,u32)
+max-fn-params-bools            = 2    # default 3; third bool usually wants an enum
+
+# --- Test ergonomics ---
+# Allow unwrap/expect/panic in #[cfg(test)] modules.
+# Known gap (clippy#13981): integration tests under crates/*/tests/ need
+# a top-of-file #![allow(clippy::unwrap_used, clippy::expect_used)] manually.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-panic-in-tests  = true
+
+# --- Naming ---
+upper-case-acronyms-aggressive = false
+# Clear the default ["foo","baz","quux"]; those are tutorial names that
+# legitimately appear in test fixtures.
+disallowed-names = []
+
+# --- Documentation coverage ---
+check-private-items = true
+
+# --- Doc-comment identifier allowlist (kills doc_markdown false positives) ---
+doc-valid-idents = [
+    # Project-specific terms
+    "MiniJinja", "NDJSON", "MSRV", "SemVer",
+    # Domain acronyms orno uses
+    "LLM", "MCP", "YAML", "JSON", "JSONSchema",
+    "ULID", "RFC", "UTC", "IETF", "FFI", "DAG",
+    # Library names that trigger doc_markdown otherwise
+    "DevOps", "GitHub", "GitLab", "IntelliJ",
+    # Binary unit suffixes
+    "KiB", "MiB", "GiB", "TiB",
+]
+
+# --- Disallowed macros (orno stream discipline) ---
+# Note: println!/eprintln! are NOT listed here — they are caught by the
+# print_stdout/print_stderr restriction lints in [workspace.lints.clippy],
+# which orno-cli suppresses at crate level (legitimate CLI output).
+disallowed-macros = [
+    { path = "std::dbg",           reason = "debugging macro must not be committed; use tracing::debug! instead" },
+    { path = "std::todo",          reason = "open an issue or add to docs/roadmap.md instead of committing todo!()" },
+    { path = "std::unimplemented", reason = "open an issue or add to docs/roadmap.md instead of committing unimplemented!()" },
+]
+
+# --- Disallowed methods (thread-safety + process conventions) ---
+disallowed-methods = [
+    { path = "std::process::exit",   reason = "return Err from main() instead — process::exit skips Drop and tokio cleanup" },
+    { path = "std::mem::forget",     reason = "orno forbids unsafe_code; leaking via mem::forget is not acceptable" },
+    { path = "std::env::set_var",    reason = "not thread-safe; configure via figment or --env-file instead" },
+    { path = "std::env::remove_var", reason = "not thread-safe; configure via figment or --env-file instead" },
+]

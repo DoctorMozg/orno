@@ -30,9 +30,15 @@ cargo run -p orno-cli -- run examples/hello.yaml
 cargo run -p orno-cli -- validate examples/hello.yaml
 cargo run -p orno-cli -- schema > schemas/pipeline.schema.json
 cargo run -p orno-cli -- completions bash
+
+# Supply-chain and quality gates
+cargo deny check                                    # supply-chain policy
+typos                                               # typo scan
+cargo machete                                       # unused-dep scan
+cargo nextest run --workspace --all-targets         # faster test runner (optional)
 ```
 
-CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, and `cargo test` on ubuntu, plus a release-build matrix on macos-14 and windows-2022. Toolchain pinned by `rust-toolchain.toml` (1.95).
+CI (`.github/workflows/ci.yml`) runs 9 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `test`, `msrv`, and `coverage`. A release-build matrix runs on ubuntu-latest, macos-14, and windows-2022. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — Phase 2 activation after doc comments exist.
 
 ## Workspace shape
 
@@ -107,8 +113,9 @@ Set on day 1, must be preserved:
 - LLM stack: `genai` (ADR 0002), accessed only through `LlmTransport`.
 - MCP stack: `rmcp` (ADR 0007), accessed only through `McpClient`.
 - `unsafe_code = "forbid"` at the crate level in both crates.
+- **MSRV policy.** `rust-version` in the root `Cargo.toml` must match `rust-toolchain.toml`'s `channel`. Bumping one requires bumping the other in the same commit. Current MSRV: 1.95.
 
-Pedantic clippy is `warn` in both crates with a small documented allow list. When a new pedantic lint fires on intentional design, add a targeted allow with a one-line rationale in the same `[lints.clippy]` block rather than suppressing inline.
+Pedantic clippy is `warn` for the whole workspace via `[workspace.lints.clippy]` in the root `Cargo.toml`. Crates inherit with `[lints] workspace = true`. When a lint fires on intentional design, prefer crate-root `#![allow(...)]` with a one-line rationale in the source file. Avoid inline item-level `#[allow(...)]` — the workspace warns on `clippy::allow_attributes` to catch it. Use `#[expect(lint, reason = "...")]` for targeted inline suppression where the lint is certain to fire.
 
 ## Error conventions
 
@@ -146,6 +153,12 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 - **No section-header comments.** If a file wants `// === parsing ===` dividers, it wants splitting instead.
 - **No autobiographical comments.** `// added to fix bug #47`, `// this used to use X`, `// refactored from the old module` — all of these belong in commit messages, not source.
 
+## Lint suppression convention
+
+Workspace lints live in root `Cargo.toml`'s `[workspace.lints.rust]` and `[workspace.lints.clippy]` tables. Per-crate overrides use `#![allow(...)]` as inner attributes at the crate root (`lib.rs` / `main.rs`), with a rationale comment on the same line. File-scoped overrides use the same pattern at the top of the `.rs` file. Inline item-scoped overrides prefer `#[expect(lint, reason = "...")]` over `#[allow(...)]` — the workspace enables `clippy::allow_attributes` which flags bare `#[allow(...)]`.
+
+`clippy.toml`'s `disallowed-macros` and `disallowed-methods` enforce stream discipline (stdout = NDJSON, stderr = tracing) and thread-safety (no `env::set_var`). Reasons are baked into the clippy config and surface in warnings automatically.
+
 ## Testing patterns
 
 - **CLI integration tests use `assert_cmd` + `predicates`.** They live in `crates/orno-cli/tests/` and invoke `orno` as a subprocess. `tests/cli.rs` is the template — copy its pattern rather than starting a parallel one.
@@ -154,6 +167,7 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 - **Hand-rolled fakes, not `mockall`.** The seam count is small enough that a fake struct in a `mod tests` block is clearer than derived mocks. `mockall` adds proc-macro latency and obscures intent.
 - **One test per terminal `AgentError` variant.** Every strictness dimension must have at least one test that asserts termination with the exact expected variant. The loop's contract is "bounded" — only a test that checks the bound actually proves it.
 - **`cargo insta review`** is the accept-new-snapshots workflow. Never edit `.snap` files by hand; run the review command or delete and re-run.
+- **Supplemental tooling.** `cargo-deny` (supply-chain, `deny.toml`), `typos` (`.typos.toml`), `cargo-machete` (unused deps), and dependabot (`.github/dependabot.yml`) back the CI workflow. Run locally before pushing if the change touches dependencies.
 
 ## ADRs
 

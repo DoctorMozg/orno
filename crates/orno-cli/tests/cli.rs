@@ -90,7 +90,8 @@ fn run_emits_lifecycle_events() {
 fn schema_prints_valid_json() {
     let assert = orno().arg("schema").assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    let _: serde_json::Value = serde_json::from_str(&stdout).expect("schema must be valid JSON");
+    let _unused: serde_json::Value =
+        serde_json::from_str(&stdout).expect("schema must be valid JSON");
 }
 
 #[test]

@@ -68,7 +68,7 @@ impl EventSink for StreamingSink {
                 // `()` so we cannot surface it to the caller.
                 tracing::warn!(error = %e, "failed to serialize event envelope");
                 return;
-            }
+            },
         };
         if let Err(e) = guard
             .writer

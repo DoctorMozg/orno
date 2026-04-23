@@ -1,0 +1,26 @@
+# typos-cli 1.45+ configuration.
+# Run: `typos` (check) or `typos -w` (fix in-place).
+
+[files]
+ignore-vcs     = true
+ignore-hidden  = true
+extend-exclude = [
+    "target/",
+    "Cargo.lock",
+    "*.snap",
+    "schemas/",
+    ".mz/",
+]
+
+[default]
+locale         = "en-us"
+check-filename = true
+check-file     = true
+
+[default.extend-words]
+# Project domain terms that typos-cli would otherwise flag.
+ulid = "ulid"
+
+[type.snap]
+extend-glob = ["*.snap"]
+check-file  = false

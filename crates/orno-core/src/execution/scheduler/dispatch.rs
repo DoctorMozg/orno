@@ -64,6 +64,14 @@ impl Engine {
     /// even on failure so the engine can fold it into `Context` —
     /// downstream templates that read `node.<id>.stderr` for recovery
     /// branches must see the data even when the producer node failed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dispatch requires full context; collapsing into a struct would add indirection without simplifying calls"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "dispatch enumerates every failure mode inline to keep event sequencing visible"
+    )]
     pub(super) async fn dispatch_node(
         &self,
         run_id: &str,
@@ -98,7 +106,7 @@ impl Engine {
                     "render_request failed",
                 );
                 return DispatchOutcome::failed(NodeFailure::TemplateRenderFailed { error });
-            }
+            },
         };
 
         let started = std::time::Instant::now();
@@ -129,7 +137,7 @@ impl Engine {
                         "node exceeded wall-clock budget",
                     );
                     return DispatchOutcome::failed(NodeFailure::TimedOut { limit_secs: limit });
-                }
+                },
             }
         } else {
             exec.execute(run_id, &node.id, req).await
@@ -141,7 +149,7 @@ impl Engine {
                     return DispatchOutcome::ok(resp.output);
                 }
                 self.on_payload_failure(node, kind, resp, redactor)
-            }
+            },
             Err(err) => {
                 // Walk the full `source()` chain — thiserror's Display
                 // only renders the top-level variant, so a `NodeError::
@@ -163,7 +171,7 @@ impl Engine {
                     "node execution failed",
                 );
                 DispatchOutcome::failed(NodeFailure::ExecutorError { error })
-            }
+            },
         }
     }
 
@@ -279,7 +287,7 @@ fn node_response_ok(kind: &NodeKind, resp: &NodeResponse) -> bool {
                     );
                     false
                 }
-            }
+            },
         },
         _ => true,
     }

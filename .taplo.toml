@@ -1,0 +1,19 @@
+# taplo TOML formatter configuration.
+include = ["**/*.toml"]
+exclude = ["target/**", ".git/**"]
+
+[formatting]
+align_entries         = false
+align_comments        = true
+array_trailing_comma  = true
+array_auto_expand     = true
+array_auto_collapse   = false
+compact_arrays        = false
+compact_inline_tables = false
+indent_tables         = false
+indent_entries        = false
+# IMPORTANT: never reorder keys — Cargo.toml has meaningful manual ordering.
+reorder_keys          = false
+allowed_blank_lines   = 1
+trailing_newline      = true
+column_width          = 100

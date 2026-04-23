@@ -2,3 +2,25 @@ edition = "2024"
 max_width = 100
 use_field_init_shorthand = true
 use_try_shorthand = true
+
+# Unix line endings everywhere — canonical form on CI (ubuntu-latest).
+newline_style              = "Unix"
+
+# Width-ratio heuristics relative to max_width (fn_call_width=60%, etc.).
+use_small_heuristics       = "Default"
+
+# Trailing comma after block-bodied match arms → cleaner diffs when adding
+# a new variant to a #[non_exhaustive] enum.
+match_block_trailing_comma = true
+
+# Alphabetical ordering within existing `use` groups.
+reorder_imports            = true
+
+# Alphabetical order of mod declarations.
+reorder_modules            = true
+
+# Canonical form for #[derive(...)] attribute lists.
+merge_derives              = true
+
+# Drop unnecessary outer parens: ((x + y)) → (x + y)
+remove_nested_parens       = true

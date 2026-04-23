@@ -297,7 +297,7 @@ mod tests {
             NodeError::UnsupportedYet { id, feature } => {
                 assert_eq!(id, "n");
                 assert!(feature.contains("allowed_tools"));
-            }
+            },
             other => panic!("expected UnsupportedYet, got {other:?}"),
         }
     }
@@ -320,7 +320,7 @@ mod tests {
                     source.to_string().contains("invalid agent policy"),
                     "expected AgentError display in source chain, got {source}",
                 );
-            }
+            },
             other => panic!("expected Execution, got {other:?}"),
         }
     }

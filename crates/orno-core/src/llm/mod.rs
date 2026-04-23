@@ -44,6 +44,10 @@ impl LlmRequest {
     /// Build the single-turn request shape (no message history, no tools).
     /// Use when the caller does not need multi-turn context.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor for a value type; no abstraction needed pre-v0.1"
+    )]
     pub fn from_prompt(
         provider: String,
         model: String,

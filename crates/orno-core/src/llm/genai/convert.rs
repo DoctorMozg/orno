@@ -62,7 +62,7 @@ pub(super) fn build_client(
                     },
                 ))
                 .build())
-        }
+        },
         "anthropic" => {
             let auth = resolve_auth("ANTHROPIC_API_KEY", secrets);
             Ok(Client::builder()
@@ -76,7 +76,7 @@ pub(super) fn build_client(
                     },
                 ))
                 .build())
-        }
+        },
         "ollama" => Ok(Client::builder()
             .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
                 |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -101,7 +101,7 @@ pub(super) fn build_client(
                     },
                 ))
                 .build())
-        }
+        },
         other => Err(LlmError::ConfigError(format!(
             "unknown provider `{other}`; known: {}",
             KNOWN_PROVIDERS.join(", "),
@@ -119,16 +119,16 @@ pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) ->
     match err {
         G::HttpError { status, body, .. } => {
             status_to_error(provider, model, status.as_u16(), body)
-        }
+        },
         G::RequiresApiKey { .. } | G::NoAuthData { .. } | G::NoAuthResolver { .. } => {
             LlmError::AuthFailed {
                 provider: provider.to_string(),
             }
-        }
+        },
         G::ChatResponseGeneration { cause, .. } => LlmError::ParseError(cause),
         G::NoChatResponse { .. } => {
             LlmError::ParseError("provider returned no chat response".to_string())
-        }
+        },
         G::StreamParse { serde_error, .. } => LlmError::ParseError(serde_error.to_string()),
         G::SerdeJson(e) => LlmError::ParseError(e.to_string()),
         other => LlmError::Transport(Box::new(GenAiErrorAdapter(other))),
@@ -161,7 +161,7 @@ fn status_to_error(provider: &str, model: &str, status: u16, body: String) -> Ll
 /// non-negative counters. Negative genai values — which shouldn't
 /// happen but are representable — collapse to 0.
 pub(super) fn convert_usage(u: &genai::chat::Usage) -> Usage {
-    #[allow(clippy::cast_sign_loss)] // negatives clamped to 0 above
+    #[expect(clippy::cast_sign_loss, reason = "negatives clamped to 0 above")]
     fn nonneg(v: Option<i32>) -> u32 {
         match v {
             Some(n) if n > 0 => n as u32,
@@ -195,10 +195,10 @@ pub(super) fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
                 })
                 .collect();
             ChatMessage::from(genai_calls)
-        }
+        },
         OrnoChatMessage::ToolResult { call_id, content } => {
             ChatMessage::from(ToolResponse::new(call_id.clone(), content.clone()))
-        }
+        },
     }
 }
 
@@ -295,7 +295,7 @@ mod tests {
             LlmError::ModelNotFound { provider, model } => {
                 assert_eq!(provider, "anthropic");
                 assert_eq!(model, "claude-9001");
-            }
+            },
             other => panic!("expected ModelNotFound, got {other:?}"),
         }
     }
@@ -319,7 +319,7 @@ mod tests {
                 assert_eq!(provider, "x");
                 assert_eq!(status, 503);
                 assert_eq!(body, "upstream boom");
-            }
+            },
             other => panic!("expected ApiError, got {other:?}"),
         }
     }

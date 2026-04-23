@@ -12,6 +12,7 @@ use crate::pipeline::{Node, Pipeline};
 /// Per-node lifecycle state. Internal to the walker; tests read it
 /// through [`DagWalker::statuses`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum NodeState {
     Pending,
     Ready,

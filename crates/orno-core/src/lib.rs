@@ -4,6 +4,13 @@
 //! crate and are exercised (with dummy implementations) from the skeleton
 //! onward. See `docs/adr/0003-event-log-from-day-one.md`.
 
+// Crate-level allows: these lints are correct for specific design decisions
+// in orno-core and are allowed here rather than inline to keep the lint
+// suppression centralized and documented.
+#![allow(clippy::struct_excessive_bools)] // AgentPolicy uses bool flags by design; ADR 0005
+#![allow(clippy::struct_field_names)] // wire-format types mirror provider API naming
+#![allow(clippy::unnecessary_literal_bound)] // dynamic ToolHandler::name() lifetime bound
+
 pub mod agent;
 pub mod budget;
 pub mod config;

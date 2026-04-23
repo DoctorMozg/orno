@@ -5,7 +5,7 @@ members = ["crates/orno-core", "crates/orno-cli"]
 [workspace.package]
 version = "0.0.1-dev"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "AGPL-3.0-only"
 repository = "https://github.com/drmozg/orno"
 authors = ["Stanislav Gonorovskii"]
@@ -102,3 +102,51 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 opt-level = 3
+
+# Workspace-wide lint policy. Both crates opt in via `[lints] workspace = true`.
+[workspace.lints.rust]
+# Memory safety — orno forbids unsafe under all circumstances.
+unsafe_code                    = "forbid"
+# Correctness-adjacent: catches real bugs.
+let_underscore_drop            = "warn"
+meta_variable_misuse           = "warn"
+non_ascii_idents               = "forbid"
+ambiguous_negative_literals    = "warn"
+# Dead-code / unused-item hygiene.
+unused_qualifications          = "warn"
+unused_import_braces           = "warn"
+unused_lifetimes               = "warn"
+unused_extern_crates           = "warn"
+redundant_lifetimes            = "warn"
+explicit_outlives_requirements = "warn"
+# Deferred to Phase 2 (blast radius): missing_debug_implementations
+
+[workspace.lints.clippy]
+# Pedantic group at low priority so individual overrides win at priority 0.
+pedantic = { level = "warn", priority = -1 }
+
+# --- Pedantic lints suppressed (async-trait false positives or skeleton-stage) ---
+module_name_repetitions        = "allow"
+missing_errors_doc             = "allow"
+missing_panics_doc             = "allow"
+unnecessary_wraps              = "allow"
+must_use_candidate             = "allow"
+cast_precision_loss            = "allow"
+default_trait_access           = "allow"
+unused_async                   = "allow"   # async-trait false positive (clippy#10459)
+manual_async_fn                = "allow"   # async-trait false positive (clippy#12664)
+needless_pass_by_ref_mut       = "allow"   # async-trait false positive (clippy#11545)
+
+# --- Cherry-picked restriction lints (group intentionally NOT enabled wholesale) ---
+dbg_macro                      = "warn"
+print_stdout                   = "warn"    # orno-core must not write to stdout directly
+print_stderr                   = "warn"    # orno-core must not write to stderr directly
+todo                           = "warn"
+unimplemented                  = "warn"
+allow_attributes               = "warn"
+exit                           = "warn"
+exhaustive_enums               = "warn"    # safe: skips types already marked #[non_exhaustive]
+
+# Deferred to Phase 2 (blast radius without source cleanup):
+# unwrap_used, expect_used (4 production call sites in recording/replay/walker)
+# exhaustive_structs (23+ pub structs)

@@ -80,7 +80,7 @@ impl NodeExecutor for ShellExecutor {
             let mut child_stdin = child.stdin.take().expect("stdin was piped");
             Some(tokio::spawn(async move {
                 let res = child_stdin.write_all(payload.as_bytes()).await;
-                let _ = child_stdin.shutdown().await;
+                drop(child_stdin.shutdown().await);
                 res
             }))
         } else {
@@ -97,16 +97,16 @@ impl NodeExecutor for ShellExecutor {
 
         if let Some(handle) = writer_handle {
             match handle.await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {},
                 Ok(Err(err)) if err.kind() == std::io::ErrorKind::BrokenPipe => {
                     warn!(node.id = %id, "child closed stdin before full payload written");
-                }
+                },
                 Ok(Err(err)) => {
                     warn!(node.id = %id, error = %err, "stdin writer failed");
-                }
+                },
                 Err(join_err) => {
                     warn!(node.id = %id, error = %join_err, "stdin writer task panicked");
-                }
+                },
             }
         }
 
@@ -216,7 +216,7 @@ mod tests {
         match err {
             NodeError::Execution { id, source: _ } => {
                 assert_eq!(id, "wrong_kind");
-            }
+            },
             other => panic!("expected NodeError::Execution, got {other:?}"),
         }
     }
@@ -238,7 +238,7 @@ mod tests {
         match err {
             NodeError::Execution { id, source: _ } => {
                 assert_eq!(id, "unknown");
-            }
+            },
             other => panic!("expected NodeError::Execution, got {other:?}"),
         }
     }

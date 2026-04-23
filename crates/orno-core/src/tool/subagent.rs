@@ -208,7 +208,7 @@ impl ToolHandler for SubagentHandler {
                     })
                     .await;
                 Ok(output.content)
-            }
+            },
             Err(err) => {
                 let rendered = format!("{err:#}");
                 self.sink
@@ -228,7 +228,7 @@ impl ToolHandler for SubagentHandler {
                     "error: subagent `{}` failed: {rendered}",
                     self.child_agent_name,
                 ))
-            }
+            },
         }
     }
 }
