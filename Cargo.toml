@@ -107,7 +107,7 @@ tempfile = "3"
 assert_cmd = "2"
 insta = { version = "1", features = ["yaml"] }
 predicates = "3"
-rstest = "0.23"
+rstest = "0.26"
 # wiremock stands up an in-process HTTP/1 server we can point an MCP
 # client at. Used to exercise the streamable-HTTP transport without a
 # live network dep.
