@@ -147,20 +147,189 @@ async fn rmcp_client_empty_command_returns_spawn_error() {
     );
 }
 
-#[tokio::test]
-async fn rmcp_client_http_returns_unsupported() {
-    use orno_core::pipeline::schema::{McpAuthConfig, McpHttpConfig};
+// ──────────────────────────────────────────────────────────────────────────────
+// HTTP transport — wire-level tests
+//
+// The full streamable-HTTP MCP handshake involves session negotiation, JSON
+// or SSE responses, and `Mcp-Session-Id` headers. That is far more than
+// `wiremock` can fake without re-implementing the protocol. These tests
+// instead pin the wire-level contract: the right URL is hit, the right
+// headers go out, and config-time errors surface as `HandshakeFailed`.
+// Wiremock returns 500 on every request so the handshake fails immediately
+// after the first POST, which is enough to verify request shape via
+// `.expect(1..)`. End-to-end protocol coverage lives in `mcp_real.rs`
+// against actual MCP servers.
+// ──────────────────────────────────────────────────────────────────────────────
 
-    let cfg = McpHttpConfig {
-        url: "http://localhost:9999".to_string(),
-        auth: Some(McpAuthConfig::None),
-        headers: std::collections::BTreeMap::new(),
-    };
-    let mut client = RmcpClient::new_http("http-server".to_string(), &cfg);
-    let err = client.initialize().await.unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.to_lowercase().contains("unsupported") || msg.to_lowercase().contains("http"),
-        "error should indicate unsupported transport: {msg}"
-    );
+mod http_transport {
+    use orno_core::mcp::{McpClient, RmcpClient};
+    use orno_core::pipeline::schema::{McpAuthConfig, McpHttpConfig};
+    use std::collections::BTreeMap;
+    use std::error::Error as _;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A 500 response is the simplest way to short-circuit the rmcp
+    /// streamable-HTTP handshake: the transport bails with `OtherStatus`
+    /// before content-type negotiation, which propagates up to
+    /// `HandshakeFailed`. That's exactly the failure mode we want — we
+    /// only care that the request was sent, not that the handshake
+    /// completed.
+    fn fail_with_500() -> ResponseTemplate {
+        ResponseTemplate::new(500)
+    }
+
+    #[tokio::test]
+    async fn http_initialize_posts_to_configured_url() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(fail_with_500())
+            .expect(1u64..)
+            .mount(&server)
+            .await;
+
+        let cfg = McpHttpConfig {
+            url: format!("{}/mcp", server.uri()),
+            auth: None,
+            headers: BTreeMap::new(),
+        };
+
+        let mut client = RmcpClient::new_http("http-server".to_string(), &cfg);
+        let err = client
+            .initialize()
+            .await
+            .expect_err("500 from server must surface as a handshake error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("handshake failed") && msg.contains("http-server"),
+            "expected HandshakeFailed naming the server, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_initialize_sends_bearer_auth_header() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer test-token-abc"))
+            .respond_with(fail_with_500())
+            .expect(1u64..)
+            .mount(&server)
+            .await;
+
+        let cfg = McpHttpConfig {
+            url: format!("{}/mcp", server.uri()),
+            auth: Some(McpAuthConfig::Bearer {
+                token: "test-token-abc".to_string(),
+            }),
+            headers: BTreeMap::new(),
+        };
+
+        let mut client = RmcpClient::new_http("http-bearer".to_string(), &cfg);
+        // We expect the handshake to fail (server returned 500). The real
+        // assertion is on `MockServer::drop` — the `.expect(1u64..)` matcher
+        // panics if no request with the right Authorization header arrived.
+        assert!(
+            client.initialize().await.is_err(),
+            "500 from server must surface as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_initialize_forwards_custom_headers() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("x-orno-test", "demo-123"))
+            .respond_with(fail_with_500())
+            .expect(1u64..)
+            .mount(&server)
+            .await;
+
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Orno-Test".to_string(), "demo-123".to_string());
+
+        let cfg = McpHttpConfig {
+            url: format!("{}/mcp", server.uri()),
+            auth: None,
+            headers,
+        };
+
+        let mut client = RmcpClient::new_http("http-headers".to_string(), &cfg);
+        assert!(
+            client.initialize().await.is_err(),
+            "500 from server must surface as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_basic_auth_returns_unsupported_with_guidance() {
+        let cfg = McpHttpConfig {
+            // Port 1 will refuse on every platform; we never get there
+            // because Basic auth is rejected before any network call.
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            auth: Some(McpAuthConfig::Basic {
+                user: "u".to_string(),
+                password: "p".to_string(),
+            }),
+            headers: BTreeMap::new(),
+        };
+
+        let mut client = RmcpClient::new_http("http-basic".to_string(), &cfg);
+        let err = client
+            .initialize()
+            .await
+            .expect_err("Basic auth must surface as UnsupportedTransport");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported"),
+            "expected UnsupportedTransport, got: {msg}"
+        );
+        assert!(
+            msg.contains("bearer"),
+            "operator-facing message must point at the bearer-auth alternative: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_invalid_header_name_returns_handshake_failed() {
+        // A space inside the header name is invalid per RFC 7230 and
+        // `HeaderName::try_from` will reject it before we ever spawn a
+        // request.
+        let mut headers = BTreeMap::new();
+        headers.insert("Bad Header".to_string(), "value".to_string());
+
+        let cfg = McpHttpConfig {
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            auth: None,
+            headers,
+        };
+
+        let mut client = RmcpClient::new_http("http-bad-header".to_string(), &cfg);
+        let err = client
+            .initialize()
+            .await
+            .expect_err("invalid header name must surface as a HandshakeFailed");
+
+        let top = err.to_string();
+        assert!(
+            top.contains("handshake failed") && top.contains("http-bad-header"),
+            "top-level error should be HandshakeFailed naming the server: {top}"
+        );
+
+        let source = err
+            .source()
+            .expect("HandshakeFailed should carry the validation error as its source");
+        let inner = source.to_string();
+        assert!(
+            inner.contains("invalid http header name") && inner.contains("Bad Header"),
+            "source error should name the offending header: {inner}"
+        );
+    }
 }

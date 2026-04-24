@@ -21,6 +21,7 @@ pub mod llm;
 pub mod mcp;
 pub mod node;
 pub mod pipeline;
+pub mod plan;
 pub mod telemetry;
 pub mod tool;
 

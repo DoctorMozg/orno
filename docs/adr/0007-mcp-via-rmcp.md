@@ -78,3 +78,39 @@ the library, wrap it behind a thin trait — applies identically here.
 - Auto-discovery is explicitly rejected for v0.1.0. Users list the
   tools they want exposed; SRE review of `mcp_servers:` + `tools:`
   is the audit trail.
+
+## Amendments
+
+### 2026-04-24 — HTTP transport wired
+
+The original Decision named both `stdio` and `http` as supported in
+v0.1, but the initial skeleton only wired stdio against `rmcp 0.2`,
+which did not yet feature-gate the streamable-HTTP client cleanly.
+With the upgrade to `rmcp 1.5` the streamable-HTTP transport is now
+wired through `RmcpClient::new_http`:
+
+- Feature gate: `rmcp` is built with
+  `transport-streamable-http-client-reqwest`, which transitively
+  enables `__reqwest` and `reqwest?/rustls`. No native-tls path.
+- Transport: `StreamableHttpClientTransport::<reqwest::Client>::from_config`,
+  hidden behind a private `build_http_transport` helper so the
+  `<reqwest::Client>` generic parameter does not leak into the
+  `connect_http_client` signature.
+- Auth: `auth.kind: bearer` is sent via rmcp's `auth_header` builder,
+  which prepends `Bearer ` on the wire. `auth.kind: basic` remains
+  unwired in v0.1 — `connect_http_client` returns `McpError::
+  UnsupportedTransport` with an operator-facing message pointing at
+  the bearer alternative or a manual `Authorization` header in
+  `headers:`. `auth.kind: none` is a no-op.
+- Headers: `headers:` is forwarded via rmcp's `custom_headers`. The
+  schema's `BTreeMap<String, String>` is converted to rmcp's
+  `HashMap<HeaderName, HeaderValue>` by `build_custom_headers`,
+  which surfaces invalid names/values as `HandshakeFailed` so
+  callers see a single failure shape.
+- Tests: `crates/orno-core/tests/mcp_fake.rs::http_transport`
+  uses `wiremock` to verify the wire-level contract — that the
+  configured URL is hit, that `Bearer` auth produces an
+  `Authorization: Bearer …` header, and that custom headers are
+  forwarded — without re-implementing the streamable-HTTP
+  protocol surface. End-to-end coverage stays in `mcp_real.rs`
+  against actual MCP servers.

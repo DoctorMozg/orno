@@ -174,6 +174,18 @@ impl ReplayToolHandler {
         }
         Ok(Self { inner, entries })
     }
+
+    /// In-memory constructor — skips file I/O. Useful when entries
+    /// arrive from a replay bundle (`orno replay`) rather than a
+    /// standalone tape file on disk.
+    #[must_use]
+    pub fn from_entries(inner: Arc<dyn ToolHandler>, entries: Vec<ToolTapeEntry>) -> Self {
+        let map = entries.into_iter().map(|e| (e.key.clone(), e)).collect();
+        Self {
+            inner,
+            entries: map,
+        }
+    }
 }
 
 #[async_trait]

@@ -16,6 +16,10 @@ pub struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Command::Run carries every flag clap parses; boxing it would force every match arm to deref for marginal stack savings"
+)]
 pub enum Command {
     /// Execute a pipeline YAML file.
     Run {
@@ -94,10 +98,37 @@ pub enum Command {
             conflicts_with = "record_tool_tape"
         )]
         replay_tool_tape: Option<PathBuf>,
+
+        /// Record the full run (LLM tape + tool tape + pipeline YAML)
+        /// to a single bundle file for later replay with
+        /// `orno replay`. Mutually exclusive with the individual
+        /// `--record-tape` / `--replay-tape` / `--record-tool-tape` /
+        /// `--replay-tool-tape` flags.
+        #[arg(
+            long = "record-bundle",
+            value_name = "PATH",
+            conflicts_with_all = ["record_tape", "replay_tape", "record_tool_tape", "replay_tool_tape"]
+        )]
+        record_bundle: Option<PathBuf>,
+    },
+
+    /// Replay a recorded run from a bundle file. No LLM calls, no
+    /// network, no MCP servers — every external interaction is
+    /// served from the bundle's recorded tapes.
+    Replay {
+        /// Bundle file written by `orno run --record-bundle`.
+        bundle: PathBuf,
     },
 
     /// Load and validate a pipeline YAML without running it.
     Validate {
+        /// Path to the pipeline YAML file.
+        pipeline: PathBuf,
+    },
+
+    /// Static pipeline preview — DAG, declared effects, and budget totals.
+    /// No LLM calls, no tool execution, no network.
+    Plan {
         /// Path to the pipeline YAML file.
         pipeline: PathBuf,
     },

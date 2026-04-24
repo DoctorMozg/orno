@@ -294,3 +294,243 @@ nodes:
         "expected at least 2 ok:true occurrences (node + run), got {successes}: {stdout}",
     );
 }
+
+#[test]
+fn plan_hello_yaml_emits_plan_outputs() {
+    // `orno plan` enumerates the DAG without executing — every node
+    // surfaces a `plan_node` event and the run closes with a single
+    // `plan_summary`. The example pipeline declares one agent node `greet`
+    // (see `examples/hello.yaml`).
+    let assert = orno()
+        .args(["plan", "../../examples/hello.yaml"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"plan_node""#),
+        "expected at least one plan_node: {stdout}",
+    );
+    assert!(
+        stdout.contains(r#""type":"plan_summary""#),
+        "expected plan_summary: {stdout}",
+    );
+    assert!(
+        stdout.contains(r#""greet""#),
+        "expected agent node id `greet` from hello.yaml: {stdout}",
+    );
+}
+
+#[test]
+fn plan_cyclic_pipeline_exits_nonzero() {
+    // Two-node cycle a→b→a must fail DAG validation. Kahn's algorithm
+    // surfaces the unvisited remainder; the CLI should propagate that as
+    // a non-zero exit.
+    let yaml = r#"
+version: 1
+nodes:
+  - id: a
+    kind: shell
+    command: "true"
+    needs: [b]
+  - id: b
+    kind: shell
+    command: "true"
+    needs: [a]
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["plan", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stdout.to_lowercase().contains("cycle") || stderr.to_lowercase().contains("cycle"),
+        "expected cycle in stdout or stderr.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn plan_shell_only_pipeline_produces_summary() {
+    // No agent nodes means no LLM transport is needed. The summary must
+    // count both shell nodes.
+    let yaml = r#"
+version: 1
+nodes:
+  - id: first
+    kind: shell
+    command: "echo hello"
+  - id: second
+    kind: shell
+    command: "echo world"
+    needs: [first]
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["plan", file.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"plan_summary""#),
+        "expected plan_summary: {stdout}",
+    );
+    assert!(
+        stdout.contains(r#""total_nodes":2"#),
+        "expected total_nodes:2 in plan_summary: {stdout}",
+    );
+}
+
+#[test]
+fn record_bundle_then_replay_exits_success() {
+    // Round-trip: record a bundle from a live `run`, then feed that
+    // bundle back through `replay` and assert the replayed run reaches
+    // `run_finished`. The DummyTransport keeps the recorded LLM
+    // interactions deterministic so replay matches the recording.
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let bundle_path = tmp.path().to_str().expect("utf8 bundle path");
+
+    orno_with_dummy_transport()
+        .args([
+            "run",
+            "../../examples/hello.yaml",
+            "--record-bundle",
+            bundle_path,
+        ])
+        .assert()
+        .success();
+
+    let assert = orno_with_dummy_transport()
+        .args(["replay", bundle_path])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"run_finished""#),
+        "expected run_finished after replay: {stdout}",
+    );
+}
+
+#[test]
+fn replay_missing_bundle_exits_nonzero() {
+    // A non-existent bundle path is a hard error — the CLI must exit
+    // non-zero and surface a readable diagnostic mentioning either the
+    // operation ("reading bundle") or the OS-level cause ("No such file").
+    let assert = orno()
+        .args(["replay", "/tmp/orno_test_nonexistent_bundle_xyz.ndjson"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("reading bundle") || combined.contains("No such file"),
+        "expected `reading bundle` or `No such file`.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn validate_unknown_tool_exits_nonzero() {
+    // Tool allowlist names a builtin that doesn't exist. `validate`
+    // should fail and the diagnostic must name the offending tool so the
+    // user can find the typo.
+    let yaml = r#"
+version: 1
+agents:
+  worker:
+    model: gpt-4o
+    provider: openrouter
+    allowed_tools: ["UnknownMagicTool"]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 5
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: run
+    kind: agent
+    agent: worker
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("UnknownMagicTool"),
+        "expected diagnostic to name `UnknownMagicTool`.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn validate_undeclared_agent_reference_exits_nonzero() {
+    // Node references an agent name that isn't in the top-level `agents`
+    // map. Validation must reject the pipeline and name the missing key.
+    let yaml = r#"
+version: 1
+nodes:
+  - id: run
+    kind: agent
+    agent: ghost_agent
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("ghost_agent"),
+        "expected diagnostic to name `ghost_agent`.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}
+
+#[test]
+fn validate_subagent_reference_to_unknown_agent_exits_nonzero() {
+    // `subagent.<name>` in `allowed_tools` must point at a real agent
+    // declared in the `agents` map. A dangling reference fails validation
+    // and the diagnostic must name the missing agent.
+    let yaml = r#"
+version: 1
+agents:
+  main:
+    model: gpt-4o
+    provider: openrouter
+    allowed_tools: ["subagent.nonexistent"]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 5
+      max_subagent_depth: 1
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: run
+    kind: agent
+    agent: main
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("nonexistent"),
+        "expected diagnostic to name `nonexistent`.\nstdout: {stdout}\nstderr: {stderr}",
+    );
+}

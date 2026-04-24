@@ -43,7 +43,7 @@ The pairing is the pitch: `plan` proves a pipeline can be audited before spend; 
 
 ### Phase 6 — MCP + subagents + replay (weeks 5–6)
 
-- `McpClient` trait + `RmcpClient` impl (ADR 0007). Stdio transport implemented; HTTP transport stubbed pending upstream `rmcp` feature-gating fix (tracked in `Cargo.toml` comment). Lifecycle-managed by run; events at every transition.
+- `McpClient` trait + `RmcpClient` impl (ADR 0007). Stdio and streamable-HTTP transports both wired against `rmcp 1.5` (`transport-streamable-http-client-reqwest`). HTTP carries `Bearer` auth and arbitrary custom headers; `Basic` auth still returns `UnsupportedTransport` at initialize time and is tracked separately. Lifecycle-managed by run; events at every transition.
 - `SubagentHandler` (ADR 0006). Depth-bounded recursion. Effect-policy compose-down enforced at pipeline load.
 - Replay end-to-end: `RecordingTransport`/`ReplayTransport` around `LlmTransport`; tool-result recording around `ToolHandler`; subagent outputs cached in the parent's event log.
 - Integration test against one real MCP server (filesystem or github).

@@ -1,0 +1,100 @@
+# yaml-language-server: $schema=../schemas/pipeline.schema.json
+#
+# MCP-over-HTTP demo — one agent that talks to a public, no-auth MCP
+# HTTP server (GitMCP) and produces a one-paragraph summary of a public
+# documentation surface. Exercises the streamable-HTTP transport path
+# wired in `RmcpClient::new_http` (ADR 0007, amended 2026-04-24).
+#
+# Why GitMCP for the demo?
+#   - Zero auth, zero credentials in the bundle, zero secrets to leak.
+#   - Stable URL pattern: https://gitmcp.io/<owner>/<repo>.
+#   - Read-only by construction (it only exposes search/fetch tools).
+#   - The exposed tool names embed the repo slug. The wildcard
+#     `mcp.gitmcp.*` in the agent's `allowed_tools` expands at run
+#     start against whatever the server advertises, so the demo
+#     does not need to hard-code per-repo tool names.
+#
+# Run live (LLM call + real HTTP MCP traffic):
+#   export OPENROUTER_API_KEY=sk-or-...
+#   cargo run -p orno-cli -- run examples/mcp-http-demo.yaml
+#
+# Record a replayable bundle (safe to commit if you used GitMCP — no
+# Authorization header is sent):
+#   cargo run -p orno-cli -- run examples/mcp-http-demo.yaml \
+#       --record-bundle examples/bundles/mcp-http-demo.ndjson
+#
+# Replay (no LLM, no network):
+#   cargo run -p orno-cli -- replay examples/bundles/mcp-http-demo.ndjson
+#
+# Swap servers:
+#   - Different public repo: change `mcp_servers.gitmcp.url` to
+#     `https://gitmcp.io/<owner>/<repo>` and update the
+#     `allowed_tools` to match the new repo slug.
+#   - Authenticated server: set `auth.kind: bearer` and supply a token
+#     from `secrets.<NAME>` (orno will redact it from the recorded
+#     bundle per ADR 0020).
+
+version: 1
+
+vars:
+  topic: "How does this MCP server expose its tools to clients?"
+
+mcp_servers:
+  gitmcp:
+    transport: http
+    url: "https://gitmcp.io/modelcontextprotocol/python-sdk"
+    # `auth: none` is the explicit form; omitting `auth:` entirely
+    # is equivalent. Bearer + custom headers are also supported on
+    # this transport — see the file header for the swap recipe.
+    auth:
+      kind: none
+    headers: {}
+
+agents:
+  doc_summarizer:
+    model: anthropic/claude-haiku-4.5
+    provider: openrouter
+    system: |
+      You are a documentation summarizer. You have one MCP server
+      (`gitmcp`) wired to https://gitmcp.io/modelcontextprotocol/python-sdk.
+      It advertises a small set of read-only tools (visible via
+      `tools/list`) for fetching the repo's primary documentation,
+      searching its docs, and searching its code.
+
+      Make exactly one MCP call (prefer the documentation-fetch tool),
+      then write a single short paragraph (≤ 120 words) answering the
+      user's prompt grounded in what you fetched. No lists, no headings,
+      no commentary about the call itself. If the first call returns
+      empty content, answer briefly with what you do know rather than
+      retrying — do not exhaust the tool-call budget.
+    allowed_tools:
+      # Wildcards expand at run start against the server's advertised
+      # `tools/list`. Equivalent here to listing `mcp.gitmcp.fetch_*`,
+      # `mcp.gitmcp.search_*`, etc. — every tool the GitMCP server
+      # exposes for `modelcontextprotocol/servers`.
+      - "mcp.gitmcp.*"
+    policy:
+      max_iterations: 4
+      max_total_tokens: 8000
+      max_tool_calls: 3
+      max_subagent_depth: 0
+      # allow_mutations is required for any MCP call: the v0.1
+      # McpToolHandler classifies every MCP tool as
+      # `ToolEffect::MutationsAndNetwork` because orno cannot
+      # introspect a remote server's per-tool semantics at
+      # registration time. GitMCP is read-only by construction,
+      # so granting this is safe for this demo.
+      allow_mutations: true
+      allow_network: true
+      allowed_domains: ["gitmcp.io"]
+      on_parse_error: fail
+
+nodes:
+  - id: summarize
+    kind: agent
+    agent: doc_summarizer
+    initial_prompt: |
+      {{ vars.topic }}
+
+      Fetch the documentation via the MCP server, then answer in one
+      short paragraph.

@@ -58,6 +58,6 @@ disallowed-macros = [
 disallowed-methods = [
     { path = "std::process::exit",   reason = "return Err from main() instead — process::exit skips Drop and tokio cleanup" },
     { path = "std::mem::forget",     reason = "orno forbids unsafe_code; leaking via mem::forget is not acceptable" },
-    { path = "std::env::set_var",    reason = "not thread-safe; configure via figment or --env-file instead" },
-    { path = "std::env::remove_var", reason = "not thread-safe; configure via figment or --env-file instead" },
+    { path = "std::env::set_var",    reason = "not thread-safe; use --env-file or inherited process env instead" },
+    { path = "std::env::remove_var", reason = "not thread-safe; use --env-file or inherited process env instead" },
 ]

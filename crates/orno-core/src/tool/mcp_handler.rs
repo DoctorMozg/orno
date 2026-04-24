@@ -160,6 +160,80 @@ impl ToolHandler for McpToolHandler {
     }
 }
 
+/// Replay-only stub for one MCP tool. Carries just enough metadata
+/// (name, description, schema) for the agent loop's outgoing
+/// `OrnoChatTool` definition to byte-equal what was recorded — that
+/// equality is what makes `ReplayTransport` find the right response
+/// (the tape key hashes the entire `LlmRequest`, including its
+/// `tools` list).
+///
+/// The real `McpToolHandler` is unusable in `orno replay` because it
+/// requires a live `McpClient`, which is not spawned in replay (no
+/// network, no subprocess). This stub fills the registration slot so
+/// the agent loop's pre-flight `find_handler` check passes; actual
+/// dispatch is intercepted by `ReplayToolHandler` wrapping the stub,
+/// so [`Self::invoke`] is unreachable in normal use. If somehow
+/// called directly, it returns a clear `ToolError` rather than
+/// panicking.
+pub struct ReplayMcpStubHandler {
+    name: String,
+    description: String,
+    schema: Value,
+}
+
+impl std::fmt::Debug for ReplayMcpStubHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayMcpStubHandler")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayMcpStubHandler {
+    /// Build a stub for one MCP tool. `name` is the YAML-form
+    /// (`mcp.<server>.<tool>`) so it matches the agent's
+    /// `allowed_tools` entries directly. `description` and `schema`
+    /// must echo what the original `McpToolHandler` returned at
+    /// recording time — `orno replay` looks them up from the LLM
+    /// tape's `OrnoChatTool` entries to guarantee that.
+    #[must_use]
+    pub fn new(name: String, description: String, schema: Value) -> Self {
+        Self {
+            name,
+            description,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReplayMcpStubHandler {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::MutationsAndNetwork
+    }
+
+    async fn invoke(&self, _inv: ToolInvocation<'_>, _args: Value) -> Result<String, ToolError> {
+        Err(ToolError::Invocation {
+            name: self.name.clone(),
+            source: Box::new(std::io::Error::other(
+                "ReplayMcpStubHandler::invoke called directly — must be wrapped in ReplayToolHandler so the tool tape serves the response",
+            )),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -311,5 +385,40 @@ mod tests {
         });
         let (handler, _sink) = make_handler(client);
         assert_eq!(handler.effect(), ToolEffect::MutationsAndNetwork);
+    }
+
+    #[test]
+    fn replay_stub_exposes_yaml_name_and_recorded_metadata() {
+        let stub = ReplayMcpStubHandler::new(
+            "mcp.fs.read_file".to_string(),
+            "Read a file".to_string(),
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        );
+        assert_eq!(stub.name(), "mcp.fs.read_file");
+        assert_eq!(stub.description(), "Read a file");
+        assert_eq!(stub.schema()["type"], "object");
+        // Effect must match the live `McpToolHandler` so the agent
+        // loop's policy gate behaves identically in replay vs. record.
+        assert_eq!(stub.effect(), ToolEffect::MutationsAndNetwork);
+    }
+
+    #[tokio::test]
+    async fn replay_stub_invoke_called_directly_returns_clear_error() {
+        // Direct invocation should never happen in practice — every
+        // stub gets wrapped in `ReplayToolHandler`. But if it does,
+        // we want a readable error, not a panic.
+        let stub =
+            ReplayMcpStubHandler::new("mcp.fs.read_file".to_string(), String::new(), json!({}));
+        let err = stub
+            .invoke(ToolInvocation::for_test("c1"), json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Invocation { name, source } => {
+                assert_eq!(name, "mcp.fs.read_file");
+                assert!(source.to_string().contains("ReplayToolHandler"));
+            },
+            other => panic!("expected ToolError::Invocation, got {other:?}"),
+        }
     }
 }

@@ -82,6 +82,64 @@
         "panel": "shared",
         "echo": true
       }
+    },
+    {
+      "label": "orno: run mcp-http-demo example",
+      "type": "shell",
+      "command": "cargo run -p orno-cli -- run examples/mcp-http-demo.yaml --secrets-file .env.secrets -v 2>&1",
+      "options": {
+        "env": {
+          "RUST_LOG": "info"
+        }
+      },
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared",
+        "echo": true
+      }
+    },
+    {
+      "label": "orno: mcp-http record/replay walkthrough",
+      "type": "shell",
+      "command": "bash examples/mcp-http-record-replay.sh 2>&1",
+      "options": {
+        "env": {
+          "RUST_LOG": "info"
+        }
+      },
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared",
+        "echo": true
+      }
+    },
+    {
+      "label": "orno: plan commit-digest example",
+      "type": "shell",
+      "command": "cargo run -p orno-cli -- plan examples/commit-digest.yaml 2>&1",
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared",
+        "echo": true
+      }
+    },
+    {
+      "label": "orno: validate commit-digest example",
+      "type": "shell",
+      "command": "cargo run -p orno-cli -- validate examples/commit-digest.yaml 2>&1",
+      "problemMatcher": ["$rustc"],
+      "presentation": {
+        "clear": true,
+        "reveal": "always",
+        "panel": "shared",
+        "echo": true
+      }
     }
   ]
 }

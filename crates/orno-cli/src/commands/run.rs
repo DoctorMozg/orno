@@ -113,15 +113,51 @@ pub struct RunFlags {
     /// When `Some`, wrap each tool handler in `ReplayToolHandler`
     /// so invocations return cached results.
     pub replay_tool_tape: Option<PathBuf>,
+    /// When `Some`, record the full run (LLM tape + tool tape +
+    /// pipeline YAML) into a single bundle file at this path. The
+    /// run still uses the live transport and tool handlers — only
+    /// the post-run assembly step writes the bundle. Mutually
+    /// exclusive with `record_tape` / `replay_tape` /
+    /// `record_tool_tape` / `replay_tool_tape` at the CLI layer; the
+    /// runner uses temp paths internally for the two component tapes.
+    pub record_bundle: Option<PathBuf>,
 }
 
 #[expect(
     clippy::too_many_lines,
     reason = "run() is the top-level orchestrator for orno run; splitting it adds indirection without reducing conceptual load"
 )]
-pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
-    let pipeline = pipeline::load::load_from_path(path)
+pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
+    let mut pipeline = pipeline::load::load_from_path(path)
         .with_context(|| format!("loading pipeline `{}`", path.display()))?;
+
+    // `--record-bundle` records both tapes into temp files that sit
+    // next to the eventual bundle path, then assembles them into a
+    // single NDJSON bundle after the engine flushes. The temp paths
+    // live in the bundle's parent directory so a successful run
+    // produces the bundle on the same filesystem (avoids cross-mount
+    // rename surprises) and a failed run leaves diagnosable artifacts
+    // adjacent to where the user expected the bundle.
+    let bundle_paths = flags.record_bundle.as_ref().map(|bundle| {
+        let parent = bundle.parent().unwrap_or_else(|| Path::new("."));
+        let stem = bundle.file_name().map_or_else(
+            || std::ffi::OsString::from("orno-bundle"),
+            ToOwned::to_owned,
+        );
+        let mut llm = parent.to_path_buf();
+        let mut tool = parent.to_path_buf();
+        let mut llm_name = stem.clone();
+        llm_name.push(".llm.tmp");
+        let mut tool_name = stem;
+        tool_name.push(".tool.tmp");
+        llm.push(llm_name);
+        tool.push(tool_name);
+        (bundle.clone(), llm, tool)
+    });
+    if let Some((_, llm_tmp, tool_tmp)) = &bundle_paths {
+        flags.record_tape = Some(llm_tmp.clone());
+        flags.record_tool_tape = Some(tool_tmp.clone());
+    }
 
     let engine_config = EngineConfig {
         verbose: flags.verbose,
@@ -201,6 +237,11 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     // On failure, `McpServerCrashed` is emitted and the run aborts.
     let mut mcp_clients: Vec<Arc<SharedMcpClient>> = Vec::new();
     let mut mcp_tools: Vec<Arc<dyn ToolHandler>> = Vec::new();
+    // Per-server advertised tool names, captured so wildcard entries
+    // (`mcp.<server>.*`) in agent allowlists can be expanded once every
+    // server has handshaked. We can't expand at load time — the real
+    // tool list is only known after `tools/list` returns.
+    let mut server_tool_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for (server_name, server_cfg) in &pipeline.mcp_servers {
         let transport_label = match server_cfg {
@@ -242,7 +283,9 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
                 })
                 .await;
 
+                let mut tool_names: Vec<String> = Vec::with_capacity(tools.len());
                 for tool in &tools {
+                    tool_names.push(tool.name.clone());
                     mcp_tools.push(Arc::new(McpToolHandler::new(
                         McpToolHandlerConfig {
                             yaml_name: format!("mcp.{server_name}.{}", tool.name),
@@ -256,6 +299,7 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
                         sink.clone(),
                     )));
                 }
+                server_tool_names.insert(server_name.clone(), tool_names);
 
                 mcp_clients.push(shared);
             },
@@ -271,6 +315,16 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
             },
         }
     }
+
+    // Expand `mcp.<server>.*` wildcards in every agent's `allowed_tools`
+    // against the tool list each server actually advertised. Done before
+    // `LoopAgent` construction so the cloned `AgentConfig` each
+    // `SubagentHandler` receives carries the expanded list and the
+    // agent loop's pre-flight `find_handler` lookup sees only exact
+    // names. See `pipeline::load::expand_mcp_wildcards` for the dedupe
+    // and ordering contract.
+    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
+        .context("expanding MCP tool wildcards in agent allowed_tools")?;
 
     // Built-in tool set per ADR 0008 + ADR 0025 (SetState). `LoopAgent`
     // gates each call against the per-agent `AgentPolicy.allowed_tools`
@@ -376,6 +430,29 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
             .expect("tool tape mutex poisoned")
             .flush()
             .context("flushing tool tape after run")?;
+    }
+
+    // Bundle assembly: combine the two component tapes plus the
+    // verbatim pipeline YAML into a single NDJSON file. Done after
+    // both tapes are flushed so the bundle reader sees fully-written
+    // sources. Temp tape files are removed only after the bundle
+    // writes successfully so a mid-assembly failure leaves the raw
+    // tapes diagnosable on disk.
+    if let Some((bundle_path, llm_tmp, tool_tmp)) = bundle_paths {
+        let pipeline_yaml = std::fs::read_to_string(path)
+            .with_context(|| format!("reading pipeline YAML `{}` for bundle", path.display()))?;
+        orno_core::llm::write_bundle(
+            &pipeline_yaml,
+            Some(&llm_tmp),
+            Some(&tool_tmp),
+            &bundle_path,
+        )
+        .with_context(|| format!("writing bundle `{}`", bundle_path.display()))?;
+        // Best-effort cleanup: a failure to remove a temp file is not
+        // fatal — the bundle is already written and a stale `.tmp`
+        // sitting next to it is a recoverable mess, not a data loss.
+        drop(std::fs::remove_file(&llm_tmp));
+        drop(std::fs::remove_file(&tool_tmp));
     }
 
     // Shut down MCP servers in declaration order. Best-effort per ADR 0007:

@@ -16,14 +16,7 @@ feature-depth = 1
 [advisories]
 version = 2
 yanked  = "warn"
-ignore  = [
-    # `paste` is unmaintained (repo archived upstream). It reaches our tree
-    # as a transitive proc-macro dep of `rmcp` (ADR 0007: MCP client). No
-    # safe upgrade is available (pastey/with_builtin_macros are forks, not
-    # drop-in at rmcp's pinned version). Revisit when rmcp drops the dep
-    # or we switch MCP stacks.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained paste proc-macro reached via rmcp (ADR 0007); no safe upgrade yet" },
-]
+ignore  = []
 
 # --- License policy (AGPL-3.0 project; only permissive deps allowed) ---
 [licenses]
@@ -37,10 +30,8 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
-    "MPL-2.0",
     "AGPL-3.0-only",    # workspace crates themselves
 ]
 confidence-threshold = 0.8

@@ -35,3 +35,6 @@ tempfile = { workspace = true }
 # failure paths inside the engine. Production code only depends on the
 # `tracing` macro crate; this is test-only.
 tracing-subscriber = { workspace = true }
+# In-process HTTP server used by mcp_http.rs to exercise the rmcp
+# streamable-HTTP client without a live network dep.
+wiremock = { workspace = true }

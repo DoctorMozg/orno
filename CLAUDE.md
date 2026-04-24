@@ -126,7 +126,7 @@ Do not cross the streams. `init_tracing` in `orno-cli/src/main.rs` enforces the 
 
 Set on day 1, must be preserved:
 
-- `default-features = false` on `reqwest`, `tokio`, `tracing-subscriber`, `minijinja`, `figment`. Feature lists are enumerated explicitly in root `Cargo.toml` under `[workspace.dependencies]`. Do not add `tokio` with `features = ["full"]`.
+- `default-features = false` on `reqwest`, `tokio`, `tracing-subscriber`, `minijinja`. Feature lists are enumerated explicitly in root `Cargo.toml` under `[workspace.dependencies]`. Do not add `tokio` with `features = ["full"]`.
 - YAML parser: **`serde_yaml_ng`** only. `serde_yaml` is archived; `serde_yml` carries RUSTSEC-2025-0068 and must never enter the tree.
 - LLM stack: `genai` (ADR 0002), accessed only through `LlmTransport`.
 - MCP stack: `rmcp` (ADR 0007), accessed only through `McpClient`.

@@ -12,13 +12,16 @@
 //! 3. Call [`call_tool`][super::McpClient::call_tool] any number of times.
 //! 4. Call [`shutdown`][super::McpClient::shutdown] at run end.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, Transport};
 use serde_json::Value;
 use tracing::instrument;
 
@@ -104,9 +107,10 @@ impl RmcpClient {
     }
 
     /// Construct for an HTTP-transport server. Connection is deferred to
-    /// `initialize`. Returns `McpError::UnsupportedTransport` at initialize
-    /// time until the HTTP transport feature is wired (rmcp feature-gating
-    /// issues prevent HTTP in v0.1).
+    /// `initialize`. Uses rmcp's streamable-HTTP client (the current MCP
+    /// transport — SSE-only is gone). Bearer auth and custom headers are
+    /// applied via the rmcp transport config; `Basic` auth still returns
+    /// `McpError::UnsupportedTransport` at initialize time (deferred).
     pub fn new_http(server: String, cfg: &McpHttpConfig) -> Self {
         Self {
             server,
@@ -149,22 +153,7 @@ impl McpClient for RmcpClient {
 
         let service = match config {
             Config::Stdio(stdio) => spawn_stdio_client(&self.server, stdio).await?,
-            Config::Http(http) => {
-                // auth/headers stored for when HTTP transport is wired; url
-                // surfaced in the error so operators know which server failed.
-                tracing::debug!(
-                    url = %http.url,
-                    auth = http.auth.is_some(),
-                    extra_headers = http.headers.len(),
-                    "http mcp transport not yet supported"
-                );
-                return Err(McpError::UnsupportedTransport {
-                    transport: format!(
-                        "http (url={} — HTTP transport deferred past v0.1 due to rmcp feature-gating issues)",
-                        http.url
-                    ),
-                });
-            },
+            Config::Http(http) => connect_http_client(&self.server, http).await?,
         };
 
         let peer = service.peer().clone();
@@ -205,10 +194,10 @@ impl McpClient for RmcpClient {
             });
         };
 
-        let param = CallToolRequestParam {
-            name: tool.to_owned().into(),
-            arguments: args.as_object().cloned(),
-        };
+        let mut param = CallToolRequestParams::new(tool.to_owned());
+        if let Some(obj) = args.as_object() {
+            param = param.with_arguments(obj.clone());
+        }
 
         let result = peer
             .call_tool(param)
@@ -290,4 +279,89 @@ async fn spawn_stdio_client(
             })?;
 
     Ok(service)
+}
+
+/// Open a streamable-HTTP MCP session against `cfg.url` and complete the
+/// MCP handshake. Bearer tokens are passed as the rmcp transport's
+/// `auth_header` (rmcp prepends `Bearer ` itself); user-supplied headers
+/// in `cfg.headers` are forwarded as `custom_headers` on every request.
+///
+/// `Basic` auth is intentionally not wired in v0.1: the schema accepts
+/// it for forward compatibility, but the streamable-HTTP transport only
+/// exposes a single `auth_header` slot and basic-auth interop with MCP
+/// servers is not part of the v0.1 demo scope. Returns
+/// `McpError::UnsupportedTransport` so operators get a loud, scoped
+/// failure rather than silent omission of credentials.
+async fn connect_http_client(
+    server_name: &str,
+    cfg: &HttpConfig,
+) -> Result<RunningService<RoleClient, ()>, McpError> {
+    let mut transport_cfg = StreamableHttpClientTransportConfig::with_uri(cfg.url.as_str());
+
+    match &cfg.auth {
+        Some(McpAuthConfig::Bearer { token }) => {
+            transport_cfg = transport_cfg.auth_header(token.clone());
+        },
+        Some(McpAuthConfig::Basic { .. }) => {
+            return Err(McpError::UnsupportedTransport {
+                transport: format!(
+                    "http (url={} — `auth: basic` not supported on the streamable-HTTP transport in v0.1; use bearer or a custom Authorization header)",
+                    cfg.url
+                ),
+            });
+        },
+        Some(McpAuthConfig::None) | None => {},
+    }
+
+    if !cfg.headers.is_empty() {
+        let custom = build_custom_headers(server_name, &cfg.headers)?;
+        transport_cfg = transport_cfg.custom_headers(custom);
+    }
+
+    let transport = build_http_transport(transport_cfg);
+
+    ().serve(transport)
+        .await
+        .map_err(|e| McpError::HandshakeFailed {
+            server: server_name.to_string(),
+            source: Box::new(e),
+        })
+}
+
+/// Convert the schema's `BTreeMap<String, String>` headers into rmcp's
+/// `HashMap<HeaderName, HeaderValue>`. Either an invalid header name or
+/// a non-ASCII / control-character value surfaces as a single
+/// `HandshakeFailed` so the caller sees the same failure shape as a
+/// real connection-time rejection — handlers don't need a separate
+/// "bad config" branch.
+fn build_custom_headers(
+    server_name: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<HashMap<HeaderName, HeaderValue>, McpError> {
+    let mut out = HashMap::with_capacity(headers.len());
+    for (k, v) in headers {
+        let name = HeaderName::try_from(k.as_str()).map_err(|e| McpError::HandshakeFailed {
+            server: server_name.to_string(),
+            source: Box::new(std::io::Error::other(format!(
+                "invalid http header name `{k}`: {e}"
+            ))),
+        })?;
+        let value = HeaderValue::try_from(v.as_str()).map_err(|e| McpError::HandshakeFailed {
+            server: server_name.to_string(),
+            source: Box::new(std::io::Error::other(format!(
+                "invalid http header value for `{k}`: {e}"
+            ))),
+        })?;
+        out.insert(name, value);
+    }
+    Ok(out)
+}
+
+/// Concrete reqwest-backed transport construction kept in its own
+/// function so the generic parameter on `StreamableHttpClientTransport`
+/// stays out of `connect_http_client`'s signature.
+fn build_http_transport(
+    config: StreamableHttpClientTransportConfig,
+) -> impl Transport<RoleClient> + 'static {
+    StreamableHttpClientTransport::<reqwest::Client>::from_config(config)
 }

@@ -54,6 +54,7 @@ async fn dispatch(args: Cli) -> Result<()> {
             replay_tape,
             record_tool_tape,
             replay_tool_tape,
+            record_bundle,
         } => {
             let flags = commands::run::RunFlags {
                 inline_env: env,
@@ -69,10 +70,13 @@ async fn dispatch(args: Cli) -> Result<()> {
                 replay_tape,
                 record_tool_tape,
                 replay_tool_tape,
+                record_bundle,
             };
             commands::run::run(&pipeline, flags).await
         },
+        Command::Replay { bundle } => commands::replay::run(&bundle).await,
         Command::Validate { pipeline } => commands::validate::run(&pipeline),
+        Command::Plan { pipeline } => commands::plan::run(&pipeline),
         Command::Schema => commands::schema::run(),
         Command::Completions { shell } => commands::completions::run(shell),
     }

@@ -200,8 +200,8 @@ mcp_servers:
 
 - `transport: http` — required discriminator.
 - `url: string` — server endpoint.
-- `auth: AuthConfig` — optional. `kind: bearer | basic | none`.
-- `headers: { string: string }` — optional extra headers.
+- `auth: AuthConfig` — optional. `kind: bearer | basic | none`. **v0.1 caveat**: only `bearer` and `none` connect; `basic` is parsed and validated but returns `UnsupportedTransport` at run start so misconfiguration surfaces loudly (use `kind: bearer` or supply an explicit `Authorization` header in `headers:` instead).
+- `headers: { string: string }` — optional extra headers. Forwarded as request headers on every MCP call. Header names that violate RFC 7230 (e.g. spaces, control characters) fail at run start with `HandshakeFailed`.
 
 ## `nodes`
 
