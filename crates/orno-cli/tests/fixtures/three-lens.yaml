@@ -1,0 +1,74 @@
+# Three-subagent pipeline for integration tests. No MCP, no live API.
+# The reviewer delegates to three read-only lens subagents, then synthesizes.
+version: 1
+
+agents:
+  reviewer:
+    model: openai/gpt-4o-mini
+    provider: openai
+    system: "Delegate to each lens subagent, collect results, return JSON synthesis."
+    allowed_tools:
+      - "subagent.security_lens"
+      - "subagent.perf_lens"
+      - "subagent.docs_lens"
+    policy:
+      max_iterations: 10
+      max_total_tokens: 40000
+      max_tool_calls: 12
+      max_subagent_depth: 1
+      # Read-only parent delegating to read-only children. Per ADR 0027
+      # the subagent tool's effect is derived from the child's policy,
+      # so `allow_mutations=false, allow_network=false` here must not
+      # block the subagent dispatch. This fixture is the regression
+      # case for that behavior.
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  security_lens:
+    model: openai/gpt-4o-mini
+    provider: openai
+    system: "Security reviewer. Return findings as JSON array."
+    allowed_tools: []
+    policy:
+      max_iterations: 5
+      max_total_tokens: 10000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  perf_lens:
+    model: openai/gpt-4o-mini
+    provider: openai
+    system: "Performance reviewer. Return findings as JSON array."
+    allowed_tools: []
+    policy:
+      max_iterations: 5
+      max_total_tokens: 10000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+  docs_lens:
+    model: openai/gpt-4o-mini
+    provider: openai
+    system: "Documentation reviewer. Return findings as JSON array."
+    allowed_tools: []
+    policy:
+      max_iterations: 5
+      max_total_tokens: 10000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: retry_once
+
+nodes:
+  - id: review
+    kind: agent
+    agent: reviewer
+    initial_prompt: "Review this snippet for security, performance, and documentation issues."

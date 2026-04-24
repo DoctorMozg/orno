@@ -9,6 +9,7 @@ use std::io::Write;
 
 use assert_cmd::Command;
 use predicates::str::contains;
+use serde_json::json;
 
 fn orno() -> Command {
     Command::cargo_bin("orno").expect("orno binary should build")
@@ -50,6 +51,48 @@ fn outcome_sequence(stdout: &str) -> Vec<bool> {
             }
         })
         .collect()
+}
+
+/// Build a scripted `LlmResponse` whose sole content is a single tool call
+/// — i.e. a turn where the model is dispatching to `subagent_name`.
+fn subagent_call_response(call_id: &str, subagent_name: &str) -> serde_json::Value {
+    json!({
+        "content": "",
+        "finish_reason": "tool_calls",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "tool_calls": [{"call_id": call_id, "fn_name": subagent_name, "fn_arguments": {"prompt": "review"}}]
+    })
+}
+
+/// Build a scripted `LlmResponse` whose content is a terminal text turn
+/// (no tool calls) — used for both subagent results and the parent's
+/// final synthesis.
+fn text_response(content: &str) -> serde_json::Value {
+    json!({
+        "content": content,
+        "finish_reason": "stop",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        "tool_calls": []
+    })
+}
+
+/// Count NDJSON envelopes on `stdout` whose `event.type` equals `event_type`.
+fn count_event_type(stdout: &str, event_type: &str) -> usize {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("event")?
+                        .get("type")?
+                        .as_str()
+                        .map(|t| t == event_type)
+                })
+                .unwrap_or(false)
+        })
+        .count()
 }
 
 // ─── pr-review.yaml validation ──────────────────────────────────────────────
@@ -224,5 +267,114 @@ nodes:
         event_types(&record_stdout),
         event_types(&replay_stdout),
         "shell-only pipeline must produce identical event type sequences under record and replay",
+    );
+}
+
+// ─── Three-subagent record / replay ─────────────────────────────────────────
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a single record+replay scenario; splitting would share mutable tape state across tests"
+)]
+fn three_subagent_run_record_then_replay_preserves_event_sequence() {
+    // The parent reviewer calls three subagent lenses in sequence; each
+    // subagent makes one LLM call and returns a text result. The full
+    // run requires 7 LLM responses total:
+    //   1. parent → call subagent.security_lens
+    //   2. security_lens → text result
+    //   3. parent → call subagent.perf_lens
+    //   4. perf_lens → text result
+    //   5. parent → call subagent.docs_lens
+    //   6. docs_lens → text result
+    //   7. parent → final synthesis
+    let scripted: Vec<serde_json::Value> = vec![
+        subagent_call_response("call_1", "subagent.security_lens"),
+        text_response("{\"findings\":[],\"verdict\":\"ok\"}"),
+        subagent_call_response("call_2", "subagent.perf_lens"),
+        text_response("{\"findings\":[],\"verdict\":\"ok\"}"),
+        subagent_call_response("call_3", "subagent.docs_lens"),
+        text_response("{\"findings\":[],\"verdict\":\"ok\"}"),
+        text_response("{\"verdict\":\"approve\",\"findings\":[]}"),
+    ];
+    let scripted_json = serde_json::to_string(&scripted).expect("serialize scripted responses");
+
+    let scripted_file = tempfile::NamedTempFile::new().expect("scripted tempfile");
+    std::fs::write(scripted_file.path(), &scripted_json).expect("write scripted tape");
+
+    let tape = tempfile::NamedTempFile::new().expect("tape tempfile");
+    let tape_path = tape.path().to_str().expect("utf8 tape path");
+
+    // Phase 1: record — run three-lens.yaml with ScriptedTransport and
+    // capture the LLM tape.
+    let record_assert = orno()
+        .env("ORNO_TEST_LLM_TRANSPORT", "scripted")
+        .env(
+            "ORNO_TEST_SCRIPTED_TAPE",
+            scripted_file.path().to_str().expect("utf8 scripted path"),
+        )
+        .args([
+            "run",
+            "--record-tape",
+            tape_path,
+            "tests/fixtures/three-lens.yaml",
+        ])
+        .assert()
+        .success();
+    let record_stdout =
+        String::from_utf8(record_assert.get_output().stdout.clone()).expect("utf8 stdout");
+
+    // All three subagent lenses must have fired.
+    assert_eq!(
+        count_event_type(&record_stdout, "subagent_started"),
+        3,
+        "expected 3 subagent_started events in record run:\n{record_stdout}",
+    );
+    assert_eq!(
+        count_event_type(&record_stdout, "subagent_completed"),
+        3,
+        "expected 3 subagent_completed events in record run:\n{record_stdout}",
+    );
+
+    // Tape must be non-empty.
+    let tape_bytes = std::fs::metadata(tape.path()).expect("tape metadata").len();
+    assert!(
+        tape_bytes > 0,
+        "LLM tape must be non-empty after subagent run"
+    );
+
+    // Phase 2: replay — no ScriptedTransport; ReplayTransport takes over.
+    let replay_assert = orno()
+        .args([
+            "run",
+            "--replay-tape",
+            tape_path,
+            "tests/fixtures/three-lens.yaml",
+        ])
+        .assert()
+        .success();
+    let replay_stdout =
+        String::from_utf8(replay_assert.get_output().stdout.clone()).expect("utf8 stdout");
+
+    // Event sequence must be identical.
+    let recorded_types = event_types(&record_stdout);
+    let replayed_types = event_types(&replay_stdout);
+    assert_eq!(
+        recorded_types, replayed_types,
+        "replay must emit the same event type sequence as the original run\n\
+         recorded: {recorded_types:?}\n\
+         replayed: {replayed_types:?}",
+    );
+
+    // All subagent events must appear in the replay too.
+    assert_eq!(
+        count_event_type(&replay_stdout, "subagent_started"),
+        3,
+        "replay must also emit 3 subagent_started events",
+    );
+    assert_eq!(
+        count_event_type(&replay_stdout, "subagent_completed"),
+        3,
+        "replay must also emit 3 subagent_completed events",
     );
 }

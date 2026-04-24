@@ -92,6 +92,20 @@ jobs:
       - run: cargo nextest run --workspace --all-targets --locked
       - run: cargo test --doc --workspace --locked
 
+  test-mcp-real:
+    name: test (real MCP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - run: cargo test -p orno-core --test mcp_real -- --ignored
+
   msrv:
     name: msrv
     runs-on: ubuntu-latest

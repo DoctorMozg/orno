@@ -52,6 +52,8 @@ async fn dispatch(args: Cli) -> Result<()> {
             stderr_tail_bytes,
             record_tape,
             replay_tape,
+            record_tool_tape,
+            replay_tool_tape,
         } => {
             let flags = commands::run::RunFlags {
                 inline_env: env,
@@ -65,6 +67,8 @@ async fn dispatch(args: Cli) -> Result<()> {
                 }),
                 record_tape,
                 replay_tape,
+                record_tool_tape,
+                replay_tool_tape,
             };
             commands::run::run(&pipeline, flags).await
         },

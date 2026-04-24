@@ -74,6 +74,26 @@ pub enum Command {
             conflicts_with = "record_tape"
         )]
         replay_tape: Option<PathBuf>,
+
+        /// Write all tool invocation results to a tape file for later
+        /// replay. Creates or truncates the file. Mutually exclusive
+        /// with `--replay-tool-tape`.
+        #[arg(
+            long = "record-tool-tape",
+            value_name = "PATH",
+            conflicts_with = "replay_tool_tape"
+        )]
+        record_tool_tape: Option<PathBuf>,
+
+        /// Replay tool calls from a tape file instead of executing
+        /// them live. A tape miss returns an error. Mutually exclusive
+        /// with `--record-tool-tape`.
+        #[arg(
+            long = "replay-tool-tape",
+            value_name = "PATH",
+            conflicts_with = "record_tool_tape"
+        )]
+        replay_tool_tape: Option<PathBuf>,
     },
 
     /// Load and validate a pipeline YAML without running it.

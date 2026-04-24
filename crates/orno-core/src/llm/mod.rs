@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::LlmError;
 
 pub use dummy::DummyTransport;
+pub use dummy::ScriptedTransport;
 pub use genai::GenAiTransport;
 pub use recording::RecordingTransport;
 pub use replay::ReplayTransport;

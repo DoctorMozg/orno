@@ -28,7 +28,7 @@ use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::agent::{Agent, AgentRequest, LoopAgent};
 use crate::error::ToolError;
 use crate::events::{Event, EventSink};
-use crate::pipeline::AgentConfig;
+use crate::pipeline::{AgentConfig, AgentPolicy};
 
 #[derive(Clone)]
 pub struct SubagentHandler {
@@ -48,6 +48,13 @@ pub struct SubagentHandler {
     /// owns its copy so a mid-run pipeline mutation cannot change
     /// the child's policy.
     child_config: AgentConfig,
+    /// Effect class derived once from `child_config.policy` at
+    /// construction (ADR 0027). Pipeline-load compose-down already
+    /// guarantees child.policy ≤ parent.policy on both axes, so
+    /// returning the child's declared effect — rather than a
+    /// conservative `MutationsAndNetwork` union — lets a read-only
+    /// parent legitimately delegate to a read-only child.
+    declared_effect: ToolEffect,
     /// Weak back-pointer to the parent [`LoopAgent`]. Upgraded per
     /// call. Using `Weak` — rather than `Arc` — breaks the cycle that
     /// would otherwise leak `LoopAgent` forever (the parent's `tools`
@@ -89,10 +96,12 @@ impl SubagentHandler {
         parent: Weak<LoopAgent>,
         sink: Arc<dyn EventSink>,
     ) -> Self {
+        let declared_effect = effect_from_policy(&child_config.policy);
         Self {
             yaml_name,
             child_agent_name,
             child_config,
+            declared_effect,
             parent,
             sink,
         }
@@ -132,13 +141,11 @@ impl ToolHandler for SubagentHandler {
         })
     }
     fn effect(&self) -> ToolEffect {
-        // A subagent inherits the union of its own policy's effects.
-        // Declaring the handler as `MutationsAndNetwork` means the
-        // parent must itself be allowed both — otherwise the policy
-        // gate denies before we ever reach `invoke`. Per-subagent
-        // effect composition (child ≤ parent) is deferred; the
-        // parent's gate is the conservative ceiling for now.
-        ToolEffect::MutationsAndNetwork
+        // ADR 0027: derived from the child agent's policy at
+        // construction. Pipeline-load compose-down already guarantees
+        // child ≤ parent, so the parent's gate never has to over-
+        // approximate with `MutationsAndNetwork`.
+        self.declared_effect
     }
 
     #[instrument(
@@ -229,6 +236,61 @@ impl ToolHandler for SubagentHandler {
                     self.child_agent_name,
                 ))
             },
+        }
+    }
+}
+
+/// Map a child agent's `(allow_mutations, allow_network)` pair to the
+/// `ToolEffect` variant the parent's policy gate should evaluate (ADR
+/// 0027). The four-quadrant table is the full contract — any future
+/// `AgentPolicy` boolean that gates an effect class must surface here
+/// or in a dedicated helper, never silently.
+fn effect_from_policy(policy: &AgentPolicy) -> ToolEffect {
+    match (policy.allow_mutations, policy.allow_network) {
+        (false, false) => ToolEffect::ReadOnly,
+        (true, false) => ToolEffect::Mutations,
+        (false, true) => ToolEffect::Network,
+        (true, true) => ToolEffect::MutationsAndNetwork,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::OnParseError;
+
+    fn policy(allow_mutations: bool, allow_network: bool) -> AgentPolicy {
+        AgentPolicy {
+            max_iterations: 1,
+            max_total_tokens: 1_000,
+            max_tool_calls: 1,
+            max_subagent_depth: 0,
+            allow_mutations,
+            allow_network,
+            allow_context_writes: false,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            on_parse_error: OnParseError::Fail,
+        }
+    }
+
+    #[test]
+    fn effect_from_policy_four_quadrants() {
+        // ADR 0027: one row per combination of the two booleans. A new
+        // row must be added here before a new `AgentPolicy` flag can
+        // widen the effect surface at the subagent boundary.
+        let cases: &[(bool, bool, ToolEffect)] = &[
+            (false, false, ToolEffect::ReadOnly),
+            (true, false, ToolEffect::Mutations),
+            (false, true, ToolEffect::Network),
+            (true, true, ToolEffect::MutationsAndNetwork),
+        ];
+        for &(mutations, network, expected) in cases {
+            let got = effect_from_policy(&policy(mutations, network));
+            assert_eq!(
+                got, expected,
+                "expected effect {expected:?} for (allow_mutations={mutations}, allow_network={network}), got {got:?}",
+            );
         }
     }
 }

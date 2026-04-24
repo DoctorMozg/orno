@@ -14,8 +14,9 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -26,6 +27,7 @@ use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{
     DummyTransport, GenAiTransport, LlmTransport, RecordingTransport, ReplayTransport,
+    ScriptedTransport,
 };
 use orno_core::mcp::{McpClient, McpTool, McpToolCallResult, RmcpClient};
 use orno_core::node::NodeRegistry;
@@ -36,16 +38,20 @@ use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::schema::McpServerConfig;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, McpToolHandler, McpToolHandlerConfig, ReadHandler, SetStateHandler,
-    SubagentHandler, ToolHandler, WebFetchHandler, WriteHandler,
+    BashHandler, EditHandler, McpToolHandler, McpToolHandlerConfig, ReadHandler,
+    RecordingToolHandler, ReplayToolHandler, SetStateHandler, SubagentHandler, ToolHandler,
+    WebFetchHandler, WriteHandler,
 };
 use serde_json::Value;
 
 /// Test-only escape hatch: when set to `dummy`, `orno run` swaps
 /// `GenAiTransport` for `DummyTransport` so integration tests can
-/// snapshot the event stream without a live API key. The var name
-/// is intentionally awkward — end users should never set it.
-/// Record/replay tape wiring (Phase 7) will subsume this.
+/// snapshot the event stream without a live API key. When set to
+/// `scripted`, tests can drive multi-turn agent + subagent loops
+/// by pre-seeding the response queue via `ORNO_TEST_SCRIPTED_TAPE`
+/// — required for record/replay coverage of subagent dispatch
+/// (Phase 6). The var name is intentionally awkward — end users
+/// should never set it.
 const TEST_TRANSPORT_ENV: &str = "ORNO_TEST_LLM_TRANSPORT";
 
 /// Mutex-guarded wrapper that lets the orchestrator hold a single MCP
@@ -101,6 +107,12 @@ pub struct RunFlags {
     /// When `Some`, use `ReplayTransport` instead of the live transport.
     /// Mutually exclusive with `record_tape`.
     pub replay_tape: Option<PathBuf>,
+    /// When `Some`, wrap each tool handler in `RecordingToolHandler`
+    /// and flush to this path at run end.
+    pub record_tool_tape: Option<PathBuf>,
+    /// When `Some`, wrap each tool handler in `ReplayToolHandler`
+    /// so invocations return cached results.
+    pub replay_tool_tape: Option<PathBuf>,
 }
 
 #[expect(
@@ -122,6 +134,16 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     let base_transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
+        Ok("scripted") => {
+            let tape_path = std::env::var("ORNO_TEST_SCRIPTED_TAPE").unwrap_or_else(|_| {
+                panic!("ORNO_TEST_SCRIPTED_TAPE must be set when ORNO_TEST_LLM_TRANSPORT=scripted")
+            });
+            let json = std::fs::read_to_string(&tape_path)
+                .unwrap_or_else(|e| panic!("reading scripted tape `{tape_path}`: {e}"));
+            let responses: Vec<orno_core::llm::LlmResponse> = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("parsing scripted tape as Vec<LlmResponse>: {e}"));
+            Arc::new(ScriptedTransport::new(responses))
+        },
         _ => Arc::new(
             GenAiTransport::from_agents(&pipeline.agents, &inputs.secrets)
                 .context("constructing LLM transport from pipeline agents")?,
@@ -269,6 +291,41 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
     ];
     builtin_tools.extend(mcp_tools);
 
+    // Tool tape wiring: wrap every handler so all calls are recorded to or
+    // replayed from a single NDJSON file. One shared BufWriter so all tool
+    // results land in order in the same file (RecordingToolHandler::with_shared_tape).
+    let mut tool_tape_to_flush: Option<Arc<Mutex<std::io::BufWriter<std::fs::File>>>> = None;
+    if let Some(path) = &flags.record_tool_tape {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| format!("creating tool tape `{}`", path.display()))?;
+        let shared = Arc::new(Mutex::new(std::io::BufWriter::new(file)));
+        let path_buf = path.clone();
+        builtin_tools = builtin_tools
+            .into_iter()
+            .map(|h| {
+                Arc::new(RecordingToolHandler::with_shared_tape(
+                    h,
+                    shared.clone(),
+                    path_buf.clone(),
+                )) as Arc<dyn ToolHandler>
+            })
+            .collect();
+        tool_tape_to_flush = Some(shared);
+    } else if let Some(path) = &flags.replay_tool_tape {
+        let mut replay_tools = Vec::with_capacity(builtin_tools.len());
+        for h in builtin_tools {
+            let name = h.name().to_string();
+            let replay = ReplayToolHandler::load(h, path)
+                .with_context(|| format!("loading tool tape for handler `{name}`"))?;
+            replay_tools.push(Arc::new(replay) as Arc<dyn ToolHandler>);
+        }
+        builtin_tools = replay_tools;
+    }
+
     // ADR 0006: build the `LoopAgent` inside `Arc::new_cyclic` so each
     // `SubagentHandler` can hold a `Weak<LoopAgent>` back-pointer into
     // the same agent its tool vector lives on. A plain `Arc` would
@@ -312,6 +369,13 @@ pub async fn run(path: &Path, flags: RunFlags) -> Result<()> {
 
     if let Some(rec) = recording_transport {
         rec.flush().context("flushing LLM tape after run")?;
+    }
+
+    if let Some(tape) = &tool_tape_to_flush {
+        tape.lock()
+            .expect("tool tape mutex poisoned")
+            .flush()
+            .context("flushing tool tape after run")?;
     }
 
     // Shut down MCP servers in declaration order. Best-effort per ADR 0007:

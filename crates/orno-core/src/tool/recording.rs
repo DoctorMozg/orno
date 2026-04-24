@@ -73,6 +73,17 @@ impl RecordingToolHandler {
         })
     }
 
+    /// Wrap `inner` and share an already-opened tape. Use this when
+    /// multiple handlers must all write to the same NDJSON file — the
+    /// caller is responsible for flushing the tape after the run.
+    pub fn with_shared_tape(
+        inner: Arc<dyn ToolHandler>,
+        tape: Arc<Mutex<BufWriter<File>>>,
+        path: PathBuf,
+    ) -> Self {
+        Self { inner, tape, path }
+    }
+
     #[must_use]
     pub fn tape_path(&self) -> &Path {
         &self.path
