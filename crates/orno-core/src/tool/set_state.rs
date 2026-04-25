@@ -14,7 +14,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Map, Value};
 use tracing::{debug, instrument};
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
@@ -22,6 +24,18 @@ use crate::error::ToolError;
 use crate::events::Redactor;
 
 const TOOL_NAME: &str = "SetState";
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetStateArgs {
+    #[schemars(
+        description = "Top-level identifier under `state`. No dots.",
+        regex(pattern = r"^[A-Za-z_][A-Za-z0-9_]*$")
+    )]
+    key: String,
+    #[schemars(description = "JSON value to store at `state.<key>`. Any type.")]
+    value: Value,
+}
 
 /// Handler for the `SetState` builtin. Holds the per-run redactor and
 /// the size cap so `invoke` has everything it needs without reaching
@@ -60,20 +74,7 @@ impl ToolHandler for SetStateHandler {
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "Top-level identifier under `state`. No dots.",
-                    "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
-                },
-                "value": {
-                    "description": "JSON value to store at `state.<key>`. Any type."
-                }
-            },
-            "required": ["key", "value"]
-        })
+        serde_json::to_value(schemars::schema_for!(SetStateArgs)).expect("static schema")
     }
 
     fn effect(&self) -> ToolEffect {
@@ -85,23 +86,12 @@ impl ToolHandler for SetStateHandler {
         fields(tool.name = TOOL_NAME, tool.call_id = %inv.call_id, node.id = %inv.node_id),
     )]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let key =
-            args.get("key")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::InvalidArgs {
-                    name: TOOL_NAME.to_string(),
-                    message: "missing or non-string `key`".to_string(),
-                })?;
-        validate_key(key)?;
-
-        // `null` is a valid value — check presence, not truthiness.
-        let value = args
-            .get("value")
-            .cloned()
-            .ok_or_else(|| ToolError::InvalidArgs {
+        let SetStateArgs { key, value } =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 name: TOOL_NAME.to_string(),
-                message: "missing `value` field".to_string(),
+                message: e.to_string(),
             })?;
+        validate_key(&key)?;
 
         // ADR 0020 / 0025 §7: redact secret leaves before storage so
         // downstream template renders never re-materialize a secret
@@ -133,7 +123,7 @@ impl ToolHandler for SetStateHandler {
         // Insert first so we can measure the tentative new size, then
         // roll back if it exceeds the cap. Keeping the rollback inline
         // avoids a full clone of the map on the happy path.
-        let previous = map.insert(key.to_string(), redacted.clone());
+        let previous = map.insert(key.clone(), redacted.clone());
         let serialized_len = serde_json::to_string(&*guard)
             .map(|s| s.len())
             .map_err(|e| ToolError::Invocation {
@@ -146,10 +136,10 @@ impl ToolHandler for SetStateHandler {
             if let Some(map) = as_object_mut(&mut guard) {
                 match previous {
                     Some(prev) => {
-                        map.insert(key.to_string(), prev);
+                        map.insert(key.clone(), prev);
                     },
                     None => {
-                        map.remove(key);
+                        map.remove(&key);
                     },
                 }
             }
@@ -213,6 +203,8 @@ fn as_object_mut(v: &mut Value) -> Option<&mut Map<String, Value>> {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    use serde_json::json;
 
     use super::*;
     use crate::tool::StateHandle;

@@ -534,3 +534,174 @@ nodes:
         "expected diagnostic to name `nonexistent`.\nstdout: {stdout}\nstderr: {stderr}",
     );
 }
+
+#[test]
+fn plan_shows_allow_context_writes() {
+    // The `triager` agent in `examples/scoped-state.yaml` opts into
+    // scoped-state writes (ADR 0025). `orno plan` must surface that
+    // gate as a serialized field on the `plan_node` so a reviewer sees
+    // the elevated effect surface without running the pipeline.
+    let assert = orno()
+        .args(["plan", "../../examples/scoped-state.yaml"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""allow_context_writes":true"#),
+        "expected allow_context_writes:true for triager agent: {stdout}",
+    );
+}
+
+#[test]
+fn validate_effect_gate_mismatch_exits_nonzero() {
+    // `SetState` carries `ToolEffect::ContextSelf` (ADR 0025) — listing
+    // it without `allow_context_writes:true` is a silent runtime denial.
+    // Validation promotes that into an explicit failure so the agent
+    // never ships with a dead allowlist entry.
+    let yaml = r#"
+version: 1
+agents:
+  worker:
+    model: gpt-4o
+    provider: openrouter
+    allowed_tools: ["SetState"]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 5
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      allow_context_writes: false
+      on_parse_error: fail
+nodes:
+  - id: run
+    kind: agent
+    agent: worker
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("SetState") && stderr.contains("allow_context_writes"),
+        "expected diagnostic naming SetState + allow_context_writes: {stderr}",
+    );
+}
+
+#[test]
+fn validate_network_gate_mismatch_exits_nonzero() {
+    // Symmetric to the SetState gate above: `WebFetch` requires
+    // `allow_network:true`. A mismatch is an error, not a warning.
+    let yaml = r#"
+version: 1
+agents:
+  worker:
+    model: gpt-4o
+    provider: openrouter
+    allowed_tools: ["WebFetch"]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 5
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: run
+    kind: agent
+    agent: worker
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("WebFetch") && stderr.contains("allow_network"),
+        "expected diagnostic naming WebFetch + allow_network: {stderr}",
+    );
+}
+
+#[test]
+fn validate_domain_list_with_no_network_warns() {
+    // `allowed_domains` with `allow_network:false` is dormant config —
+    // never consulted, but not an error either. Validation must surface
+    // it as a `warning:` line and still exit success.
+    let yaml = r#"
+version: 1
+agents:
+  worker:
+    model: gpt-4o
+    provider: openrouter
+    allowed_tools: []
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 5
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      allowed_domains: ["example.com"]
+      on_parse_error: fail
+nodes:
+  - id: run
+    kind: agent
+    agent: worker
+    initial_prompt: "hello"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("warning:") && stderr.contains("allow_network"),
+        "expected `warning:` line referencing allow_network: {stderr}",
+    );
+}
+
+#[test]
+fn mcp_init_crash_emits_run_started_and_run_finished() {
+    // When the MCP init step fails, the CLI owns the lifecycle pair —
+    // `Engine::run` never reaches the DAG. Verifies the crash path
+    // emits both `run_started` and `run_finished{ok:false}` around the
+    // `mcp_server_crashed` envelope so a stream consumer sees a
+    // well-bracketed run even when nothing executed (ADR 0007 / H2).
+    let yaml = r#"
+version: 1
+mcp_servers:
+  broken:
+    transport: stdio
+    command: ["/nonexistent-mcp-server-xyz-12345"]
+nodes:
+  - id: noop
+    kind: shell
+    command: "true"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno_with_dummy_transport()
+        .args(["run", file.path().to_str().unwrap()])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"run_started""#),
+        "expected run_started before MCP crash: {stdout}",
+    );
+    assert!(
+        stdout.contains(r#""type":"mcp_server_crashed""#),
+        "expected mcp_server_crashed: {stdout}",
+    );
+    assert!(
+        stdout.contains(r#""type":"run_finished""#) && stdout.contains(r#""ok":false"#),
+        "expected run_finished ok:false: {stdout}",
+    );
+}

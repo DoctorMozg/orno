@@ -124,10 +124,20 @@ impl ToolHandler for RecordingToolHandler {
             .unwrap_or_else(|e| format!("{{\"serialize_err\":\"{e}\"}}"));
         {
             let mut guard = self.tape.lock().expect("tape mutex poisoned");
-            // Write errors are non-fatal — we don't want a tape-write failure
-            // to kill the agent run. Log at debug and continue.
+            // ADR 0005 §5: record/replay is a strictness dimension, so a
+            // tape-write failure aborts the call rather than silently
+            // dropping the entry — replay would otherwise diverge.
             if let Err(e) = writeln!(*guard, "{line}") {
-                tracing::debug!(error = %e, tool = self.inner.name(), "tool tape write failed");
+                tracing::warn!(
+                    error = %e,
+                    tool = self.inner.name(),
+                    path = %self.path.display(),
+                    "tool tape write failed — replay bundle is incomplete",
+                );
+                return Err(ToolError::Invocation {
+                    name: self.inner.name().to_string(),
+                    source: Box::new(e),
+                });
             }
         }
         result
@@ -161,15 +171,17 @@ impl ReplayToolHandler {
         inner: Arc<dyn ToolHandler>,
         path: impl AsRef<Path>,
     ) -> Result<Self, std::io::Error> {
-        let file = File::open(path.as_ref())?;
+        let path_ref = path.as_ref();
+        let path_disp = path_ref.display().to_string();
+        let file = File::open(path_ref)?;
         let mut entries = HashMap::new();
-        for line in BufReader::new(file).lines() {
+        for (lineno, line) in BufReader::new(file).lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let entry: ToolTapeEntry =
-                serde_json::from_str(&line).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let entry: ToolTapeEntry = serde_json::from_str(&line)
+                .map_err(|e| std::io::Error::other(format!("{path_disp}:{}: {e}", lineno + 1)))?;
             entries.insert(entry.key.clone(), entry);
         }
         Ok(Self { inner, entries })
@@ -379,5 +391,54 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("Echo"), "error should name the tool: {msg}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tape_write_failure_returns_invocation_error() {
+        // `/dev/full` accepts opens but every `write` returns ENOSPC. A
+        // zero-capacity `BufWriter` forwards each byte straight to the
+        // underlying file, so the failure cannot hide in the buffer.
+        let path = PathBuf::from("/dev/full");
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        let tape = Arc::new(Mutex::new(BufWriter::with_capacity(0, file)));
+        let rec = RecordingToolHandler::with_shared_tape(Arc::new(EchoHandler), tape, path);
+
+        let err = rec
+            .invoke(ToolInvocation::for_test("c1"), json!({"x": 1}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, ToolError::Invocation { ref name, .. } if name == "Echo"),
+            "expected Invocation error from tape-write failure, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_tape_line_error_includes_path_and_line() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let good = serde_json::to_string(&ToolTapeEntry {
+            key: "k".to_string(),
+            content: Some("ok".to_string()),
+            error: None,
+        })
+        .unwrap();
+        std::fs::write(&path, format!("{good}\nnot-json\n{good}\n")).unwrap();
+
+        let err = ReplayToolHandler::load(Arc::new(EchoHandler), &path).unwrap_err();
+
+        let msg = err.to_string();
+        let path_disp = path.display().to_string();
+        assert!(
+            msg.contains(&path_disp),
+            "error should mention tape path `{path_disp}`: {msg}",
+        );
+        assert!(
+            msg.contains(":2:"),
+            "error should mention 1-indexed line number `:2:`: {msg}",
+        );
     }
 }

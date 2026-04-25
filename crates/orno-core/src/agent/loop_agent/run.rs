@@ -108,9 +108,6 @@ impl Agent for LoopAgent {
         let prompt_excerpt = self.excerpt_for_wire(&req.initial_prompt);
         let system_excerpt = req.system.as_deref().map(|s| self.excerpt_for_wire(s));
 
-        let max_tokens = (req.policy.max_total_tokens > 0)
-            .then(|| u32::try_from(req.policy.max_total_tokens).unwrap_or(u32::MAX));
-
         // Growing conversation history across iterations. The initial
         // user turn rides in `LlmRequest.prompt`; this vector captures
         // assistant tool-call turns and their paired `ToolResult`s so
@@ -118,7 +115,6 @@ impl Agent for LoopAgent {
         let mut messages: Vec<OrnoChatMessage> = Vec::new();
         let mut tool_call_count: u32 = 0;
         let mut total_tokens: u64 = 0;
-        let mut retried_parse_errors: HashSet<String> = HashSet::new();
 
         for iteration in 0..req.policy.max_iterations {
             self.config
@@ -129,6 +125,23 @@ impl Agent for LoopAgent {
                     iteration,
                 })
                 .await;
+
+            // Per-iteration parse-retry budget. `call_id`s are issued
+            // per LLM turn and unique per iteration in practice, so a
+            // fresh set each iteration narrows the contract: one parse
+            // retry per `call_id` within the iteration that produced it.
+            let mut retried_parse_errors: HashSet<String> = HashSet::new();
+
+            // Each request asks for the budget remaining AFTER previous
+            // iterations' usage. `total_tokens` is updated below from
+            // the response's `Usage`; the saturating subtraction guards
+            // against the model overshooting the prior cap.
+            let max_tokens = if req.policy.max_total_tokens == 0 {
+                None
+            } else {
+                let remaining = req.policy.max_total_tokens.saturating_sub(total_tokens);
+                (remaining > 0).then(|| u32::try_from(remaining).unwrap_or(u32::MAX))
+            };
 
             let llm_req = LlmRequest {
                 provider: req.provider.clone(),
@@ -281,6 +294,7 @@ impl Agent for LoopAgent {
                             &req.policy,
                             inv,
                             &mut retried_parse_errors,
+                            &wire_to_yaml,
                         )
                         .await?
                     }
@@ -303,6 +317,7 @@ impl Agent for LoopAgent {
                         &req.policy,
                         inv,
                         &mut retried_parse_errors,
+                        &wire_to_yaml,
                     )
                     .await?
                 };

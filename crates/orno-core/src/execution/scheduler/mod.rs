@@ -197,7 +197,6 @@ impl Engine {
             }
 
             let node_id = node.id.clone();
-            let newly_skipped = walker.complete(&node_id, node_ok);
 
             self.sink
                 .record(Event::NodeFinished {
@@ -207,6 +206,8 @@ impl Engine {
                     failure,
                 })
                 .await;
+
+            let newly_skipped = walker.complete(&node_id, node_ok);
 
             for (skipped_id, reason) in newly_skipped {
                 skipped_nodes.push(skipped_id.clone());

@@ -1,6 +1,8 @@
 //! `WebFetch` tool — HTTP GET a URL (ADR 0008). Requires `allow_network`.
 //! Domain policy is enforced by `LoopAgent` before dispatch.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -14,11 +16,16 @@ use crate::error::ToolError;
 // window on the next turn.
 const MAX_BODY_BYTES: usize = 1_048_576;
 
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WebFetchArgs {
     #[schemars(description = "URL to fetch.")]
     url: String,
+    #[schemars(description = "Per-request timeout in seconds. Defaults to 30.")]
+    #[serde(default)]
+    timeout_secs: Option<u64>,
 }
 
 /// List the top-level field names of a JSON-object argument bundle
@@ -54,13 +61,20 @@ impl ToolHandler for WebFetchHandler {
         // string`). Values are omitted to avoid echoing caller-supplied
         // payloads into the log.
         let fields = arg_field_names(&args);
-        let WebFetchArgs { url } =
+        let WebFetchArgs { url, timeout_secs } =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 name: "WebFetch".to_string(),
                 message: format!("{e} (fields: {fields})"),
             })?;
 
-        let client = reqwest::Client::new();
+        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|err| ToolError::Invocation {
+                name: "WebFetch".to_string(),
+                source: Box::new(err),
+            })?;
         let response = client
             .get(&url)
             .send()
@@ -154,6 +168,10 @@ mod tests {
             properties.contains_key("url"),
             "properties missing url: {schema}"
         );
+        assert!(
+            properties.contains_key("timeout_secs"),
+            "properties missing timeout_secs: {schema}"
+        );
 
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -164,6 +182,21 @@ mod tests {
         assert!(
             required.contains(&"url"),
             "`url` must be required: {required:?}"
+        );
+        assert!(
+            !required.contains(&"timeout_secs"),
+            "timeout_secs must be optional: {required:?}"
+        );
+    }
+
+    #[test]
+    fn default_timeout_used_when_unset() {
+        let args: WebFetchArgs = serde_json::from_value(json!({ "url": "https://example.com" }))
+            .expect("WebFetchArgs must accept a body without timeout_secs");
+        assert_eq!(args.url, "https://example.com");
+        assert!(
+            args.timeout_secs.is_none(),
+            "timeout_secs must default to None when omitted"
         );
     }
 

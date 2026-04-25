@@ -121,24 +121,6 @@ pub enum AgentError {
     #[error("agent exceeded budget: {kind:?}")]
     BudgetExceeded { kind: crate::events::BudgetKind },
 
-    /// Reserved for a future strict-termination mode. Effect denials are currently
-    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
-    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
-    #[error("tool `{tool_name}` blocked by allow_mutations=false")]
-    MutatingCallBlocked { tool_name: String },
-
-    /// Reserved for a future strict-termination mode. Effect denials are currently
-    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
-    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
-    #[error("tool `{tool_name}` blocked by allow_network=false")]
-    NetworkBlocked { tool_name: String },
-
-    /// Reserved for a future strict-termination mode. Effect denials are currently
-    /// non-terminal per ADR 0005 §3 — the denial string is fed back to the model.
-    /// TODO(orno-team, post-v0.1): wire when strict-termination policy is defined.
-    #[error("tool `{tool_name}` blocked for domain `{domain}`")]
-    DomainBlocked { tool_name: String, domain: String },
-
     /// Subagent recursion exceeded `max_subagent_depth`.
     #[error("subagent depth exceeded ({max})")]
     SubagentDepthExceeded { max: u32 },

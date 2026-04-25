@@ -256,8 +256,11 @@ fn discover_mcp_tool_definitions(llm_entries: &[TapeEntry]) -> Vec<OrnoChatTool>
 /// the longest server prefix declared in `pipeline.mcp_servers` that
 /// matches; in v0.1 every demo uses single-token server names so the
 /// ambiguity never bites in practice. Tools whose wire name does not
-/// begin with `mcp_<S>_` for any declared server `S` are silently
-/// skipped — they cannot have come from a server orno knows about.
+/// begin with `mcp_<S>_` for any declared server `S` emit a
+/// `tracing::warn!` and are skipped — they cannot have come from a
+/// server orno knows about, so the operator gets a stderr signal that
+/// a recorded tool was lost on replay (defense-in-depth for bundles
+/// recorded before the validate-side ambiguity check existed).
 fn derive_server_tools(
     mcp_tool_defs: &[OrnoChatTool],
     pipeline: &pipeline::Pipeline,
@@ -288,6 +291,14 @@ fn derive_server_tools(
             out.entry(server.to_string())
                 .or_default()
                 .push(tool.to_string());
+        } else {
+            let declared: Vec<&str> = pipeline.mcp_servers.keys().map(String::as_str).collect();
+            tracing::warn!(
+                wire_name = %wire_name,
+                declared_servers = ?declared,
+                "MCP wire-form tool name does not match any declared \
+                 server prefix; tool will not be replayable",
+            );
         }
     }
     out
@@ -421,5 +432,37 @@ mod tests {
     fn discover_mcp_tool_definitions_handles_empty_tape() {
         let defs = discover_mcp_tool_definitions(&[]);
         assert!(defs.is_empty());
+    }
+
+    #[test]
+    fn derive_server_tools_warns_on_unmatched_wire_name() {
+        use orno_core::pipeline::Pipeline;
+        use orno_core::pipeline::schema::{McpServerConfig, McpStdioConfig};
+
+        let mut servers: BTreeMap<String, McpServerConfig> = BTreeMap::new();
+        // Declare server `fs` only; the tape carries a wire name from
+        // server `gh` that does not match any declared prefix.
+        servers.insert(
+            "fs".to_string(),
+            McpServerConfig::Stdio(McpStdioConfig {
+                command: vec!["true".to_string()],
+                env: BTreeMap::new(),
+            }),
+        );
+        let pipeline = Pipeline {
+            version: 1,
+            vars: BTreeMap::new(),
+            pass_env: Vec::new(),
+            secrets: Vec::new(),
+            agents: BTreeMap::new(),
+            mcp_servers: servers,
+            nodes: vec![],
+        };
+        let defs = vec![ornochat_tool("mcp_gh_pull_request", "x")];
+        let out = derive_server_tools(&defs, &pipeline);
+        // Test passes if the call did not panic and no spurious entry
+        // was attributed to the declared `fs` server. The WARN emission
+        // is observable via `cargo test -- --nocapture`.
+        assert!(out.get("fs").is_none_or(Vec::is_empty));
     }
 }

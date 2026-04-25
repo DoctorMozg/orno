@@ -168,6 +168,12 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
 
     let sink: Arc<dyn EventSink> = Arc::new(StreamingSink::stdout());
 
+    // Mint `run_id` immediately after the sink so every lifecycle
+    // envelope (MCP init included) carries a valid correlation id, and
+    // so the CLI can emit a `RunStarted`/`RunFinished` pair on the
+    // MCP-init crash path before `Engine::run` ever runs (ADR 0007 + H2).
+    let run_id = new_run_id();
+
     let base_transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
         Ok("scripted") => {
@@ -226,10 +232,6 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // the same cap for its whole-state serialize-and-measure check so
     // an oversize write is comparable to an oversize excerpt.
     let body_excerpt_max_bytes = engine_config.max_output_bytes;
-
-    // run_id must be minted before MCP lifecycle events are emitted so
-    // they carry a valid envelope correlation id.
-    let run_id = new_run_id();
 
     // Spawn MCP servers declared in `Pipeline.mcp_servers` (ADR 0007).
     // Each server initializes once before the engine runs. `McpToolHandler`
@@ -310,6 +312,34 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
                     reason: e.to_string(),
                 })
                 .await;
+                // Drain already-initialized clients in declaration order
+                // so a mid-init crash never leaks live MCP subprocesses.
+                // Reuses the same shutdown sequence as the success path
+                // at the bottom of `run()` (ADR 0007 / H3).
+                for client in &mcp_clients {
+                    sink.record(Event::McpServerShuttingDown {
+                        run_id: run_id.clone(),
+                        server: client.server.clone(),
+                    })
+                    .await;
+                    if let Err(shutdown_err) = client.inner.lock().await.shutdown().await {
+                        tracing::warn!(
+                            server = %client.server,
+                            error = ?shutdown_err,
+                            "MCP server shutdown failed during crash recovery",
+                        );
+                    }
+                    sink.record(Event::McpServerExited {
+                        run_id: run_id.clone(),
+                        server: client.server.clone(),
+                    })
+                    .await;
+                }
+                // No nodes ran on this path, so the lifecycle aggregate
+                // vectors are empty. The CLI owns the `RunStarted` /
+                // `RunFinished { ok: false }` pair on the crash path
+                // because `Engine::run` never gets a chance to (H2).
+                emit_run_lifecycle_failure(&sink, &run_id, Vec::new(), Vec::new()).await;
                 return Err(anyhow::Error::from(e))
                     .with_context(|| format!("MCP server `{server_name}` failed to initialize"));
             },
@@ -474,6 +504,31 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Emit the `RunStarted` + `RunFinished { ok: false, .. }` pair the CLI
+/// owes when a pre-engine failure (e.g. MCP init crash) prevents
+/// `Engine::run` from ever running. Keeps the event stream well-formed
+/// for downstream consumers — every successful run still gets exactly
+/// one `RunStarted` from the engine; a pre-engine-crash run gets
+/// exactly one from the CLI (H2 / ADR 0007).
+async fn emit_run_lifecycle_failure(
+    sink: &Arc<dyn EventSink>,
+    run_id: &str,
+    failed_nodes: Vec<String>,
+    skipped_nodes: Vec<String>,
+) {
+    sink.record(Event::RunStarted {
+        run_id: run_id.to_string(),
+    })
+    .await;
+    sink.record(Event::RunFinished {
+        run_id: run_id.to_string(),
+        ok: false,
+        failed_nodes,
+        skipped_nodes,
+    })
+    .await;
 }
 
 /// Resolve `env` and `secrets` per ADR 0020 precedence.

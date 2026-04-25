@@ -43,6 +43,7 @@ pub struct PlanNode {
     pub max_tool_calls: Option<u32>,
     pub allow_mutations: Option<bool>,
     pub allow_network: Option<bool>,
+    pub allow_context_writes: Option<bool>,
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
 }
@@ -176,6 +177,7 @@ fn build_agent_plan_node(
         max_tool_calls: config.map(|c| c.policy.max_tool_calls),
         allow_mutations: config.map(|c| c.policy.allow_mutations),
         allow_network: config.map(|c| c.policy.allow_network),
+        allow_context_writes: config.map(|c| c.policy.allow_context_writes),
         allowed_domains: config
             .map(|c| c.policy.allowed_domains.clone())
             .unwrap_or_default(),
@@ -200,6 +202,7 @@ fn build_shell_plan_node(node: &crate::pipeline::Node) -> PlanNode {
         max_tool_calls: None,
         allow_mutations: None,
         allow_network: None,
+        allow_context_writes: None,
         allowed_domains: Vec::new(),
         blocked_domains: Vec::new(),
     }
@@ -295,6 +298,7 @@ mod tests {
         assert_eq!(second.depends_on, vec!["a".to_string()]);
         assert_eq!(second.max_iterations, Some(5));
         assert_eq!(second.allow_mutations, Some(false));
+        assert_eq!(second.allow_context_writes, Some(false));
 
         let PlanOutput::PlanSummary(summary) = &outputs[2] else {
             panic!("last output must be a PlanSummary");

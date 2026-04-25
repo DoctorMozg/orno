@@ -140,7 +140,9 @@ mod tests {
     use crate::agent::{Agent, AgentRequest};
     use crate::error::{AgentError, LlmError, ToolError};
     use crate::events::{BudgetKind, Event, InMemorySink, LlmFailure};
-    use crate::llm::{DummyTransport, LlmRequest, LlmResponse, dummy::ScriptedTransport};
+    use crate::llm::{
+        DummyTransport, LlmRequest, LlmResponse, OrnoChatToolCall, Usage, dummy::ScriptedTransport,
+    };
     use crate::pipeline::{AgentPolicy, OnParseError};
     use crate::tool::{ToolEffect, ToolInvocation};
     use async_trait::async_trait;
@@ -901,6 +903,36 @@ mod tests {
         }
     }
 
+    /// Dotted-name handler with `Mutations` effect — used to exercise
+    /// the policy-gate denial path on a dotted YAML name. The `deny()`
+    /// helper must surface the YAML form (`subagent.child`) on both the
+    /// `ToolDenied` event and the feed-back string, not the wire form
+    /// (`subagent_child`) the LLM saw.
+    struct DottedMutationTool;
+
+    #[async_trait]
+    impl ToolHandler for DottedMutationTool {
+        fn name(&self) -> &str {
+            "subagent.child"
+        }
+        fn description(&self) -> &str {
+            "Dotted-name mutation for denial-name translation."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::Mutations
+        }
+        async fn invoke(
+            &self,
+            _inv: ToolInvocation<'_>,
+            _args: serde_json::Value,
+        ) -> Result<String, ToolError> {
+            Ok("should not run".to_string())
+        }
+    }
+
     #[tokio::test]
     async fn subagent_depth_gate_denies_when_child_depth_exceeds_max_and_emits_event() {
         // ADR 0006: at depth N with `max_subagent_depth = 0`, any
@@ -1069,6 +1101,79 @@ mod tests {
             assert!(
                 output_excerpt.contains("dotted ok"),
                 "handler output must be the dotted echo's fixed string: {output_excerpt:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_denied_emits_yaml_name_for_dotted_subagent() {
+        // M3 regression: when a dotted YAML name (`subagent.child`) is
+        // sanitized to wire form (`subagent_child`) at the schema
+        // boundary, a policy denial must still surface the YAML form
+        // operators wrote in their pipeline. Otherwise an event reader
+        // grepping for the tool name in their YAML cannot find the
+        // matching `ToolDenied` and the feed-back string back to the
+        // model uses a name that does not appear anywhere in the
+        // operator-authored config.
+        let sink = Arc::new(InMemorySink::new());
+        let dotted = Arc::new(DottedMutationTool);
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response("c1", "subagent_child", serde_json::json!({})),
+            ScriptedTransport::text_response("acknowledging mutation denial"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![dotted],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.max_subagent_depth = 1;
+        req.policy.allow_mutations = false;
+        req.allowed_tools = vec!["subagent.child".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("mutations denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let denied = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolDenied { .. }))
+            .expect("ToolDenied must fire for a dotted-name mutations denial");
+        if let Event::ToolDenied {
+            tool_name, reason, ..
+        } = &denied.event
+        {
+            assert_eq!(
+                tool_name, "subagent.child",
+                "ToolDenied.tool_name must be the YAML form, not the wire form `subagent_child`",
+            );
+            assert!(
+                reason.contains("allow_mutations=false"),
+                "denial reason must name the gate: {reason:?}",
+            );
+        } else {
+            panic!("unexpected event type");
+        }
+
+        // The feed-back string back to the model must also use the YAML
+        // form so the model sees consistent naming with the pipeline
+        // YAML the operator wrote.
+        let recorded = events
+            .iter()
+            .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+            .expect("ToolCallRecorded must fire for a denied dotted-name call");
+        if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+            assert!(
+                output_excerpt.starts_with("denied: tool `subagent.child`"),
+                "feed-back string must use the YAML form: {output_excerpt:?}",
             );
         }
     }
@@ -1543,6 +1648,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the inline `AlwaysInvalid` ToolHandler stub plus the dual-call response literal push the body past 60 lines; both stay inline so the test's intent is readable end-to-end"
+    )]
     async fn retry_once_second_parse_error_on_same_call_id_terminates_with_parse_failed() {
         struct AlwaysInvalid;
         #[async_trait]
@@ -1574,10 +1683,28 @@ mod tests {
         let sink = Arc::new(InMemorySink::new());
         let tool = Arc::new(AlwaysInvalid);
 
-        let transport = ScriptedTransport::new(vec![
-            ScriptedTransport::tool_call_response("same", "AlwaysInvalid", serde_json::json!({})),
-            ScriptedTransport::tool_call_response("same", "AlwaysInvalid", serde_json::json!({})),
-        ]);
+        // Both tool_calls share the same call_id and ride in ONE
+        // assistant turn so the parse-retry de-dup runs within a
+        // single iteration's tool dispatch loop. Per-iteration scope
+        // (post-M2) means a fresh `retried_parse_errors` set at the
+        // start of every iteration; the second identical-call_id call
+        // within the same iteration still terminates.
+        let same_call = OrnoChatToolCall {
+            call_id: "same".into(),
+            fn_name: "AlwaysInvalid".into(),
+            fn_arguments: serde_json::json!({}),
+        };
+        let dual_call = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+            tool_calls: vec![same_call.clone(), same_call],
+        };
+        let transport = ScriptedTransport::new(vec![dual_call]);
 
         let agent = LoopAgent::new(LoopAgentConfig {
             transport: Arc::new(transport),
@@ -1664,5 +1791,120 @@ mod tests {
             AgentError::ParseFailed { tool, .. } => assert_eq!(tool, "InvalidOnce"),
             other => panic!("expected ParseFailed, got {other:?}"),
         }
+    }
+
+    /// Transport stub that records each request's `max_tokens` field
+    /// in declaration order before returning the next scripted
+    /// response. Used by the H6 regression test below to assert the
+    /// budget is decremented across iterations rather than re-sent at
+    /// its original value every turn.
+    struct RecordingScriptedTransport {
+        responses: Mutex<std::collections::VecDeque<LlmResponse>>,
+        max_tokens_seen: Mutex<Vec<Option<u32>>>,
+    }
+
+    impl RecordingScriptedTransport {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                max_tokens_seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn max_tokens_seen(&self) -> Vec<Option<u32>> {
+            self.max_tokens_seen
+                .lock()
+                .expect("RecordingScriptedTransport mutex poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmTransport for RecordingScriptedTransport {
+        async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            self.max_tokens_seen
+                .lock()
+                .expect("RecordingScriptedTransport mutex poisoned")
+                .push(req.max_tokens);
+            self.responses
+                .lock()
+                .expect("RecordingScriptedTransport mutex poisoned")
+                .pop_front()
+                .ok_or_else(|| LlmError::Rejected("no more scripted responses".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_decrements_across_iterations() {
+        // H6 regression: `max_tokens` must shrink each iteration by
+        // the previous turn's `total_tokens`. Pre-fix the value was
+        // computed once at the top of `run` and re-sent unchanged on
+        // every iteration, which let a chatty agent burn through the
+        // declared budget before the post-hoc total breach check
+        // could fire. With `max_total_tokens=1000` and a first-iter
+        // usage of 400, the second iteration must request at most
+        // `Some(600)`.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::ReadOnly, "ok"));
+
+        // First response: tool call that costs 400 tokens. Second:
+        // text answer terminating the loop. The recording transport
+        // captures `max_tokens` on both `complete` calls.
+        let first = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 200,
+                completion_tokens: 200,
+                total_tokens: 400,
+            }),
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: "c1".into(),
+                fn_name: "EchoTool".into(),
+                fn_arguments: serde_json::json!({}),
+            }],
+        };
+        let second = LlmResponse {
+            content: "done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+            }),
+            tool_calls: Vec::new(),
+        };
+        let transport = Arc::new(RecordingScriptedTransport::new(vec![first, second]));
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: transport.clone(),
+            sink,
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.max_total_tokens = 1000;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("two iterations must complete within the token budget");
+
+        let seen = transport.max_tokens_seen();
+        assert_eq!(seen.len(), 2, "transport must observe two requests");
+        assert_eq!(
+            seen[0],
+            Some(1000),
+            "first iteration must request the full budget",
+        );
+        assert_eq!(
+            seen[1],
+            Some(600),
+            "second iteration must request the remaining budget after a 400-token first turn",
+        );
     }
 }
