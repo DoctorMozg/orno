@@ -5,8 +5,7 @@
 //! Split out of `mod.rs` so the `Event` enum and its failure detail
 //! types can evolve independently. The `from_llm_error` classifier
 //! lives next to `LlmFailure` so the variant set and its mapping from
-//! `LlmError` stay wired together — originally sited here per ADR 0023
-//! and kept co-located through the module split.
+//! `LlmError` stay wired together.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,8 +39,7 @@ pub enum BudgetKind {
 /// `Event::NodeFinished` so downstream consumers see the cause without
 /// reconstructing it from stderr or `tracing` JSON. Strict-loop
 /// dimensions (`BudgetExceeded`, `IterationLimitExceeded`,
-/// `ToolDenied`, …) land here as those subsystems come online
-/// (ADR 0022).
+/// `ToolDenied`, …) land here as those subsystems come online.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -81,12 +79,12 @@ pub enum NodeFailure {
     /// `NoExecutorRegistered { node_kind }` convention above.
     BudgetExceeded { budget_kind: BudgetKind },
     /// A tool call was denied by the policy gate (`allow_mutations`,
-    /// `allow_network`, domain lists). Per ADR 0005 §3 the denial is
-    /// fed back to the model as a tool-result string; this variant is
+    /// `allow_network`, domain lists). Effect-based denials are fed
+    /// back to the model as a tool-result string; this variant is
     /// available for future strict-mode use.
     ToolDenied { tool_name: String, reason: String },
-    /// The node did not return before `Node.timeout` elapsed (ADR
-    /// 0017). `limit_secs` echoes the declared budget. The preceding
+    /// The node did not return before `Node.timeout` elapsed.
+    /// `limit_secs` echoes the declared budget. The preceding
     /// `Event::NodeTimedOut` envelope carries the measured
     /// `elapsed_ms`; this variant stays minimal so `NodeFailure`
     /// keeps its one-cause-per-variant shape.

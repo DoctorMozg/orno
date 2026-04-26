@@ -56,10 +56,10 @@ pub struct AgentNodeRequest {
     pub provider: String,
     /// Provider-side model identifier.
     pub model: String,
-    /// Strictness knobs (ADR 0005). Enforced inside the executor.
+    /// Strictness knobs. Enforced inside the executor.
     pub policy: AgentPolicy,
-    /// Tool allowlist. Empty in Phase 4; non-empty rejected with
-    /// `NodeError::UnsupportedYet` until Phase 5 lands tool handlers.
+    /// Tool allowlist. Names must match handlers registered on the
+    /// driving `LoopAgent`; an unknown name terminates the agent loop.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
 }
@@ -85,10 +85,9 @@ pub struct NodeResponse {
 #[async_trait]
 pub trait NodeExecutor: Send + Sync {
     /// Dispatch a single node. `run_id` is the ULID-prefixed run
-    /// identifier (ADR 0019) — executors that emit their own events
-    /// (`AgentExecutor` and the planned `SubagentHandler`) need it to
-    /// scope envelopes; shell and other non-emitting executors
-    /// ignore it.
+    /// identifier — executors that emit their own events
+    /// (`AgentExecutor` and `SubagentHandler`) need it to scope
+    /// envelopes; shell and other non-emitting executors ignore it.
     async fn execute(
         &self,
         run_id: &str,

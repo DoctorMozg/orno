@@ -4,7 +4,7 @@
 //! Keyed by `(provider, model, blake3(serialized request))`. A tape
 //! miss returns [`LlmError::ReplayMiss`]; `ReplayTransport` never falls
 //! through to a live call. That's what makes it usable as the
-//! determinism guarantee in ADR 0005 dimension 5.
+//! bounded-non-determinism guarantee in the strictness contract.
 
 use std::collections::HashMap;
 use std::fs::File;

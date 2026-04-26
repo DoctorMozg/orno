@@ -1,4 +1,4 @@
-//! LLM transport seam — ADR 0002 and 0003.
+//! LLM transport seam.
 //!
 //! Callers speak to `LlmTransport`, never to a concrete SDK. The
 //! production implementation (`GenAiTransport`) wraps `genai`; the
@@ -73,7 +73,7 @@ impl LlmRequest {
 }
 
 /// A single tool call issued by the model (part of an assistant turn).
-/// Orno-owned type — keeps `genai::ToolCall` off the public surface (ADR 0002).
+/// Orno-owned type — keeps `genai::ToolCall` off the public surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrnoChatToolCall {
     /// Provider-issued id that pairs this call with its later `ToolResult`.

@@ -1,4 +1,4 @@
-//! `Bash` tool — run a shell command (ADR 0008). Requires both
+//! `Bash` tool — run a shell command. Requires both
 //! `allow_mutations` and `allow_network`.
 
 use std::process::Stdio;

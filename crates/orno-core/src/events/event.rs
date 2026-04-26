@@ -30,7 +30,7 @@ pub enum Event {
         /// pipelines) can surface a cause without parsing stderr.
         /// On `ok: true` this is `None` and serialized as `null`.
         /// `#[non_exhaustive]` on `NodeFailure` lets new variants
-        /// land non-breakingly (ADR 0022).
+        /// land non-breakingly.
         failure: Option<NodeFailure>,
     },
     NodeSkipped {
@@ -53,7 +53,7 @@ pub enum Event {
     /// Emitted after each successful or denied tool call within an
     /// agent iteration. `input_excerpt` and `output_excerpt` are
     /// redacted and head-truncated at `body_excerpt_max_bytes` (same
-    /// cap as `LlmRequestStarted` excerpts, ADR 0024). On a denied
+    /// cap as `LlmRequestStarted` excerpts). On a denied
     /// call the `output_excerpt` carries the denial reason string.
     ToolCallRecorded {
         run_id: String,
@@ -65,10 +65,10 @@ pub enum Event {
     },
     /// Emitted immediately before the transport is called. Carries
     /// provider + model identifiers plus redacted head excerpts of the
-    /// rendered prompt and optional system prompt (ADR 0024). The
-    /// excerpts are passed through the per-run `Redactor` so rendered
-    /// `secrets.*` values never reach the wire (ADR 0020), and bounded
-    /// by the engine's `max_output_bytes` so a megabyte-long prompt
+    /// rendered prompt and optional system prompt. The excerpts are
+    /// passed through the per-run `Redactor` so rendered `secrets.*`
+    /// values never reach the wire, and bounded by the engine's
+    /// `max_output_bytes` so a megabyte-long prompt
     /// does not flood the event log — the same cap used for
     /// `LlmFailure::ApiError.body_excerpt` and shell stderr tails.
     /// `system_excerpt` is `None` when the agent config declared no
@@ -86,8 +86,7 @@ pub enum Event {
     /// head excerpt of the model's response so downstream tools can
     /// surface what the model actually produced without folding the
     /// unbounded `NodeResponse.output` payload. Excerpt redaction and
-    /// truncation follow the same rules as `LlmRequestStarted`
-    /// (ADR 0024).
+    /// truncation follow the same rules as `LlmRequestStarted`.
     LlmResponseReceived {
         run_id: String,
         node_id: String,
@@ -100,7 +99,7 @@ pub enum Event {
     /// dangling request without reconstructing it from a downstream
     /// `NodeFinished.failure`. Carries a typed `LlmFailure` so
     /// alerting can fire on auth or rate-limit classes specifically,
-    /// not on the generic `ExecutorError` blob (ADR 0023).
+    /// not on the generic `ExecutorError` blob.
     LlmRequestFailed {
         run_id: String,
         node_id: String,
@@ -112,7 +111,7 @@ pub enum Event {
     /// `skipped_nodes` echo the per-node events in causal order so a
     /// single tail-line read of the stream summarizes the run's
     /// failure footprint without folding the full envelope log
-    /// (ADR 0023). Both vectors are empty on a fully-green run.
+    /// log. Both vectors are empty on a fully-green run.
     RunFinished {
         run_id: String,
         ok: bool,
@@ -120,7 +119,7 @@ pub enum Event {
         skipped_nodes: Vec<String>,
     },
     /// Emitted at the start of a subagent dispatch, before the child
-    /// `LoopAgent::run` is entered (ADR 0006). `parent_node_id` is the
+    /// `LoopAgent::run` is entered. `parent_node_id` is the
     /// DAG node the caller is bound to; the child inherits it for its
     /// own event stream so a consumer filtering by `node_id` sees every
     /// turn the tree produced. `depth` is the child's depth
@@ -147,7 +146,7 @@ pub enum Event {
     /// is rendered with the full `Display` chain (`{:#}`) so downstream
     /// consumers see the cause without a follow-up query. The parent
     /// loop still feeds the failure back to its LLM as a denial-style
-    /// `ToolResult` string per ADR 0005 §3; this event records the
+    /// `ToolResult` string under the effects strictness dimension; this event records the
     /// structured observability trail for the failure itself.
     SubagentFailed {
         run_id: String,
@@ -169,7 +168,7 @@ pub enum Event {
     },
     /// Emitted when a tool call was denied by the policy gate
     /// (`allow_mutations`, `allow_network`, `allow_context_writes`,
-    /// or domain allow/block lists). Per ADR 0005 §3 the denial is
+    /// or domain allow/block lists). Effect-based denials are
     /// non-terminal — the loop feeds a denial string back to the
     /// model as the tool's `ToolResult`; this envelope records the
     /// structured observability trail for the gate firing. Paired
@@ -181,8 +180,8 @@ pub enum Event {
         tool_name: String,
         reason: String,
     },
-    /// Emitted when a node's wall-clock budget (`Node.timeout`, ADR
-    /// 0017) elapsed before the executor returned. Paired with the
+    /// Emitted when a node's wall-clock budget (`Node.timeout`)
+    /// elapsed before the executor returned. Paired with the
     /// matching `NodeFinished { failure: Some(NodeFailure::TimedOut)
     /// }` so downstream tools can surface the limit and the actual
     /// elapsed time. `limit_secs` echoes the declared budget;
@@ -241,8 +240,8 @@ pub enum Event {
         run_id: String,
         server: String,
     },
-    /// Emitted when the server crashed mid-run. Per ADR 0007 the owning
-    /// agent terminates with a tool-call failure.
+    /// Emitted when the server crashed mid-run. The owning agent
+    /// terminates with a tool-call failure.
     McpServerCrashed {
         run_id: String,
         server: String,

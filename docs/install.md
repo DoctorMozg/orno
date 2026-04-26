@@ -73,5 +73,5 @@ The `completions` subcommand also supports `elvish` and `powershell`.
 ## Where to go next
 
 - [What is orno](what-is-orno.md) — the runtime contract, in plain English.
-- [Pipeline YAML grammar](yaml-spec.md) — every field of every block.
+- [Pipeline YAML grammar](reference/pipeline-yaml.md) — every field of every block.
 - The per-example READMEs under [`../examples/`](../examples/README.md) — runnable shapes to copy from.

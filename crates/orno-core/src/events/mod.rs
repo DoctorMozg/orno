@@ -73,7 +73,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 /// — opposite of stderr tails where the cause sits at the end.
 ///
 /// The same head-retention semantics apply to prompt and response
-/// excerpts on `LlmRequestStarted` / `LlmResponseReceived` (ADR 0024):
+/// excerpts on `LlmRequestStarted` / `LlmResponseReceived`:
 /// a rendered prompt starts with the operator instruction, and a model
 /// response starts with the direct answer — truncating either from
 /// the back keeps the part a human would actually read first.

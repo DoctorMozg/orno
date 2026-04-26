@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "agents": {
-      "description": "Named agent configurations, referenced from `kind: agent` nodes\nby `agent: <name>` (ADR 0009).",
+      "description": "Named agent configurations, referenced from `kind: agent` nodes\nby `agent: <name>`.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/AgentConfig"
@@ -12,7 +12,7 @@
       "default": {}
     },
     "mcp_servers": {
-      "description": "MCP servers spawned at run start, torn down at run end (ADR 0007).",
+      "description": "MCP servers spawned at run start, torn down at run end.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/McpServerConfig"
@@ -26,7 +26,7 @@
       }
     },
     "pass_env": {
-      "description": "Names pulled from the process environment into the `env.*`\ntemplate namespace at run start (ADR 0020). Opt-in only — the\nprocess environment is not auto-inherited. Names not present via\n`pass_env`, `-e`, or `--env-file` are a template-render error.",
+      "description": "Names pulled from the process environment into the `env.*`\ntemplate namespace at run start. Opt-in only — the\nprocess environment is not auto-inherited. Names not present via\n`pass_env`, `-e`, or `--env-file` are a template-render error.",
       "type": "array",
       "default": [],
       "items": {
@@ -34,7 +34,7 @@
       }
     },
     "secrets": {
-      "description": "User-declared credential names, routed into the redacted\n`secrets.*` template namespace (ADR 0020). Provider-known names\n(e.g. `OPENROUTER_API_KEY`) are auto-pulled by the transport and\ndo not need to appear here; this list is for additional secrets\nsuch as MCP server tokens.",
+      "description": "User-declared credential names, routed into the redacted\n`secrets.*` template namespace. Provider-known names\n(e.g. `OPENROUTER_API_KEY`) are auto-pulled by the transport and\ndo not need to appear here; this list is for additional secrets\nsuch as MCP server tokens.",
       "type": "array",
       "default": [],
       "items": {
@@ -115,11 +115,11 @@
       ]
     },
     "AgentPolicy": {
-      "description": "Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017,\nextended by ADR 0025). Every field is required in Rust construction;\ndefaults belong in docs and examples, not silently in code.\n`allow_context_writes` gets `#[serde(default)]` so pre-ADR-0025 YAML\npipelines keep deserializing — the default `false` matches the old\nbehavior of \"no mutable context.\" Wall-clock is **not** here — ADR\n0017 promotes it to a universal node-level `timeout:` attribute\napplicable to every `NodeKind`; the attribute is not yet modeled on\n`Node` and lands with the Phase 4–5 executor work.",
+      "description": "Agent-loop strictness knobs. Every field is required in Rust\nconstruction; defaults belong in docs and examples, not silently\nin code. `allow_context_writes` gets `#[serde(default)]` so YAML\npipelines that don't opt into `SetState` keep deserializing — the\ndefault `false` matches the behavior of \"no mutable context.\"\nWall-clock is **not** here — `timeout:` is a universal node-level\nattribute applicable to every `NodeKind`.",
       "type": "object",
       "properties": {
         "allow_context_writes": {
-          "description": "Gates `ToolEffect::ContextSelf` (the `SetState` builtin, ADR\n0025). Defaults to `false` so a pipeline that never references\nthe new tool behaves identically to pre-ADR-0025 builds. When\n`false`, any `SetState` call returns a tool-result denial string\nexactly like `allow_mutations=false` denies filesystem tools.",
+          "description": "Gates `ToolEffect::ContextSelf` (the `SetState` builtin).\nDefaults to `false` so a pipeline that never references the\ntool sees no shape change. When `false`, any `SetState` call\nreturns a tool-result denial string exactly like\n`allow_mutations=false` denies filesystem tools.",
           "type": "boolean",
           "default": false
         },
@@ -260,7 +260,7 @@
       ]
     },
     "McpServerConfig": {
-      "description": "MCP server declaration. Two transports in v0.1: stdio subprocess and\nHTTP. See ADR 0007.",
+      "description": "MCP server declaration. Two transports in v0.1: stdio subprocess and\nHTTP.",
       "oneOf": [
         {
           "type": "object",
@@ -313,7 +313,7 @@
       ]
     },
     "Node": {
-      "description": "Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell` —\nper ADR 0017 §1. The former `Llm` variant was collapsed into `Agent`\n(ADR 0009); the former `External` variant was removed entirely and\nwill return as a `transport:` axis on existing kinds post-v0.1\n(ADR 0017 §3).",
+      "description": "Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell`.\nHTTP, parsing, and assertions happen inside agent tooling rather\nthan as sibling kinds.",
       "type": "object",
       "properties": {
         "id": {
@@ -327,7 +327,7 @@
           }
         },
         "timeout": {
-          "description": "Per-node wall-clock budget in seconds (ADR 0017 §2). When elapsed\nbefore the executor returns, `Engine::dispatch_node` cancels via\n`tokio::time::timeout`, emits `Event::NodeTimedOut`, and records\n`NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means\nno wall-clock budget on this node.",
+          "description": "Per-node wall-clock budget in seconds. When elapsed\nbefore the executor returns, `Engine::dispatch_node` cancels via\n`tokio::time::timeout`, emits `Event::NodeTimedOut`, and records\n`NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means\nno wall-clock budget on this node.",
           "type": [
             "integer",
             "null"

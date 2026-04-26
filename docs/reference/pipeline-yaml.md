@@ -316,7 +316,7 @@ Blocking behavior:
 - Every `mcp.<server>.<tool>` and `mcp.<server>.*` references a key in `mcp_servers:`.
 - The DAG declared by `nodes[*].needs:` has no cycles, no self-loops, and no edges to undefined nodes.
 - Child-agent policies are no more permissive than their parents' on `allow_mutations` and `allow_network`.
-- Templates render against a synthetic context (catches obvious typos like `{{ vars.poject }}`).
+- Templates render against a synthetic context (catches obvious typos in `{{ vars.* }}` references).
 
 A failure surfaces as `PipelineError` and exits non-zero with a description on stderr. No events are emitted.
 

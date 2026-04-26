@@ -1,24 +1,24 @@
-//! `LoopAgent` — Phase 5 iteration-loop implementation of [`Agent`].
+//! `LoopAgent` — iteration-loop implementation of [`Agent`].
 //!
-//! Enforces the five strictness dimensions of ADR 0005 in one loop:
-//! bounded iteration (`max_iterations`), bounded tool surface
-//! (`allowed_tools` + registered handlers), bounded effects
-//! (`allow_mutations` / `allow_network` — denials feed back to the
-//! model as tool-result strings per §3, the loop continues), bounded
-//! resources (`max_total_tokens`, `max_tool_calls`), and bounded
-//! non-determinism (delegated to the transport / recording layer).
+//! Enforces the five strictness dimensions in one loop: bounded
+//! iteration (`max_iterations`), bounded tool surface (`allowed_tools`
+//! plus registered handlers), bounded effects (`allow_mutations` and
+//! `allow_network` — denials feed back to the model as tool-result
+//! strings, the loop continues), bounded resources (`max_total_tokens`,
+//! `max_tool_calls`), and bounded non-determinism (delegated to the
+//! transport / recording layer).
 //!
 //! On transport failure the impl emits a typed `LlmRequestFailed` next
 //! to the dangling `LlmRequestStarted` so downstream consumers can
 //! classify auth / rate-limit / model-not-found without grepping error
 //! strings.
 //!
-//! **Subagent dispatch (ADR 0006).** Entries in `allowed_tools` named
+//! **Subagent dispatch.** Entries in `allowed_tools` named
 //! `subagent.<child>` correspond to [`SubagentHandler`] instances that
 //! hold a `Weak<LoopAgent>` back-pointer into this same loop. Depth is
 //! enforced here (not in the handler) so the policy gate runs before
 //! any child loop entry, and the denial feeds back as a
-//! tool-result string per §3. Wire names are sanitized at the
+//! tool-result string. Wire names are sanitized at the
 //! `OrnoChatTool` boundary — the YAML uses dotted names but some
 //! providers reject dots in `function.name`, so we translate
 //! `subagent.<child>` → `subagent_<child>` before the schema reaches
@@ -59,7 +59,7 @@ pub struct LoopAgentConfig {
     pub transport: Arc<dyn LlmTransport>,
     pub sink: Arc<dyn EventSink>,
     /// Redacts `secrets.*` values out of prompt, response, and tool
-    /// excerpts before they reach the wire (ADR 0020 / 0024).
+    /// excerpts before they reach the wire.
     pub redactor: Arc<Redactor>,
     /// Cap for body excerpts captured into `LlmFailure::ApiError` and
     /// the `prompt_excerpt` / `system_excerpt` / `content_excerpt` /
@@ -105,7 +105,7 @@ impl LoopAgent {
     /// Redact + head-truncate a user-visible string for emission into
     /// an excerpt field on an event envelope. Head truncation because
     /// prompts lead with the instruction and responses lead with the
-    /// answer (ADR 0024).
+    /// answer.
     fn excerpt_for_wire(&self, s: &str) -> String {
         truncate_excerpt(
             self.config.redactor.redact(s).as_ref(),
@@ -232,10 +232,10 @@ mod tests {
             "LlmRequestStarted must precede LlmResponseReceived",
         );
 
-        // ADR 0024: the excerpt fields must round-trip the rendered
-        // prompt and the model response, not be silently empty. A
-        // consumer pairing the two envelopes must see what went in and
-        // what came back without folding `NodeResponse.output`.
+        // The excerpt fields must round-trip the rendered prompt and
+        // the model response, not be silently empty. A consumer pairing
+        // the two envelopes must see what went in and what came back
+        // without folding `NodeResponse.output`.
         if let Event::LlmRequestStarted {
             provider,
             model,
@@ -403,10 +403,10 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_excerpt_redacts_known_secret_values() {
-        // ADR 0020 + ADR 0024: the agent shares the engine's `Redactor`
-        // so a prompt that embedded a rendered `secrets.*` value never
-        // reaches the sink in cleartext. Without this, enabling
-        // prompt excerpts would regress the secrets-namespace contract.
+        // The agent shares the engine's `Redactor` so a prompt that
+        // embedded a rendered `secrets.*` value never reaches the sink
+        // in cleartext. Without this, enabling prompt excerpts would
+        // regress the secrets-namespace contract.
         use std::collections::BTreeMap;
         let mut secret_map = BTreeMap::new();
         secret_map.insert(
@@ -556,9 +556,9 @@ mod tests {
 
     #[tokio::test]
     async fn iteration_limit_exceeded_when_model_keeps_calling_tools() {
-        // ADR 0005 §1: bounded iteration. A transport that never stops
-        // emitting tool-call turns must terminate the loop at
-        // `max_iterations`, not spin forever.
+        // Bounded iteration. A transport that never stops emitting
+        // tool-call turns must terminate the loop at `max_iterations`,
+        // not spin forever.
         let sink = Arc::new(InMemorySink::new());
         let tool = Arc::new(EchoTool::new(ToolEffect::ReadOnly, "done"));
 
@@ -592,8 +592,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_budget_exceeded() {
-        // ADR 0005 §4: bounded resources. The second tool call in a run
-        // with `max_tool_calls = 1` must terminate with the typed
+        // Bounded resources. The second tool call in a run with
+        // `max_tool_calls = 1` must terminate with the typed
         // `BudgetKind::ToolCalls` variant so downstream alerting can
         // distinguish it from a token breach.
         let sink = Arc::new(InMemorySink::new());
@@ -630,10 +630,10 @@ mod tests {
 
     #[tokio::test]
     async fn model_calling_unknown_tool_terminates_with_unknown_tool_called() {
-        // ADR 0005 §2: bounded tool surface. A tool-call turn naming a
-        // handler the agent was never given must terminate with
-        // `UnknownToolCalled` — not silently drop, not retry, not ask
-        // the model to pick again.
+        // Bounded tool surface. A tool-call turn naming a handler the
+        // agent was never given must terminate with `UnknownToolCalled`
+        // — not silently drop, not retry, not ask the model to pick
+        // again.
         let sink = Arc::new(InMemorySink::new());
         let tool = Arc::new(EchoTool::new(ToolEffect::ReadOnly, "ok"));
 
@@ -667,12 +667,11 @@ mod tests {
 
     #[tokio::test]
     async fn context_writes_denied_feeds_back_as_tool_result_and_loop_continues() {
-        // ADR 0025 §3: `ContextSelf` tools are gated by
-        // `allow_context_writes`. Like `Mutations` / `Network` denials,
-        // a refusal is non-terminal — the denial string reaches the
-        // model as a `ToolResult` and the loop continues. A SetState
-        // call with the flag off must not mutate the node-state buffer
-        // and must not terminate the loop.
+        // `ContextSelf` tools are gated by `allow_context_writes`. Like
+        // `Mutations` / `Network` denials, a refusal is non-terminal —
+        // the denial string reaches the model as a `ToolResult` and the
+        // loop continues. A SetState call with the flag off must not
+        // mutate the node-state buffer and must not terminate the loop.
         let sink = Arc::new(InMemorySink::new());
         let tool = Arc::new(EchoTool::new(ToolEffect::ContextSelf, "should not run"));
 
@@ -718,8 +717,8 @@ mod tests {
                 "denial excerpt must name the gate: {output_excerpt:?}",
             );
         }
-        // ADR 0025 §2: because no SetState write landed, the buffer stays
-        // empty and `AgentOutput.state` collapses to `None`.
+        // Because no SetState write landed, the buffer stays empty and
+        // `AgentOutput.state` collapses to `None`.
         assert!(
             out.state.is_none(),
             "no SetState call landed, state must be None: {:?}",
@@ -729,8 +728,8 @@ mod tests {
 
     #[tokio::test]
     async fn mutations_denied_feeds_back_as_tool_result_and_loop_continues() {
-        // ADR 0005 §3: bounded effects via the feed-back mechanism. A
-        // denied mutation is *not* a terminal error — the denial string
+        // Bounded effects via the feed-back mechanism. A denied
+        // mutation is *not* a terminal error — the denial string
         // reaches the next LLM turn as a `ToolResult` and the model
         // adapts. The loop only terminates on iteration limit, budget,
         // unknown tool, or a final text turn.
@@ -828,12 +827,12 @@ mod tests {
 
     #[tokio::test]
     async fn set_state_call_surfaces_in_agent_output_state() {
-        // ADR 0025 end-to-end check: a `ContextSelf` tool that writes
-        // through the per-call `state_handle` must appear in the
-        // returned `AgentOutput.state`. The flag is on, the handler is
-        // the real `SetStateHandler`, and the transport scripts one
-        // SetState call followed by a text turn so the loop exits on
-        // iteration two with the buffer populated.
+        // End-to-end check: a `ContextSelf` tool that writes through
+        // the per-call `state_handle` must appear in the returned
+        // `AgentOutput.state`. The flag is on, the handler is the real
+        // `SetStateHandler`, and the transport scripts one SetState
+        // call followed by a text turn so the loop exits on iteration
+        // two with the buffer populated.
         use crate::tool::SetStateHandler;
 
         let sink = Arc::new(InMemorySink::new());
@@ -935,10 +934,10 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_depth_gate_denies_when_child_depth_exceeds_max_and_emits_event() {
-        // ADR 0006: at depth N with `max_subagent_depth = 0`, any
-        // subagent call would run at depth 1 which is > 0, so the gate
-        // must fire. The child is never invoked; the parent receives a
-        // denial string and an observability event appears on the wire.
+        // At depth N with `max_subagent_depth = 0`, any subagent call
+        // would run at depth 1 which is > 0, so the gate must fire.
+        // The child is never invoked; the parent receives a denial
+        // string and an observability event appears on the wire.
         let sink = Arc::new(InMemorySink::new());
         let dotted = Arc::new(DottedEchoTool);
 
@@ -989,7 +988,7 @@ mod tests {
 
         // Denial reaches the model as a tool-result string, so the
         // ToolCallRecorded envelope carries it verbatim — that's the
-        // ADR 0005 §3 feed-back contract applied to the depth case.
+        // bounded-effects feed-back contract applied to the depth case.
         let recorded = events
             .iter()
             .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
@@ -1004,10 +1003,10 @@ mod tests {
 
     #[tokio::test]
     async fn token_budget_breach_still_emits_llm_response_received() {
-        // ADR 0023 pairing invariant: every `LlmRequestStarted` must be
-        // paired with `LlmResponseReceived` (or `LlmRequestFailed`) on
-        // the wire. Before the fix the token-budget check ran BEFORE
-        // the response-received emission, so a breach at the end of an
+        // Pairing invariant: every `LlmRequestStarted` must be paired
+        // with `LlmResponseReceived` (or `LlmRequestFailed`) on the
+        // wire. Before the fix the token-budget check ran BEFORE the
+        // response-received emission, so a breach at the end of an
         // iteration left a dangling `LlmRequestStarted` and the
         // operator saw only "agent exceeded budget" with no record of
         // the final model turn. This regression guards the ordering.
@@ -1045,9 +1044,7 @@ mod tests {
         let received_idx = events
             .iter()
             .position(|e| matches!(e.event, Event::LlmResponseReceived { .. }))
-            .expect(
-                "LlmResponseReceived must fire even on budget breach — pairing invariant (ADR 0023)",
-            );
+            .expect("LlmResponseReceived must fire even on budget breach — pairing invariant");
         assert!(
             started_idx < received_idx,
             "LlmRequestStarted must precede LlmResponseReceived on the wire",

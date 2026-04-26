@@ -1,5 +1,5 @@
 //! `SetState` tool — write a single top-level key under
-//! `nodes.<self>.state.*` (ADR 0025). Effect class
+//! `nodes.<self>.state.*`. Effect class
 //! [`ToolEffect::ContextSelf`]; gate in [`LoopAgent`](crate::agent::LoopAgent)
 //! pre-clears the call against `allow_context_writes`.
 //!
@@ -40,7 +40,7 @@ struct SetStateArgs {
 /// Handler for the `SetState` builtin. Holds the per-run redactor and
 /// the size cap so `invoke` has everything it needs without reaching
 /// for globals. The cap is normally `EngineConfig.max_output_bytes`
-/// (ADR 0025 §5 — shared with excerpt caps).
+/// (shared with excerpt caps).
 #[derive(Debug, Clone)]
 pub struct SetStateHandler {
     redactor: Arc<Redactor>,
@@ -93,9 +93,9 @@ impl ToolHandler for SetStateHandler {
             })?;
         validate_key(&key)?;
 
-        // ADR 0020 / 0025 §7: redact secret leaves before storage so
-        // downstream template renders never re-materialize a secret
-        // that happened to be in the written payload.
+        // Redact secret leaves before storage so downstream template
+        // renders never re-materialize a secret that happened to be in
+        // the written payload.
         let redacted = self.redactor.redact_json(&value);
 
         let handle = inv.state_handle.ok_or_else(|| ToolError::Invocation {
@@ -152,8 +152,8 @@ impl ToolHandler for SetStateHandler {
 
         drop(guard);
 
-        // ADR 0025 §6: return the written value so the model has
-        // immediate feedback without needing a separate Read tool.
+        // Return the written value so the model has immediate feedback
+        // without needing a separate Read tool.
         let value_render =
             serde_json::to_string(&redacted).unwrap_or_else(|_| "<unrenderable>".to_string());
         debug!(

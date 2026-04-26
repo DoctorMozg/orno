@@ -42,7 +42,7 @@ fn validates_example_pipeline() {
 
 #[test]
 fn validates_scoped_state_example() {
-    // ADR 0025: the scoped-state example exercises `SetState` +
+    // The scoped-state example exercises `SetState` +
     // `allow_context_writes: true` + a downstream shell node that
     // templates `nodes.<id>.state.<key>`. Validation is enough here —
     // the happy-path runtime behavior is covered by unit tests in
@@ -555,7 +555,7 @@ fn plan_shows_allow_context_writes() {
 
 #[test]
 fn validate_effect_gate_mismatch_exits_nonzero() {
-    // `SetState` carries `ToolEffect::ContextSelf` (ADR 0025) — listing
+    // `SetState` carries `ToolEffect::ContextSelf` — listing
     // it without `allow_context_writes:true` is a silent runtime denial.
     // Validation promotes that into an explicit failure so the agent
     // never ships with a dead allowlist entry.
@@ -675,7 +675,7 @@ fn mcp_init_crash_emits_run_started_and_run_finished() {
     // `Engine::run` never reaches the DAG. Verifies the crash path
     // emits both `run_started` and `run_finished{ok:false}` around the
     // `mcp_server_crashed` envelope so a stream consumer sees a
-    // well-bracketed run even when nothing executed (ADR 0007 / H2).
+    // well-bracketed run even when nothing executed.
     let yaml = r#"
 version: 1
 mcp_servers:

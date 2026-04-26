@@ -2,7 +2,7 @@
 //!
 //! `Engine::run` owns a `DagWalker` over the pipeline and a `Context`
 //! seeded with `vars:` from the pipeline plus `env` and `secrets`
-//! resolved by the caller (ADR 0020). It dispatches each ready node
+//! resolved by the caller. It dispatches each ready node
 //! through a registered `NodeExecutor`. Shell outputs are captured
 //! into `Context` for downstream template rendering. Node failures
 //! cascade through `DagWalker::complete` which returns the newly-
@@ -31,8 +31,8 @@ use crate::pipeline::template::TemplateEngine;
 
 use dispatch::DispatchOutcome;
 
-/// Inputs resolved from CLI flags + `.env` files before a run begins
-/// (ADR 0020). The engine trusts these as the final values for the
+/// Inputs resolved from CLI flags + `.env` files before a run begins.
+/// The engine trusts these as the final values for the
 /// `env.*` and `secrets.*` template namespaces; resolution
 /// (precedence, dotenv parsing, classification) happens in the CLI
 /// before `Engine::run` is called.
@@ -75,8 +75,8 @@ impl Default for EngineConfig {
 
 /// Walker-driven DAG runner. Dispatches ready nodes through the
 /// registered [`NodeExecutor`]s and emits lifecycle events via the
-/// [`EventSink`]. Parallelism is deferred (ADR 0021); a single
-/// `Engine` dispatches serially in YAML source order among ties.
+/// [`EventSink`]. Dispatch is sequential; a single `Engine` runs
+/// nodes serially in YAML source order among ties.
 pub struct Engine {
     // Fields are `pub(super)` so `dispatch.rs` (a submodule of
     // `scheduler`) can read them from its `impl Engine` block without
@@ -114,7 +114,7 @@ impl Engine {
     /// graph, walker construction error).
     #[expect(
         clippy::too_many_lines,
-        reason = "dispatch loop; complexity justified by ADR 0021 event sequencing"
+        reason = "dispatch loop; complexity justified by event sequencing"
     )]
     #[instrument(skip(self, pipeline, inputs), fields(pipeline.run_id = %run_id))]
     pub async fn run(
@@ -131,7 +131,7 @@ impl Engine {
         // Build the redactor from the run's `secrets.*` namespace before
         // `Context::new` consumes `inputs.secrets`. Every user-visible
         // string that reaches the event stream flows through this
-        // instance (ADR 0020).
+        // instance.
         let redactor = crate::events::Redactor::new(&inputs.secrets);
 
         self.sink
@@ -152,7 +152,7 @@ impl Engine {
         })?;
         let mut context = Context::new(pipeline.vars.clone(), inputs.env, inputs.secrets);
         let mut run_ok = true;
-        // `RunFinished` aggregates (ADR 0023). Both vectors capture
+        // `RunFinished` aggregates. Both vectors capture
         // node ids in causal order — the same order the per-node
         // events fire — so a downstream tool that reads only the
         // `RunFinished` envelope sees the failure footprint without

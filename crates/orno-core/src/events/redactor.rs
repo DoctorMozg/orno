@@ -1,8 +1,7 @@
 //! Secret-value redactor for event emission. Rendered `secrets.*`
-//! values (ADR 0020) must not reach the event log; the scheduler
-//! constructs a `Redactor` from the run's secret map and runs every
-//! user-visible string through it before handing the envelope to a
-//! sink.
+//! values must not reach the event log; the scheduler constructs a
+//! `Redactor` from the run's secret map and runs every user-visible
+//! string through it before handing the envelope to a sink.
 //!
 //! The redactor is value-based (not key-based): we substitute raw
 //! secret strings inside prompts, node outputs, and other payloads,

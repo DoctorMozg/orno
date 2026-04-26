@@ -1,6 +1,6 @@
 //! Tool-result tape: record every `invoke` response to NDJSON, replay
-//! bit-for-bit on a second run. Implements the non-determinism
-//! dimension of ADR 0005 §5 for the tool layer.
+//! bit-for-bit on a second run. Implements the bounded-non-determinism
+//! dimension of the strictness contract for the tool layer.
 //!
 //! Tape format: one JSON object per line —
 //! `{ "key": "<hex>", "content": "...", "error": null }` on success,
@@ -124,9 +124,9 @@ impl ToolHandler for RecordingToolHandler {
             .unwrap_or_else(|e| format!("{{\"serialize_err\":\"{e}\"}}"));
         {
             let mut guard = self.tape.lock().expect("tape mutex poisoned");
-            // ADR 0005 §5: record/replay is a strictness dimension, so a
-            // tape-write failure aborts the call rather than silently
-            // dropping the entry — replay would otherwise diverge.
+            // Record/replay is a strictness dimension, so a tape-write
+            // failure aborts the call rather than silently dropping the
+            // entry — replay would otherwise diverge.
             if let Err(e) = writeln!(*guard, "{line}") {
                 tracing::warn!(
                     error = %e,

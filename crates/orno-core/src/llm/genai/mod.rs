@@ -1,16 +1,16 @@
 //! Production `LlmTransport` implementation wrapping the `genai` crate.
 //!
-//! ADR 0002 keeps `genai` types behind this trait — every `genai::*` import
+//! `genai` types are kept behind this trait — every `genai::*` import
 //! lives in this submodule tree, `Client::default()` / `Client::builder()`
 //! stay internal, and the public surface returns only `LlmResponse` /
 //! `LlmError`. Adding a provider means adding a match arm to
 //! [`convert::build_client`]; the caller sees no churn.
 //!
-//! Provider routing honors `AgentConfig.provider` (ADR 0002 amendment,
-//! Phase 4 plan). Each provider key is pinned to a specific
-//! `AdapterKind` via a `ServiceTargetResolver`, so `model: "gpt-5"` with
-//! `provider: anthropic` fails fast at the API rather than silently
-//! routing to `OpenAI` because the model prefix matched.
+//! Provider routing honors `AgentConfig.provider`. Each provider key is
+//! pinned to a specific `AdapterKind` via a `ServiceTargetResolver`, so
+//! `model: "gpt-5"` with `provider: anthropic` fails fast at the API
+//! rather than silently routing to `OpenAI` because the model prefix
+//! matched.
 //!
 //! The file split keeps `mod.rs` focused on the transport struct and
 //! trait impl. Provider client construction, message/tool conversion,
@@ -46,19 +46,17 @@ impl GenAiTransport {
     /// `agents`. One `genai::Client` per distinct provider. Returns a
     /// `ConfigError` for any provider name not in `KNOWN_PROVIDERS`.
     ///
-    /// `secrets` is the resolved `secrets.*` namespace from ADR 0020 —
-    /// values present here (typically from `--secrets-file`) are handed
-    /// to genai as literal auth data, taking precedence over the
-    /// provider's conventional env-var lookup. When a provider's
-    /// secret is absent from the map, the client falls back to
-    /// `AuthData::from_env(...)` so CI runners and replay tapes that
-    /// export keys in the shell keep working unchanged.
+    /// `secrets` is the resolved `secrets.*` namespace — values present
+    /// here (typically from `--secrets-file`) are handed to genai as
+    /// literal auth data, taking precedence over the provider's
+    /// conventional env-var lookup. When a provider's secret is absent
+    /// from the map, the client falls back to `AuthData::from_env(...)`
+    /// so CI runners and replay tapes that export keys in the shell
+    /// keep working unchanged.
     ///
     /// API-key presence is NOT checked here — genai itself fails with
     /// `RequiresApiKey` when the transport is invoked without either
-    /// a literal secret or an env var. Failing at run start rather
-    /// than dispatch time is a Phase 7 improvement (`orno plan` will
-    /// surface it).
+    /// a literal secret or an env var.
     #[must_use = "transport must be stored and threaded into the engine; dropping it discards per-provider client setup"]
     pub fn from_agents(
         agents: &BTreeMap<String, AgentConfig>,

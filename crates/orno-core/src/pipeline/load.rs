@@ -116,7 +116,7 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
     //   the server has handshaked and advertised its real tool list.
     // – `subagent.<child>` must name an agent declared in `Pipeline.agents`;
     //   compose-down requires the child's effect policy to be no more
-    //   permissive than the parent's (ADR 0006 §compose-down).
+    //   permissive than the parent's (compose-down rule).
     for (agent_name, agent_config) in &pipeline.agents {
         for tool in &agent_config.allowed_tools {
             if let Some(rest) = tool.strip_prefix("mcp.") {

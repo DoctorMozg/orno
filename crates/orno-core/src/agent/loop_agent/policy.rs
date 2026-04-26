@@ -1,10 +1,9 @@
 //! Policy gate and parse-error retry for [`LoopAgent`].
 //!
 //! Split out of `run.rs` so the effect-based denial logic and the
-//! parse-error retry wrapper stay readable. Per ADR 0005 §3 these
-//! denials are *non-terminal* — the denial string is fed back to the
-//! model as a `ToolResult`, and the enclosing loop in `run.rs`
-//! continues.
+//! parse-error retry wrapper stay readable. Effect-based denials are
+//! *non-terminal* — the denial string is fed back to the model as a
+//! `ToolResult`, and the enclosing loop in `run.rs` continues.
 //!
 //! Visibility: the single entry point `invoke_with_parse_retry` is
 //! `pub(super)` because `run.rs` (a sibling) calls it; the helpers
@@ -55,16 +54,16 @@ impl LoopAgent {
         format!("denied: tool `{yaml_name}` blocked by {reason}")
     }
 
-    /// Apply the effect-based policy gate and invoke the handler. Per
-    /// ADR 0005 §3 a policy denial is *not* a terminal error — it is
-    /// fed back to the model as a `ToolResult` denial string so the
-    /// model can adapt. A handler error still terminates the loop via
-    /// [`AgentError::Tool`]. `wire_to_yaml` is the per-`run()` reverse
-    /// map used by `deny` to surface the YAML-form name on every
-    /// denial event and feed-back string.
+    /// Apply the effect-based policy gate and invoke the handler. A
+    /// policy denial is *not* a terminal error — it is fed back to the
+    /// model as a `ToolResult` denial string so the model can adapt. A
+    /// handler error still terminates the loop via [`AgentError::Tool`].
+    /// `wire_to_yaml` is the per-`run()` reverse map used by `deny` to
+    /// surface the YAML-form name on every denial event and feed-back
+    /// string.
     #[expect(
         clippy::too_many_lines,
-        reason = "policy gate enumerates every ToolEffect variant inline per ADR 0005 §3"
+        reason = "policy gate enumerates every ToolEffect variant inline"
     )]
     #[expect(
         clippy::too_many_arguments,

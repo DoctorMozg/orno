@@ -2,8 +2,9 @@
 //! enums over bool-ish strings (the Norway problem).
 //!
 //! Shape targets the v0.1.0 YAML documented in `docs/yaml-spec.md`. Two
-//! node kinds live here — `agent` and `shell` — per ADR 0009 (collapse
-//! `llm` into `agent`) and ADR 0017 (remove `external` entirely).
+//! node kinds live here — `agent` and `shell`. The agent kind covers
+//! pure LLM calls and tool-using loops alike; HTTP, parsing, and
+//! assertions happen inside agent tooling rather than as sibling kinds.
 
 use std::collections::BTreeMap;
 
@@ -19,23 +20,23 @@ pub struct Pipeline {
     #[serde(default)]
     pub vars: BTreeMap<String, serde_json::Value>,
     /// Names pulled from the process environment into the `env.*`
-    /// template namespace at run start (ADR 0020). Opt-in only — the
+    /// template namespace at run start. Opt-in only — the
     /// process environment is not auto-inherited. Names not present via
     /// `pass_env`, `-e`, or `--env-file` are a template-render error.
     #[serde(default)]
     pub pass_env: Vec<String>,
     /// User-declared credential names, routed into the redacted
-    /// `secrets.*` template namespace (ADR 0020). Provider-known names
+    /// `secrets.*` template namespace. Provider-known names
     /// (e.g. `OPENROUTER_API_KEY`) are auto-pulled by the transport and
     /// do not need to appear here; this list is for additional secrets
     /// such as MCP server tokens.
     #[serde(default)]
     pub secrets: Vec<String>,
     /// Named agent configurations, referenced from `kind: agent` nodes
-    /// by `agent: <name>` (ADR 0009).
+    /// by `agent: <name>`.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentConfig>,
-    /// MCP servers spawned at run start, torn down at run end (ADR 0007).
+    /// MCP servers spawned at run start, torn down at run end.
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub nodes: Vec<Node>,
@@ -52,7 +53,7 @@ pub struct Node {
     pub kind: NodeKind,
     #[serde(default)]
     pub needs: Vec<String>,
-    /// Per-node wall-clock budget in seconds (ADR 0017 §2). When elapsed
+    /// Per-node wall-clock budget in seconds. When elapsed
     /// before the executor returns, `Engine::dispatch_node` cancels via
     /// `tokio::time::timeout`, emits `Event::NodeTimedOut`, and records
     /// `NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means
@@ -61,11 +62,9 @@ pub struct Node {
     pub timeout: Option<u64>,
 }
 
-/// Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell` —
-/// per ADR 0017 §1. The former `Llm` variant was collapsed into `Agent`
-/// (ADR 0009); the former `External` variant was removed entirely and
-/// will return as a `transport:` axis on existing kinds post-v0.1
-/// (ADR 0017 §3).
+/// Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell`.
+/// HTTP, parsing, and assertions happen inside agent tooling rather
+/// than as sibling kinds.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -123,15 +122,13 @@ pub struct AgentConfig {
     pub policy: AgentPolicy,
 }
 
-/// Agent-loop strictness knobs (ADR 0005, narrowed by ADR 0017,
-/// extended by ADR 0025). Every field is required in Rust construction;
-/// defaults belong in docs and examples, not silently in code.
-/// `allow_context_writes` gets `#[serde(default)]` so pre-ADR-0025 YAML
-/// pipelines keep deserializing — the default `false` matches the old
-/// behavior of "no mutable context." Wall-clock is **not** here — ADR
-/// 0017 promotes it to a universal node-level `timeout:` attribute
-/// applicable to every `NodeKind`; the attribute is not yet modeled on
-/// `Node` and lands with the Phase 4–5 executor work.
+/// Agent-loop strictness knobs. Every field is required in Rust
+/// construction; defaults belong in docs and examples, not silently
+/// in code. `allow_context_writes` gets `#[serde(default)]` so YAML
+/// pipelines that don't opt into `SetState` keep deserializing — the
+/// default `false` matches the behavior of "no mutable context."
+/// Wall-clock is **not** here — `timeout:` is a universal node-level
+/// attribute applicable to every `NodeKind`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentPolicy {
     pub max_iterations: u32,
@@ -140,11 +137,11 @@ pub struct AgentPolicy {
     pub max_subagent_depth: u32,
     pub allow_mutations: bool,
     pub allow_network: bool,
-    /// Gates `ToolEffect::ContextSelf` (the `SetState` builtin, ADR
-    /// 0025). Defaults to `false` so a pipeline that never references
-    /// the new tool behaves identically to pre-ADR-0025 builds. When
-    /// `false`, any `SetState` call returns a tool-result denial string
-    /// exactly like `allow_mutations=false` denies filesystem tools.
+    /// Gates `ToolEffect::ContextSelf` (the `SetState` builtin).
+    /// Defaults to `false` so a pipeline that never references the
+    /// tool sees no shape change. When `false`, any `SetState` call
+    /// returns a tool-result denial string exactly like
+    /// `allow_mutations=false` denies filesystem tools.
     #[serde(default)]
     pub allow_context_writes: bool,
     #[serde(default)]
@@ -168,7 +165,7 @@ pub enum OnParseError {
 }
 
 /// MCP server declaration. Two transports in v0.1: stdio subprocess and
-/// HTTP. See ADR 0007.
+/// HTTP.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 #[non_exhaustive]

@@ -10,7 +10,7 @@ orno runs LLM agents under a runtime-enforced contract: bounded iteration, bound
 
 Static analysis of a pipeline. No LLM calls, no tool execution, no network. Emits one `plan_node` line per node followed by a single `plan_summary` line as NDJSON on stdout. Exit code is `0` iff the pipeline loads, validates, and is spendable.
 
-```
+```console
 $ orno plan examples/hello/pipeline.yaml
 {"type":"plan_node","node_id":"greet","kind":"agent","depends_on":[],"timeout_secs":null,"agent_name":"greeter","model":"openai/gpt-5","provider":"openrouter","tools":[],"max_iterations":1,"max_total_tokens":1000,"max_tool_calls":0,"allow_mutations":false,"allow_network":false,"allowed_domains":[],"blocked_domains":[]}
 {"type":"plan_summary","total_nodes":1,"agent_nodes":1,"shell_nodes":0,"agents_used":["greeter"],"max_iterations_total":1,"max_tokens_total":1000,"max_tool_calls_total":0,"mcp_servers":[],"dag_is_valid":true}
@@ -24,13 +24,13 @@ Given a bundle file recorded by a prior run, orno re-executes the pipeline from 
 
 Record a bundle:
 
-```
+```bash
 orno run examples/hello/pipeline.yaml --record-bundle run.ndjson
 ```
 
 Replay it:
 
-```
+```bash
 orno replay run.ndjson
 ```
 
@@ -56,7 +56,7 @@ Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly
 
 Build from source against the workspace's pinned toolchain (MSRV 1.95):
 
-```
+```bash
 git clone https://github.com/<owner>/orno.git
 cd orno
 cargo build --release -p orno-cli
@@ -67,14 +67,14 @@ cargo build --release -p orno-cli
 
 `examples/hello/pipeline.yaml` calls a real LLM via OpenRouter. To run it without an API key, set the dummy transport — it returns a deterministic canned response:
 
-```
+```bash
 ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- plan examples/hello/pipeline.yaml
 ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
 For a real run:
 
-```
+```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
 cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
@@ -116,18 +116,17 @@ A pipeline declares `vars`, named `agents`, optional `mcp_servers`, and a list o
 - `kind: agent` — runs the strict loop against a named agent. Final assistant message is readable from downstream nodes as `nodes.<id>.output`.
 - `kind: shell` — deterministic subprocess. Output is split into `nodes.<id>.stdout`, `.stderr`, and `.exit_code`. Not subject to agent policy.
 
-Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipeline inputs), and `secrets.*` (redacted credentials). See [`docs/yaml-spec.md`](docs/yaml-spec.md) for the full grammar, and the per-example folders under `examples/` for functionality-heavy samples.
+Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipeline inputs), and `secrets.*` (redacted credentials). See [`docs/reference/pipeline-yaml.md`](docs/reference/pipeline-yaml.md) for the full grammar, and the per-example folders under `examples/` for functionality-heavy samples.
 
 ## Commands
 
-| Command                          | Description                                                                                       | Key flags                                                                                                                                                                |
-| -------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `orno run <pipeline.yaml>`       | Execute a pipeline. NDJSON events to stdout, tracing JSON to stderr.                              | `-e KEY=VAL`, `--env-file`, `--secrets-file`, `-v` / `--verbose`, `--stderr-tail-bytes`, `--record-bundle`, `--record-tape`, `--replay-tape`, `--record-tool-tape`, `--replay-tool-tape` |
-| `orno validate <pipeline.yaml>`  | Load and validate the full policy surface (tool names, agent and MCP references, budget fields). |                                                                                                                                                                          |
-| `orno plan <pipeline.yaml>`      | Static preview. Emits `plan_node` and `plan_summary` records as NDJSON. No LLM or network.       |                                                                                                                                                                          |
-| `orno replay <bundle.ndjson>`    | Replay a bundle written by `orno run --record-bundle`. No live LLM calls, no network.            |                                                                                                                                                                          |
-| `orno schema`                    | Print the pipeline JSON Schema to stdout. Used to regenerate `schemas/pipeline.schema.json`.     |                                                                                                                                                                          |
-| `orno completions <shell>`       | Emit shell completions (bash, zsh, fish, elvish, powershell).                                    |                                                                                                                                                                          |
+- **`orno run <pipeline.yaml>`** — execute a pipeline. NDJSON events to stdout, tracing JSON to stderr.
+  Key flags: `-e KEY=VAL`, `--env-file`, `--secrets-file`, `-v` / `--verbose`, `--stderr-tail-bytes`, `--record-bundle`, `--record-tape`, `--replay-tape`, `--record-tool-tape`, `--replay-tool-tape`.
+- **`orno validate <pipeline.yaml>`** — load and validate the full policy surface (tool names, agent and MCP references, budget fields).
+- **`orno plan <pipeline.yaml>`** — static preview. Emits `plan_node` and `plan_summary` records as NDJSON. No LLM or network.
+- **`orno replay <bundle.ndjson>`** — replay a bundle written by `orno run --record-bundle`. No live LLM calls, no network.
+- **`orno schema`** — print the pipeline JSON Schema to stdout. Used to regenerate `schemas/pipeline.schema.json`.
+- **`orno completions <shell>`** — emit shell completions (bash, zsh, fish, elvish, powershell).
 
 `orno run` separates streams: NDJSON event envelopes go to stdout (downstream tools), tracing JSON goes to stderr (log pipelines). Both timestamps are RFC 3339 UTC, so the two streams join on wall clock. Exit `0` on success; non-zero on pipeline load failure or any node failure.
 
@@ -137,7 +136,10 @@ Documentation lives under [`docs/`](docs/README.md):
 
 - [What is orno](docs/what-is-orno.md) — the runtime contract, in plain English.
 - [Install](docs/install.md) — building, running, and verifying a setup.
-- [Pipeline YAML grammar](docs/yaml-spec.md) — full surface, every field.
+- Tutorials: [Your first pipeline](docs/tutorials/first-pipeline.md), [Record and replay](docs/tutorials/record-replay.md), [Multi-agent PR review](docs/tutorials/multi-agent-pr-review.md).
+- How-to: [MCP servers](docs/how-to/add-mcp-server.md), [Secrets](docs/how-to/pass-secrets.md), [Scoped state](docs/how-to/scope-state-across-nodes.md), [Budget](docs/how-to/tighten-budget.md), [Debugging](docs/how-to/debug-failure.md).
+- Reference: [CLI](docs/reference/cli.md), [Pipeline YAML](docs/reference/pipeline-yaml.md), [Tools](docs/reference/tools.md), [Events](docs/reference/events.md), [Errors](docs/reference/errors.md), [Environment variables](docs/reference/env-vars.md), [Exit codes](docs/reference/exit-codes.md).
+- Explanation: [Strict agentic loops](docs/explanation/strict-agentic-loops.md), [Comparisons](docs/explanation/comparisons.md), [Security](docs/security.md).
 - [Glossary](docs/glossary.md) and [FAQ](docs/faq.md).
 
 Browsable, runnable example pipelines live in [`examples/`](examples/README.md), one folder per example.

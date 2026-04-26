@@ -1,6 +1,6 @@
-//! `McpToolHandler` — bridges the `ToolHandler` seam to a live MCP server
-//! (ADR 0007 + ADR 0008). One instance per (server, tool) pair; plugged
-//! into the executor's dispatch table at run start by `orno run`.
+//! `McpToolHandler` — bridges the `ToolHandler` seam to a live MCP server.
+//! One instance per (server, tool) pair; plugged into the executor's
+//! dispatch table at run start by `orno run`.
 //!
 //! Effect class is conservatively `MutationsAndNetwork` because MCP servers
 //! are arbitrary programs that may mutate files and issue network calls; orno
@@ -32,7 +32,7 @@ pub struct McpToolHandlerConfig {
     /// JSON Schema received from the server's `tools/list` response.
     pub schema: Value,
     /// How many bytes of input/output JSON to include in excerpt events.
-    /// Shared from the engine's `max_output_bytes` cap (ADR 0023).
+    /// Shared from the engine's `max_output_bytes` cap.
     pub body_excerpt_max_bytes: usize,
 }
 

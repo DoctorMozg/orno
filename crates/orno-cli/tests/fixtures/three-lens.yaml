@@ -16,8 +16,8 @@ agents:
       max_total_tokens: 40000
       max_tool_calls: 12
       max_subagent_depth: 1
-      # Read-only parent delegating to read-only children. Per ADR 0027
-      # the subagent tool's effect is derived from the child's policy,
+      # Read-only parent delegating to read-only children. The
+      # subagent tool's effect is derived from the child's policy,
       # so `allow_mutations=false, allow_network=false` here must not
       # block the subagent dispatch. This fixture is the regression
       # case for that behavior.

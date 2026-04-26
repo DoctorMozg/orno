@@ -1,8 +1,8 @@
 //! Template-rendering context. Threads node outputs, pipeline
-//! `vars:`, plus resolved `env.*` and `secrets.*` maps (ADR 0020)
-//! into the `MiniJinja` render call. Designed for per-branch
-//! shadowing in parallel execution; v0.1 uses one flat context
-//! and grows it as each node succeeds.
+//! `vars:`, plus resolved `env.*` and `secrets.*` maps into the
+//! `MiniJinja` render call. Designed for per-branch shadowing in
+//! parallel execution; v0.1 uses one flat context and grows it as
+//! each node succeeds.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +34,7 @@ pub struct ContextConflict {
 impl Context {
     /// Seed from the pipeline's `vars:` map plus `env` and `secrets`
     /// maps already resolved by the caller from CLI flags, `.env`
-    /// files, and `pass_env:` (ADR 0020). The process environment is
+    /// files, and `pass_env:`. The process environment is
     /// not auto-inherited; only the entries the caller places in
     /// `env` and `secrets` are visible to templates.
     #[must_use]
@@ -69,9 +69,9 @@ impl Context {
     /// for agent nodes it is `{ output, state?, finish_reason, usage }`
     /// where `output` is the final assistant message and `state` is
     /// present only when the agent made at least one `SetState` call
-    /// (ADR 0025 amending ADR 0010). The scheduler is authoritative
-    /// for calling this only on success (failed nodes are `Skipped`,
-    /// not recorded).
+    /// (`SetState` writes node-scoped state). The scheduler is
+    /// authoritative for calling this only on success (failed nodes
+    /// are `Skipped`, not recorded).
     pub fn record_node_output(&mut self, node_id: &str, output: Value) {
         self.nodes.insert(node_id.to_string(), output);
     }
@@ -79,8 +79,8 @@ impl Context {
     /// Serialize the context in the exact shape `MiniJinja` expects:
     /// `{ "vars": {...}, "nodes": {...}, "env": {...}, "secrets": {...} }`.
     /// The secrets map renders here just like any other namespace; the
-    /// redactor applied to emitted events (ADR 0020) is what keeps
-    /// values from leaking into the log stream.
+    /// redactor applied to emitted events is what keeps values from
+    /// leaking into the log stream.
     /// Call site: `TemplateEngine::render(name, source, &ctx.snapshot_for_template())`.
     #[must_use]
     pub fn snapshot_for_template(&self) -> Value {
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn new_exposes_env_as_given() {
-        // ADR 0020: env is passed in by the caller — the process
+        // env is passed in by the caller — the process
         // environment is not auto-inherited. Verify that exactly the
         // entries handed to `new` show up in the snapshot, nothing more.
         let mut env = BTreeMap::new();
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn new_does_not_inherit_process_env() {
-        // ADR 0020 regression guard: an empty env map must produce an
+        // Regression guard: an empty env map must produce an
         // empty env snapshot, independent of the current process env.
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
         let snapshot = ctx.snapshot_for_template();
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn new_exposes_secrets_as_given() {
-        // ADR 0020: the `secrets.*` namespace renders in the template
+        // The `secrets.*` namespace renders in the template
         // context like any other. The redactor on the event stream
         // (not the engine) is what keeps values out of logs.
         let mut secrets = BTreeMap::new();
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn merge_does_not_merge_env_or_secrets() {
-        // ADR 0020: env and secrets are per-branch construction-time
+        // env and secrets are per-branch construction-time
         // snapshots; `merge` only flows vars and nodes. Construct with
         // arguments that would produce a clear conflict if merge ever
         // touched them, then assert the left side is untouched.

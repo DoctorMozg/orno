@@ -3,8 +3,7 @@
 //! The main iteration loop sits here so the declarative `Agent`
 //! contract is readable end-to-end without the policy and retry
 //! helpers from `policy.rs` in the middle. Enforces the five
-//! strictness dimensions of ADR 0005 and emits the full paired
-//! event stream described in ADR 0023 / 0024.
+//! strictness dimensions and emits the full paired event stream.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -23,10 +22,10 @@ use super::{LoopAgent, SUBAGENT_PREFIX};
 
 /// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
 /// `None` when no `SetState` call landed — keeps the wire shape of
-/// `nodes.<id>` unchanged for pipelines that never opt into the feature
-/// (ADR 0025 §2). A poisoned mutex also reports `None` since the
-/// offending panic has already terminated the relevant tool call; a
-/// partial buffer would be worse than no state.
+/// `nodes.<id>` unchanged for pipelines that never opt into the feature.
+/// A poisoned mutex also reports `None` since the offending panic has
+/// already terminated the relevant tool call; a partial buffer would be
+/// worse than no state.
 fn final_state(buf: &Mutex<Value>) -> Option<Value> {
     let guard = buf.lock().ok()?;
     match &*guard {
@@ -68,10 +67,10 @@ impl Agent for LoopAgent {
             }
         }
 
-        // Per-node state buffer for the `SetState` builtin (ADR 0025).
-        // One object per `run()` call, visible only to tool dispatches
-        // inside this loop. Subagent recursion calls `run()` again and
-        // gets a fresh buffer — child state never leaks into the parent.
+        // Per-node state buffer for the `SetState` builtin. One object
+        // per `run()` call, visible only to tool dispatches inside this
+        // loop. Subagent recursion calls `run()` again and gets a fresh
+        // buffer — child state never leaks into the parent.
         let state_buffer: Mutex<Value> = Mutex::new(Value::Object(Map::new()));
         let state_handle = StateHandle::new(&state_buffer);
 
@@ -185,12 +184,12 @@ impl Agent for LoopAgent {
                 },
             };
 
-            // ADR 0023: every `LlmRequestStarted` must be paired with a
-            // terminal envelope. Emit `LlmResponseReceived` BEFORE any
-            // post-response budget check so a token-budget breach at the
-            // end of an iteration does not leave the `LlmRequestStarted`
-            // dangling on the wire. The consumer's pairing logic can
-            // then rely on the invariant unconditionally.
+            // Pairing invariant: every `LlmRequestStarted` must be
+            // paired with a terminal envelope. Emit `LlmResponseReceived`
+            // BEFORE any post-response budget check so a token-budget
+            // breach at the end of an iteration does not leave the
+            // `LlmRequestStarted` dangling on the wire. The consumer's
+            // pairing logic can then rely on the invariant unconditionally.
             let content_excerpt = self.excerpt_for_wire(&response.content);
             self.config
                 .sink
@@ -214,10 +213,10 @@ impl Agent for LoopAgent {
 
             // No tool calls → the model produced a final text answer.
             if response.tool_calls.is_empty() {
-                // ADR 0025 §2: the `state` field is `None` when the
-                // agent made no `SetState` calls. An empty buffer maps
-                // to `None` so pipelines that never use the feature see
-                // no shape change on `nodes.<id>`.
+                // The `state` field is `None` when the agent made no
+                // `SetState` calls. An empty buffer maps to `None` so
+                // pipelines that never use the feature see no shape
+                // change on `nodes.<id>`.
                 let state = final_state(&state_buffer);
                 return Ok(AgentOutput {
                     content: response.content,
@@ -248,11 +247,11 @@ impl Agent for LoopAgent {
                     .cloned()
                     .unwrap_or_else(|| tool_call.fn_name.clone());
 
-                // ADR 0006: subagent calls are routed through the
-                // recursion-depth gate before dispatch. If the gate
-                // fires, the child loop is never entered; the parent's
-                // next LLM turn carries a denial string as the tool's
-                // result so the model can adapt (ADR 0005 §3).
+                // Subagent calls are routed through the recursion-depth
+                // gate before dispatch. If the gate fires, the child
+                // loop is never entered; the parent's next LLM turn
+                // carries a denial string as the tool's result so the
+                // model can adapt.
                 let result_content = if yaml_name.starts_with(SUBAGENT_PREFIX) {
                     let child_depth = req.depth.saturating_add(1);
                     let child_agent = yaml_name
@@ -272,7 +271,7 @@ impl Agent for LoopAgent {
                             .await;
                         format!(
                             "denied: subagent `{child_agent}` would run at depth {child_depth}, \
-                             exceeding max_subagent_depth={} (ADR 0006)",
+                             exceeding max_subagent_depth={}",
                             req.policy.max_subagent_depth,
                         )
                     } else {

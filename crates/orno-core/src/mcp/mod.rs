@@ -1,14 +1,14 @@
-//! MCP client seam — ADR 0007.
+//! MCP client seam.
 //!
 //! Callers speak to [`McpClient`], never to `rmcp` directly. The concrete
 //! implementation ([`RmcpClient`]) wraps `rmcp` and maps its errors into
 //! [`McpError`]. No `rmcp` types reach orno-core's public surface.
 //!
-//! The trait surface is intentionally minimal (ADR 0007 §Decision):
-//! `initialize` collapses spawn + handshake + `tools/list`; `call_tool`
-//! handles invocation; `shutdown` terminates cleanly. Lifecycle events
-//! are emitted by the run orchestration in `orno-cli/src/commands/run.rs`,
-//! NOT inside the client — the client's job is protocol, not observability.
+//! The trait surface is intentionally minimal: `initialize` collapses
+//! spawn + handshake + `tools/list`; `call_tool` handles invocation;
+//! `shutdown` terminates cleanly. Lifecycle events are emitted by the
+//! run orchestration in `orno-cli/src/commands/run.rs`, NOT inside the
+//! client — the client's job is protocol, not observability.
 
 pub mod rmcp_client;
 
@@ -54,7 +54,7 @@ pub struct McpToolCallResult {
 ///
 /// Exactly one concrete implementation exists in v0.1: [`RmcpClient`], which
 /// wraps the `rmcp` crate. Swapping to a hand-rolled client requires touching
-/// only `rmcp_client.rs` (ADR 0007).
+/// only `rmcp_client.rs`.
 #[async_trait]
 pub trait McpClient: Send + Sync + std::fmt::Debug {
     /// Server identifier this client was constructed against. Used by

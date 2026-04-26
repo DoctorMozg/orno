@@ -84,10 +84,10 @@ pub enum NodeError {
     },
 }
 
-/// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Phase 4
-/// carries the three variants needed by the single-shot `LoopAgent`;
-/// Phase 5 will grow terminal strictness variants (`IterationLimitExceeded`,
-/// `UnknownToolCalled`, `BudgetExceeded`, `ParseFailed`) per ADR 0005.
+/// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Carries
+/// the variants enforced by the strictness contract: `PolicyInvalid`,
+/// `IterationLimitExceeded`, `UnknownToolCalled`, `BudgetExceeded`, and
+/// `ParseFailed`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AgentError {
@@ -207,7 +207,7 @@ pub enum LlmError {
 /// Errors surfaced from [`crate::mcp::McpClient`] implementations.
 /// One variant per discernible cause so downstream consumers can branch
 /// without regex-matching the chain. No `rmcp` types appear here —
-/// `RmcpClient` maps them at the trait boundary (ADR 0007).
+/// `RmcpClient` maps them at the trait boundary.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum McpError {

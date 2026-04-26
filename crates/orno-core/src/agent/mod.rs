@@ -1,7 +1,8 @@
-//! Agent-loop seam (ADR 0005). Every `kind: agent` node routes through
-//! an [`Agent`] implementation. The skeleton ships one impl,
+//! Agent-loop seam. Every `kind: agent` node routes through an
+//! [`Agent`] implementation. The skeleton ships one impl,
 //! [`LoopAgent`], which drives the bounded iteration loop with tool
-//! dispatch and full five-dimension enforcement.
+//! dispatch and full five-dimension enforcement of the strictness
+//! contract.
 //!
 //! The seam lives in its own module so `NodeExecutor` stays focused on
 //! kind dispatch. `AgentExecutor` (`crate::node::agent`) is the adapter
@@ -37,7 +38,7 @@ pub struct AgentRequest {
     pub provider: String,
     /// Provider-side model identifier.
     pub model: String,
-    /// Strictness knobs (ADR 0005). Enforced inside the agent impl.
+    /// Strictness knobs. Enforced inside the agent impl.
     pub policy: AgentPolicy,
     /// Tool allowlist. Each name must match a `ToolHandler` registered
     /// on the driving [`LoopAgent`]; an unknown name terminates with
@@ -46,8 +47,8 @@ pub struct AgentRequest {
     /// Subagent recursion depth this request executes at. The root
     /// `kind: agent` node runs at `0`; a subagent tool call entered
     /// from a depth `N` agent dispatches the child at `N + 1`. Bounded
-    /// by `policy.max_subagent_depth` (ADR 0006). Serialized with a
-    /// default so old in-memory construction sites stay source-compatible.
+    /// by `policy.max_subagent_depth`. Serialized with a default so old
+    /// in-memory construction sites stay source-compatible.
     #[serde(default)]
     pub depth: u32,
 }
@@ -74,10 +75,10 @@ pub struct AgentOutput {
     #[serde(default)]
     pub total_tokens: u64,
     /// Node-scoped state tree produced by `SetState` calls during the
-    /// loop (ADR 0025). `None` when the agent made no `SetState` calls
-    /// or the policy denied them — `AgentExecutor` elides the
-    /// `state` field from `nodes.<id>` serialization in that case so
-    /// pipelines that don't use the feature see no shape change.
+    /// loop. `None` when the agent made no `SetState` calls or the
+    /// policy denied them — `AgentExecutor` elides the `state` field
+    /// from `nodes.<id>` serialization in that case so pipelines that
+    /// don't use the feature see no shape change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<serde_json::Value>,
 }

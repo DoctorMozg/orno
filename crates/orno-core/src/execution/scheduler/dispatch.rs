@@ -97,7 +97,7 @@ impl Engine {
             Err(err) => {
                 // Redact before logging: a template error's Display chain
                 // can quote the offending expression, which may include a
-                // rendered `secrets.*` value (ADR 0020).
+                // rendered `secrets.*` value.
                 let error = redactor.redact(&format!("{err:#}")).into_owned();
                 tracing::warn!(
                     node.id = %node.id,

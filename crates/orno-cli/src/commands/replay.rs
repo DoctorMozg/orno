@@ -72,8 +72,8 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
         .context("expanding MCP tool wildcards from recorded tape")?;
 
     // Replay transport is seeded directly from the bundle entries; a
-    // tape miss surfaces as `LlmError::ReplayMiss` at call time
-    // (ADR 0005 §5).
+    // tape miss surfaces as `LlmError::ReplayMiss` at call time.
+    // No fallback to the live API — non-determinism is bounded.
     let transport: Arc<dyn LlmTransport> =
         Arc::new(ReplayTransport::from_entries(bundle.llm_entries));
 
@@ -156,8 +156,9 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
         }
     }
 
-    // ADR 0006 cyclic construction: each `SubagentHandler` keeps a
-    // `Weak<LoopAgent>` back-pointer. Same pattern as `orno run` so
+    // Cyclic construction for subagent recursion: each
+    // `SubagentHandler` keeps a `Weak<LoopAgent>` back-pointer.
+    // Same pattern as `orno run` so
     // recorded subagent dispatches replay through the same code path
     // they were captured on.
     let event_sink = sink.clone();

@@ -1,4 +1,4 @@
-//! `WebFetch` tool — HTTP GET a URL (ADR 0008). Requires `allow_network`.
+//! `WebFetch` tool — HTTP GET a URL. Requires `allow_network`.
 //! Domain policy is enforced by `LoopAgent` before dispatch.
 
 use std::time::Duration;

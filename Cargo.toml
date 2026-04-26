@@ -68,25 +68,25 @@ time = { version = "0.3", default-features = false, features = [
 # time-ordered. Default features are already minimal.
 ulid = "1"
 
-# LLM transport (ADR 0002). Pinned exactly — pre-1.0 API churn is
-# expected between betas. genai has no `[features]` table, so the
-# workspace-wide `default-features = false` discipline does not apply.
+# LLM transport. Pinned exactly — pre-1.0 API churn is expected
+# between betas. genai has no `[features]` table, so the workspace-
+# wide `default-features = false` discipline does not apply.
 genai = "=0.6.0-beta.17"
 
-# HTTP client for WebFetchHandler (ADR 0008). Pinned to the same major
+# HTTP client for WebFetchHandler. Pinned to the same major
 # that genai pulls transitively. Only `rustls` is enabled (reqwest 0.13
 # renamed `rustls-tls` to `rustls`) — no cookies, multipart, or blocking
 # pools are needed for a simple GET.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
-# MCP stack (ADR 0007). Pinned to 1.x; the 1.0 release (2026-03) stabilised
+# MCP stack. Pinned to 1.x; the 1.0 release (2026-03) stabilised
 # the API. Access goes only through McpClient (orno-core types never
 # re-export rmcp items). Features enumerated explicitly per
 # default-features = false discipline; exact names verified at build time.
 rmcp = { version = "1.5", default-features = false, features = [
     "client",
     "transport-child-process",
-    # Streamable HTTP client + reqwest backend wire ADR 0007's HTTP
+    # Streamable HTTP client + reqwest backend wire MCP's HTTP
     # transport. The `-reqwest` feature transitively enables `__reqwest`
     # and `reqwest?/rustls`, matching the workspace `reqwest` policy
     # (rustls, no native-tls); no separate `reqwest` feature is needed.

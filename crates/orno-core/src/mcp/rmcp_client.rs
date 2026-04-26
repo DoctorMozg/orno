@@ -1,4 +1,4 @@
-//! Concrete `McpClient` implementation backed by the `rmcp` crate (ADR 0007).
+//! Concrete `McpClient` implementation backed by the `rmcp` crate.
 //!
 //! No `rmcp::*` types appear in `pub` items — all rmcp interaction is hidden
 //! behind `McpClient`. Errors from rmcp are mapped into [`McpError`] variants
@@ -233,7 +233,7 @@ impl McpClient for RmcpClient {
         if let Some(svc) = service {
             // cancel() consumes the service; a JoinError means the task
             // panicked. Treat as a crash but don't propagate — shutdown
-            // is best-effort per ADR 0007.
+            // is best-effort.
             if let Err(e) = svc.cancel().await {
                 tracing::warn!(server = %self.server, error = ?e, "mcp shutdown task panicked");
             }

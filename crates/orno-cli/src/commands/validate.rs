@@ -9,7 +9,7 @@ const KNOWN_BUILTINS: &[&str] = &["Bash", "Read", "Edit", "Write", "WebFetch", "
 
 /// Builtins that perform writes outside the agent's own context (filesystem
 /// edits or shell side effects). `Bash` is included because its declared
-/// effect is `MutationsAndNetwork` (ADR 0008).
+/// effect is `MutationsAndNetwork`.
 fn builtin_requires_mutations(name: &str) -> bool {
     matches!(name, "Edit" | "Write" | "Bash")
 }
@@ -21,7 +21,7 @@ fn builtin_requires_network(name: &str) -> bool {
 }
 
 /// Builtins that write into the agent's own scoped state (`ToolEffect::ContextSelf`,
-/// gated by `AgentPolicy.allow_context_writes`, ADR 0025).
+/// gated by `AgentPolicy.allow_context_writes`).
 fn builtin_requires_context_writes(name: &str) -> bool {
     name == "SetState"
 }
@@ -110,7 +110,7 @@ fn validate_agent(
 
     // Cross-check builtin tool effects against the agent's policy.
     // Silent runtime denials become explicit validation failures —
-    // matches the ADR 0005 "everything is bounded and visible" intent.
+    // matches the strictness contract's "everything is bounded and visible" intent.
     for tool in &cfg.allowed_tools {
         if builtin_requires_mutations(tool) && !cfg.policy.allow_mutations {
             errors.push(format!(

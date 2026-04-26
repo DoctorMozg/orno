@@ -1,4 +1,4 @@
-//! Tool-handler seam (ADR 0008). Every agent-callable tool routes through
+//! Tool-handler seam. Every agent-callable tool routes through
 //! a `ToolHandler` impl. Policy gates (`allow_mutations`, `allow_network`,
 //! domain lists) run in `LoopAgent` before the handler sees the call —
 //! handlers assume they are already cleared to act.
@@ -31,9 +31,9 @@ pub use web_fetch::WebFetchHandler;
 pub use write::WriteHandler;
 
 /// Declared effect class for a tool handler. Used by `LoopAgent` to
-/// gate tool calls against `AgentPolicy` (ADR 0005 §3) and by future
-/// `orno plan` tooling for static analysis. Enforcement lives in
-/// `LoopAgent`, not in the handler itself.
+/// gate tool calls against `AgentPolicy` (bounded effects) and by
+/// `orno plan` for static analysis. Enforcement lives in `LoopAgent`,
+/// not in the handler itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolEffect {
@@ -45,11 +45,10 @@ pub enum ToolEffect {
     Network,
     /// Both mutations and network. Requires both policies.
     MutationsAndNetwork,
-    /// Mutates `nodes.<self>.state.*` via the `SetState` builtin (ADR
-    /// 0025). Requires `allow_context_writes`. Does not imply
-    /// `Mutations` — external side effects (fs/process) still require
-    /// that flag. Confined to the current node; cross-node state is
-    /// ADR 0026's territory.
+    /// Mutates `nodes.<self>.state.*` via the `SetState` builtin.
+    /// Requires `allow_context_writes`. Does not imply `Mutations` —
+    /// external side effects (fs/process) still require that flag.
+    /// Confined to the current node.
     ContextSelf,
 }
 
@@ -58,12 +57,11 @@ pub enum ToolEffect {
 /// four-parameter threshold and so additions (tracing spans, cancellation
 /// tokens, …) land without churning every handler signature.
 ///
-/// `SubagentHandler` uses `depth` to bound recursion (ADR 0006) and
-/// `run_id` / `node_id` to emit `SubagentStarted` / `SubagentCompleted`
-/// events on the shared sink. `SetStateHandler` (ADR 0025) uses
-/// `state_handle` to persist its writes without relying on global
-/// state. Builtin handlers that care about none of these typically
-/// ignore every field but `call_id`.
+/// `SubagentHandler` uses `depth` to bound recursion and `run_id` /
+/// `node_id` to emit `SubagentStarted` / `SubagentCompleted` events on
+/// the shared sink. `SetStateHandler` uses `state_handle` to persist
+/// its writes without relying on global state. Builtin handlers that
+/// care about none of these typically ignore every field but `call_id`.
 #[derive(Debug, Clone, Copy)]
 pub struct ToolInvocation<'a> {
     /// Run identifier the parent agent is executing under (`run_<ULID>`).
@@ -76,9 +74,9 @@ pub struct ToolInvocation<'a> {
     /// Subagent recursion depth of the caller. The root `kind: agent`
     /// node executes at depth `0`. A subagent call entered from a depth
     /// `N` agent dispatches the child at depth `N + 1`, bounded by
-    /// `AgentPolicy.max_subagent_depth` (ADR 0006).
+    /// `AgentPolicy.max_subagent_depth`.
     pub depth: u32,
-    /// Writable handle to the current node's `state` buffer (ADR 0025).
+    /// Writable handle to the current node's `state` buffer.
     /// `Some` only when the node's `allow_context_writes` policy is set
     /// and the handler is dispatched through `LoopAgent`. `SetState`
     /// reaches for this; every other handler leaves it alone.
@@ -101,8 +99,8 @@ pub struct StateHandle<'a> {
 
 impl<'a> StateHandle<'a> {
     /// Wrap a borrowed `Mutex<Value>` into a handle. `pub(crate)` so
-    /// only the agent crate can mint a handle; ADR 0025 confines writes
-    /// to `LoopAgent`-dispatched flows.
+    /// only the agent crate can mint a handle; writes are confined to
+    /// `LoopAgent`-dispatched flows.
     pub(crate) fn new(buf: &'a Mutex<Value>) -> Self {
         Self { buf }
     }
@@ -146,7 +144,7 @@ pub trait ToolHandler: Send + Sync {
     fn description(&self) -> &str;
 
     /// JSON Schema object describing the arguments this tool accepts.
-    /// Presented to the LLM via `OrnoChatTool.schema` (ADR 0008).
+    /// Presented to the LLM via `OrnoChatTool.schema`.
     fn schema(&self) -> Value;
 
     /// Declared effect class. Used by `LoopAgent` to gate against the

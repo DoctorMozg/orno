@@ -17,7 +17,7 @@ pub use walker::{DagWalker, NodeState};
 /// base32 characters whose first 48 bits are ms-since-epoch, so
 /// lexicographic sort is chronological sort. That matches what the
 /// record/replay infrastructure needs as a primary key without the
-/// human-hostility of raw nanosecond timestamps (ADR 0019).
+/// human-hostility of raw nanosecond timestamps.
 ///
 /// Embedders that want to pin a specific id (tests, replay drivers)
 /// skip this helper and pass their own string to `Engine::run`.

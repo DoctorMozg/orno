@@ -1,4 +1,4 @@
-//! `Write` tool — write a file (ADR 0008). Requires `allow_mutations`.
+//! `Write` tool — write a file. Requires `allow_mutations`.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;

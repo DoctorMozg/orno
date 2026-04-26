@@ -22,9 +22,9 @@ use crate::llm::{OrnoChatMessage, OrnoChatTool, Usage};
 pub(super) const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "ollama", "openrouter"];
 
 /// Pick the `AuthData` the resolver will hand genai for a given
-/// provider. CLI-resolved secrets (ADR 0020 `secrets.*` namespace)
-/// take precedence; absent keys fall back to `AuthData::from_env(...)`
-/// so shell-export and CI workflows keep working. The fallback is
+/// provider. CLI-resolved secrets (the `secrets.*` namespace) take
+/// precedence; absent keys fall back to `AuthData::from_env(...)` so
+/// shell-export and CI workflows keep working. The fallback is
 /// genai-native — an `ApiKeyEnvNotFound` error from the adapter is
 /// the signal that neither path found a credential.
 fn resolve_auth(env_name: &str, secrets: &BTreeMap<String, String>) -> AuthData {
@@ -176,8 +176,8 @@ pub(super) fn convert_usage(u: &genai::chat::Usage) -> Usage {
 }
 
 /// Translate an orno-owned message variant into the genai counterpart.
-/// Kept private so `genai::ChatMessage` never appears in a public signature
-/// (ADR 0002). `ToolCalls` collapses to a single assistant turn via
+/// Kept private so `genai::ChatMessage` never appears in a public
+/// signature. `ToolCalls` collapses to a single assistant turn via
 /// `ChatMessage::from(Vec<ToolCall>)`; `ToolResult` becomes a `Tool`-role
 /// message carrying a `ToolResponse`.
 pub(super) fn orno_msg_to_genai(msg: &OrnoChatMessage) -> ChatMessage {
@@ -231,11 +231,11 @@ mod tests {
 
     #[test]
     fn resolve_auth_prefers_cli_secret_over_env_lookup() {
-        // ADR 0020 ergonomics: a `--secrets-file` value reaches genai
-        // as a literal `AuthData::Key`, not as a deferred env lookup.
-        // Without this, the adapter's request-time `std::env::var`
-        // call would still fail even though the user handed orno the
-        // credential explicitly.
+        // Secrets-file ergonomics: a `--secrets-file` value reaches
+        // genai as a literal `AuthData::Key`, not as a deferred env
+        // lookup. Without this, the adapter's request-time
+        // `std::env::var` call would still fail even though the user
+        // handed orno the credential explicitly.
         let mut secrets = BTreeMap::new();
         secrets.insert("OPENROUTER_API_KEY".into(), "cli-resolved-value".into());
 

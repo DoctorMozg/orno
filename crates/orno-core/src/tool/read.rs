@@ -1,4 +1,4 @@
-//! `Read` tool — read a file's contents (ADR 0008). Read-only effect.
+//! `Read` tool — read a file's contents. Read-only effect.
 
 use async_trait::async_trait;
 use schemars::JsonSchema;

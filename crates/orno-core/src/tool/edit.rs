@@ -1,4 +1,4 @@
-//! `Edit` tool — replace a unique substring in a file (ADR 0008).
+//! `Edit` tool — replace a unique substring in a file.
 //! Requires `allow_mutations`.
 
 use async_trait::async_trait;

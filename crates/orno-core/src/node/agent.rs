@@ -37,7 +37,7 @@ impl AgentExecutor {
     /// set; the executor wires them into the default agent. The
     /// redactor is shared with the engine so `secrets.*` values redact
     /// consistently across agent-emitted `LlmRequestStarted` excerpts
-    /// and scheduler-emitted `NodeFailure` tails (ADR 0020 / 0024).
+    /// and scheduler-emitted `NodeFailure` tails.
     #[must_use]
     pub fn new(config: LoopAgentConfig) -> Self {
         Self::from_agent(Arc::new(LoopAgent::new(config)))
@@ -91,8 +91,7 @@ impl NodeExecutor for AgentExecutor {
             allowed_tools,
             // Root `kind: agent` nodes always enter at depth 0. A
             // subagent tool call from depth N dispatches the child at
-            // `N + 1`; see `LoopAgent::run` for the recursion gate
-            // (ADR 0006).
+            // `N + 1`; see `LoopAgent::run` for the recursion gate.
             depth: 0,
         };
 
@@ -129,12 +128,10 @@ fn agent_error_to_node(id: &str, err: AgentError) -> NodeError {
 }
 
 /// Shape `AgentOutput` into the object downstream templates see as
-/// `nodes.<id>`. ADR 0025 (amending ADR 0010) codifies `output` for the
-/// final LLM text and `state` for the `SetState`-written object; the
-/// pre-ADR skeleton used `content` which no pipeline ever referenced.
-/// `state` is only present when the agent made at least one `SetState`
-/// call so pipelines that don't opt into the feature see no shape
-/// change.
+/// `nodes.<id>`. The wire shape carries `output` for the final LLM
+/// text and `state` for the `SetState`-written object. `state` is only
+/// present when the agent made at least one `SetState` call so
+/// pipelines that don't opt into the feature see no shape change.
 fn agent_output_to_json(out: &AgentOutput) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("output".to_string(), json!(out.content));
@@ -240,10 +237,9 @@ mod tests {
             .await
             .expect("adapter must forward successful agent output");
 
-        // ADR 0025 amends ADR 0010: the wire shape is `{output, state?,
-        // finish_reason, usage}`. `state` is absent when the agent made
-        // no `SetState` calls so pipelines that don't use the feature
-        // see no shape change from the pre-ADR skeleton.
+        // The wire shape is `{output, state?, finish_reason, usage}`.
+        // `state` is absent when the agent made no `SetState` calls
+        // so pipelines that don't use the feature see no shape change.
         assert_eq!(resp.node_id, "n");
         assert_eq!(resp.output["output"], "hello");
         assert!(
@@ -259,8 +255,7 @@ mod tests {
     async fn wraps_state_when_set_state_was_called() {
         // Sibling of the baseline: when the agent wrote under `state.*`,
         // the adapter must surface that object on `NodeResponse.output`
-        // so downstream templates can read `nodes.<id>.state.key` per
-        // ADR 0025.
+        // so downstream templates can read `nodes.<id>.state.key`.
         let fake = FakeAgent::ok(AgentOutput {
             content: "hello".into(),
             finish_reason: Some("stop".into()),

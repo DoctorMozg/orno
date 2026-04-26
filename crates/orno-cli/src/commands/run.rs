@@ -5,7 +5,7 @@
 //! `TemplateEngine` into `Engine::run`, and prints every recorded
 //! envelope as NDJSON on stdout.
 //!
-//! Env and secrets resolution lives in this module (ADR 0020):
+//! Env and secrets resolution lives in this module:
 //! process env, `--env-file`, `--secrets-file`, and `-e` flags
 //! combine into the two disjoint namespaces the engine sees.
 //! Classification follows the pipeline's `secrets:` declaration,
@@ -171,7 +171,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // Mint `run_id` immediately after the sink so every lifecycle
     // envelope (MCP init included) carries a valid correlation id, and
     // so the CLI can emit a `RunStarted`/`RunFinished` pair on the
-    // MCP-init crash path before `Engine::run` ever runs (ADR 0007 + H2).
+    // MCP-init crash path before `Engine::run` ever runs.
     let run_id = new_run_id();
 
     let base_transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
@@ -193,7 +193,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     };
 
     // --replay-tape: swap the live transport for a tape reader. A tape
-    // miss is a hard error — no fallback to the live API (ADR 0005 §5).
+    // miss is a hard error — no fallback to the live API.
     // --record-tape: wrap the live transport to record (req, resp) pairs.
     // We keep an Arc<RecordingTransport> alongside so we can flush after
     // engine.run() — the trait does not expose flush().
@@ -218,7 +218,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // instance inside `Engine::run` from the same secret map — the two
     // instances carry the same value list, so redaction is consistent
     // across agent-emitted `LlmRequestStarted` excerpts and
-    // scheduler-emitted `NodeFailure` tails (ADR 0020 / 0024). Using
+    // scheduler-emitted `NodeFailure` tails. Using
     // an `Arc` avoids cloning the secret-value list per `LlmRequest`.
     let redactor = Arc::new(Redactor::new(&inputs.secrets));
 
@@ -228,12 +228,12 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // Reuse the engine's `max_output_bytes` for the LLM body excerpt
     // cap so a truncated stderr tail, a truncated HTTP error body, and
     // a truncated prompt/response excerpt all look alike to a log
-    // reader (ADR 0023 / 0024). `SetStateHandler` (ADR 0025 §5) uses
-    // the same cap for its whole-state serialize-and-measure check so
-    // an oversize write is comparable to an oversize excerpt.
+    // reader. `SetStateHandler` uses the same cap for its
+    // whole-state serialize-and-measure check so an oversize write
+    // is comparable to an oversize excerpt.
     let body_excerpt_max_bytes = engine_config.max_output_bytes;
 
-    // Spawn MCP servers declared in `Pipeline.mcp_servers` (ADR 0007).
+    // Spawn MCP servers declared in `Pipeline.mcp_servers`.
     // Each server initializes once before the engine runs. `McpToolHandler`
     // instances are built per-tool and added to the agent's tool surface.
     // On failure, `McpServerCrashed` is emitted and the run aborts.
@@ -315,7 +315,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
                 // Drain already-initialized clients in declaration order
                 // so a mid-init crash never leaks live MCP subprocesses.
                 // Reuses the same shutdown sequence as the success path
-                // at the bottom of `run()` (ADR 0007 / H3).
+                // at the bottom of `run()`.
                 for client in &mcp_clients {
                     sink.record(Event::McpServerShuttingDown {
                         run_id: run_id.clone(),
@@ -356,7 +356,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
         .context("expanding MCP tool wildcards in agent allowed_tools")?;
 
-    // Built-in tool set per ADR 0008 + ADR 0025 (SetState). `LoopAgent`
+    // Built-in tool set: Bash, Read, Edit, Write, WebFetch, SetState. `LoopAgent`
     // gates each call against the per-agent `AgentPolicy.allowed_tools`
     // list, so an agent that does not opt into a handler cannot reach
     // it — the registration here is the availability ceiling, not the
@@ -410,7 +410,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         builtin_tools = replay_tools;
     }
 
-    // ADR 0006: build the `LoopAgent` inside `Arc::new_cyclic` so each
+    // Build the `LoopAgent` inside `Arc::new_cyclic` so each
     // `SubagentHandler` can hold a `Weak<LoopAgent>` back-pointer into
     // the same agent its tool vector lives on. A plain `Arc` would
     // complete a cycle (LoopAgent → tools → SubagentHandler → LoopAgent)
@@ -485,7 +485,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         drop(std::fs::remove_file(&tool_tmp));
     }
 
-    // Shut down MCP servers in declaration order. Best-effort per ADR 0007:
+    // Shut down MCP servers in declaration order. Best-effort:
     // a failing shutdown emits a warning but does not abort a successful run.
     for client in &mcp_clients {
         sink.record(Event::McpServerShuttingDown {
@@ -511,7 +511,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
 /// `Engine::run` from ever running. Keeps the event stream well-formed
 /// for downstream consumers — every successful run still gets exactly
 /// one `RunStarted` from the engine; a pre-engine-crash run gets
-/// exactly one from the CLI (H2 / ADR 0007).
+/// exactly one from the CLI.
 async fn emit_run_lifecycle_failure(
     sink: &Arc<dyn EventSink>,
     run_id: &str,
@@ -531,7 +531,7 @@ async fn emit_run_lifecycle_failure(
     .await;
 }
 
-/// Resolve `env` and `secrets` per ADR 0020 precedence.
+/// Resolve `env` and `secrets` per the documented precedence order.
 ///
 /// - `env.*`: `pass_env:` (process env) < `--env-file` (later files
 ///   shadow earlier) < `-e KEY=VAL` (last flag wins).
@@ -579,9 +579,7 @@ fn resolve_inputs(pipeline: &Pipeline, flags: &RunFlags) -> Result<RunInputs> {
     for item in &flags.inline_env {
         let (k, v) = parse_inline_env(item)?;
         if declared_secrets.contains(k.as_str()) {
-            bail!(
-                "refusing to accept secret `{k}` via `-e`; use `--secrets-file` instead (ADR 0020)",
-            );
+            bail!("refusing to accept secret `{k}` via `-e`; use `--secrets-file` instead");
         }
         env.insert(k, v);
     }
@@ -606,10 +604,9 @@ fn parse_inline_env(s: &str) -> Result<(String, String)> {
 }
 
 /// Minimal dotenv parser: `KEY=VAL` per line, `#` comments, blank
-/// lines skipped. No quoting, no variable expansion — ADR 0020
-/// keeps the v0.1 surface intentionally narrow. Later duplicate
-/// keys within the same file win on the consumer side via
-/// `BTreeMap::insert`.
+/// lines skipped. No quoting, no variable expansion — the v0.1
+/// surface is intentionally narrow. Later duplicate keys within
+/// the same file win on the consumer side via `BTreeMap::insert`.
 fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading env file `{}`", path.display()))?;

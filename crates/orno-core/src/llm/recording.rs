@@ -1,7 +1,7 @@
 //! `RecordingTransport` — decorator that writes `(request, response)`
 //! pairs to an NDJSON tape while passing the call through to an inner
 //! transport. Pairs with [`super::ReplayTransport`] for the
-//! determinism guarantee in ADR 0005 dimension 5.
+//! bounded-non-determinism guarantee in the strictness contract.
 //!
 //! Tape format: one JSON object per line with `{ "req": …, "res": … }`.
 //! Portable DTOs only — no `genai::*` types touch the tape, so tapes

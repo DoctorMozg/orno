@@ -1,5 +1,5 @@
-//! `Subagent` tool — delegate a sub-task to a child agent loop
-//! (ADR 0006). One handler instance is registered per
+//! `Subagent` tool — delegate a sub-task to a child agent loop.
+//! One handler instance is registered per
 //! `subagent.<child-agent-name>` entry in the parent agent's
 //! `allowed_tools` list. `invoke` recursively dispatches back into the
 //! shared [`LoopAgent`] with a child [`AgentRequest`] carrying the
@@ -49,11 +49,11 @@ pub struct SubagentHandler {
     /// the child's policy.
     child_config: AgentConfig,
     /// Effect class derived once from `child_config.policy` at
-    /// construction (ADR 0027). Pipeline-load compose-down already
-    /// guarantees child.policy ≤ parent.policy on both axes, so
-    /// returning the child's declared effect — rather than a
-    /// conservative `MutationsAndNetwork` union — lets a read-only
-    /// parent legitimately delegate to a read-only child.
+    /// construction. Pipeline-load compose-down already guarantees
+    /// child.policy ≤ parent.policy on both axes, so returning the
+    /// child's declared effect — rather than a conservative
+    /// `MutationsAndNetwork` union — lets a read-only parent
+    /// legitimately delegate to a read-only child.
     declared_effect: ToolEffect,
     /// Weak back-pointer to the parent [`LoopAgent`]. Upgraded per
     /// call. Using `Weak` — rather than `Arc` — breaks the cycle that
@@ -141,10 +141,10 @@ impl ToolHandler for SubagentHandler {
         })
     }
     fn effect(&self) -> ToolEffect {
-        // ADR 0027: derived from the child agent's policy at
-        // construction. Pipeline-load compose-down already guarantees
-        // child ≤ parent, so the parent's gate never has to over-
-        // approximate with `MutationsAndNetwork`.
+        // Derived from the child agent's policy at construction.
+        // Pipeline-load compose-down already guarantees child ≤ parent,
+        // so the parent's gate never has to over-approximate with
+        // `MutationsAndNetwork`.
         self.declared_effect
     }
 
@@ -227,10 +227,10 @@ impl ToolHandler for SubagentHandler {
                         error: rendered.clone(),
                     })
                     .await;
-                // ADR 0005 §3: a subagent failure is fed back to the
-                // parent LLM as a tool-result string, not a terminal
-                // error. The parent decides whether to retry, adapt,
-                // or give up — orno does not pre-decide.
+                // Effect-based denials are non-terminal: a subagent
+                // failure is fed back to the parent LLM as a
+                // tool-result string. The parent decides whether to
+                // retry, adapt, or give up — orno does not pre-decide.
                 Ok(format!(
                     "error: subagent `{}` failed: {rendered}",
                     self.child_agent_name,
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn effect_from_policy_four_quadrants() {
-        // ADR 0027: one row per combination of the two booleans. A new
+        // One row per combination of the two booleans. A new
         // row must be added here before a new `AgentPolicy` flag can
         // widen the effect surface at the subagent boundary.
         let cases: &[(bool, bool, ToolEffect)] = &[

@@ -24,9 +24,9 @@ impl TemplateEngine {
     pub fn new() -> Self {
         let mut env = Environment::new();
         env.set_auto_escape_callback(|_| AutoEscape::None);
-        // ADR 0020: missing `env.FOO` or `secrets.FOO` references must
-        // surface as hard render errors, not silent empty strings.
-        // Strict undefined applies uniformly across every namespace.
+        // Missing `env.FOO` or `secrets.FOO` references must surface
+        // as hard render errors, not silent empty strings. Strict
+        // undefined applies uniformly across every namespace.
         env.set_undefined_behavior(UndefinedBehavior::Strict);
         Self { env }
     }

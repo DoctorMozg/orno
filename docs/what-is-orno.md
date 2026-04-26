@@ -63,6 +63,6 @@ Both timestamps are RFC 3339 UTC, so the two streams join trivially on wall cloc
 ## Where to go next
 
 - [Install](install.md) — get a working `orno` binary.
-- [Pipeline YAML grammar](yaml-spec.md) — the full surface, every field.
+- [Pipeline YAML grammar](reference/pipeline-yaml.md) — the full surface, every field.
 - [`hello`](../examples/hello/) — the smallest runnable example, and a good shape to copy from.
 - [Glossary](glossary.md) and [FAQ](faq.md) — vocabulary and common questions.
