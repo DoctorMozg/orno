@@ -1,10 +1,10 @@
-# yaml-language-server: $schema=../schemas/pipeline.schema.json
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
 # Commit-digest pipeline. Pulls a short window of recent git activity
 # out of the current working tree (no remote refs required) and asks
 # an agent to turn it into a plain-English status report, then hands
 # the digest to a second agent for three concrete next steps.
 #
-# This example exercises every Phase 5 tool handler at least once so a
+# This example exercises every builtin tool handler at least once so a
 # reader can see the full tool surface wired end-to-end:
 #
 #   Bash                        — run `git shortlog -sn` to enumerate top contributors
@@ -13,18 +13,17 @@
 #   Edit                        — stamp the last-run timestamp into the tracker file
 #   Write                       — save the final digest to disk
 #   subagent.contributor_vibes  — delegate a one-line "contributor vibe"
-#                                 to a child agent loop (ADR 0006).
-#                                 The parent's `max_subagent_depth: 1`
-#                                 budget lets the child run at depth 1
-#                                 and no deeper — a child-of-child call
-#                                 would trip the depth gate and feed
-#                                 back a denial string.
+#                                 to a child agent loop. The parent's
+#                                 `max_subagent_depth: 1` budget lets
+#                                 the child run at depth 1 and no
+#                                 deeper — a child-of-child call would
+#                                 trip the depth gate and feed back a
+#                                 denial string.
 #
 # Prereqs:
 #   - $OPENROUTER_API_KEY in the environment
 #   - `git` on PATH, invoked from a repo with at least one commit
 #   - Network access to api.github.com and raw.githubusercontent.com
-#     (domain allowlist declared but not enforced until Phase 6)
 
 version: 1
 
@@ -98,10 +97,10 @@ agents:
   contributor_vibes:
     # Subagent target for step 4. The parent calls this as
     # `subagent.contributor_vibes` — the CLI registers one handler per
-    # `agents:` entry with that naming scheme (ADR 0006). The child
-    # runs at depth 1; its own `max_subagent_depth: 0` means it cannot
-    # recurse further, so the only recursion the pipeline ever does is
-    # the parent → child jump.
+    # `agents:` entry with that naming scheme. The child runs at
+    # depth 1; its own `max_subagent_depth: 0` means it cannot recurse
+    # further, so the only recursion the pipeline ever does is the
+    # parent → child jump.
     model: anthropic/claude-haiku-4.5
     provider: openrouter
     system: |

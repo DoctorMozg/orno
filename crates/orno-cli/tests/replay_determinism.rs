@@ -1,5 +1,5 @@
-//! End-to-end tests for the record/replay tape and for `examples/pr-review.yaml`
-//! structural validation.
+//! End-to-end tests for the record/replay tape and for
+//! `examples/pr-review/pipeline.yaml` structural validation.
 //!
 //! These tests are designed to run without a live LLM API key. Agent runs use
 //! `ORNO_TEST_LLM_TRANSPORT=dummy` to get deterministic responses; replay runs
@@ -105,7 +105,7 @@ fn validate_pr_review_yaml_succeeds() {
     // may not have broader `allow_mutations`/`allow_network` than its
     // parent. Both checks are in `pipeline::load::validate()`.
     orno()
-        .args(["validate", "../../examples/pr-review.yaml"])
+        .args(["validate", "../../examples/pr-review/pipeline.yaml"])
         .assert()
         .success()
         .stdout(contains("ok: version=1 nodes=2"));
@@ -126,7 +126,7 @@ fn record_then_replay_produces_identical_event_type_sequence() {
             "run",
             "--record-tape",
             tape_path,
-            "../../examples/hello.yaml",
+            "../../examples/hello/pipeline.yaml",
         ])
         .assert()
         .success();
@@ -147,7 +147,7 @@ fn record_then_replay_produces_identical_event_type_sequence() {
             "run",
             "--replay-tape",
             tape_path,
-            "../../examples/hello.yaml",
+            "../../examples/hello/pipeline.yaml",
         ])
         .assert()
         .success();
@@ -204,7 +204,7 @@ fn replay_tape_miss_is_reported_as_node_failure() {
             "run",
             "--replay-tape",
             tape_path,
-            "../../examples/hello.yaml",
+            "../../examples/hello/pipeline.yaml",
         ])
         .assert()
         .success(); // process still exits 0

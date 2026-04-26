@@ -1,7 +1,7 @@
-# Multi-agent PR review using a parent reviewer that delegates to three
-# read-only lens subagents (security, performance, docs) and synthesizes
-# their findings. Target shape per docs/yaml-spec.md; becomes executable
-# as Phase 6 of docs/roadmap.md lands (MCP + subagents + replay).
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
+# Multi-agent PR review. A parent reviewer delegates to three read-only
+# lens subagents (security, performance, docs) and synthesizes their
+# findings into a single verdict object.
 
 version: 1
 

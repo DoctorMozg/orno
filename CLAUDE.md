@@ -187,34 +187,6 @@ Workspace lints live in root `Cargo.toml`'s `[workspace.lints.rust]` and `[works
 - **`cargo insta review`** is the accept-new-snapshots workflow. Never edit `.snap` files by hand; run the review command or delete and re-run.
 - **Supplemental tooling.** `cargo-deny` (supply-chain, `deny.toml`), `typos` (`.typos.toml`), `cargo-machete` (unused deps), and dependabot (`.github/dependabot.yml`) back the CI workflow. Run locally before pushing if the change touches dependencies.
 
-## ADRs
+## YAML spec
 
-- `docs/adr/0001-workspace-split.md` — two-crate split rationale.
-- `docs/adr/0002-llm-client-genai.md` — `genai` wrapped behind `LlmTransport`.
-- `docs/adr/0003-event-log-from-day-one.md` — original four trait seams; extended by ADRs 0005–0008.
-- `docs/adr/0004-defer-plugin-protocol.md` — no whole-node plugin loader until post-v0.1; clarified by ADRs 0008–0009.
-- `docs/adr/0005-strict-agentic-loops.md` — five strictness dimensions as user-facing guarantees.
-- `docs/adr/0006-subagent-as-tool-call.md` — recursive subagent, not peer-to-peer multi-agent.
-- `docs/adr/0007-mcp-via-rmcp.md` — MCP via `rmcp`, wrapped behind `McpClient`.
-- `docs/adr/0008-builtin-tool-set.md` — `Bash`/`Read`/`Edit`/`Write`/`WebFetch` + MCP; WebSearch deferred.
-- `docs/adr/0009-single-agent-node-kind.md` — collapse `llm` into `agent`.
-- `docs/adr/0017-node-attributes-over-new-kinds.md` — v0.1 `NodeKind` = `Agent, Shell` (no `External`); universal `retry:` / `timeout:` attributes; shell output splits to `.stdout` / `.stderr` / `.exit_code`.
-- `docs/adr/0018-event-envelope-timestamp.md` — RFC 3339 UTC `timestamp` field on `EventEnvelope`; matching stderr tracing timer so both streams join on wall clock.
-- `docs/adr/0019-run-id-ulid.md` — run identifiers are `run_<ULID>`; generator lives in `orno-core::execution::new_run_id`.
-- `docs/adr/0020-env-and-secrets-namespaces.md` — two template namespaces (`env.*` opt-in inputs, `secrets.*` redacted credentials) with distinct precedence rules; CLI adds `-e`, `--env-file`, `--secrets-file`.
-- `docs/adr/0021-dag-execution-model.md` — generator-style `DagWalker` with Kahn cycle detection; per-node `Context` with vars/env/nodes namespaces; transitive skip cascade via `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` naming the originator; Engine drives walker + `NodeRegistry` serially.
-- `docs/adr/0022-failure-surfacing.md` — every failure path emits a structured WARN on stderr; `Event::NodeFinished` grows `failure: Option<NodeFailure>` with `NoExecutorRegistered { node_kind }` / `TemplateRenderFailed { error }` / `ExecutorError { error }` / `NodePayloadFailure { exit_code, stderr_tail }`; `dispatch_node` no longer discards `resp.output` on failure; `EngineConfig { verbose, max_output_bytes }` controls WARN/wire detail; CLI grows `--verbose` and `--stderr-tail-bytes`.
-- `docs/adr/0023-llm-and-run-aggregates.md` — `Event::LlmRequestFailed { provider, model, failure: LlmFailure }` pairs every dangling `LlmRequestStarted` on transport errors with a typed classifier (`AuthFailed` / `RateLimited` / `ModelNotFound` / `ApiError { status, body_excerpt }` / `Transport` / `ConfigError` / `ParseError` / `ReplayMiss` / `Other`); `LlmFailure::ApiError.body_excerpt` shares the engine's `max_output_bytes` cap; `Event::RunFinished` grows `failed_nodes` and `skipped_nodes` `Vec<String>` aggregates in causal order so a tail-line read summarizes the run; `AgentExecutor::new` takes a third `body_excerpt_max_bytes` arg with `with_defaults` as a fallback.
-- `docs/adr/0024-llm-prompt-response-excerpts.md` — `Event::LlmRequestStarted` grows `prompt_excerpt: String` + `system_excerpt: Option<String>`; `Event::LlmResponseReceived` grows `content_excerpt: String`. All three are redacted through the per-run `Redactor` (ADR 0020) and head-truncated at the engine's `max_output_bytes` (shared cap with ADR 0023). `LoopAgent` holds an `Arc<Redactor>`; `AgentExecutor::new` arity grew to 4 `(transport, sink, redactor, body_excerpt_max_bytes)` with `with_defaults` as the source-compatible fallback; CLI `run` builds the redactor from resolved secrets before constructing the executor.
-- `docs/adr/0025-scoped-node-state-writes.md` — new builtin `SetState` tool writes single-level keys under `nodes.<self>.state.*`; `ToolEffect::ContextSelf` variant is gated by new `AgentPolicy.allow_context_writes: bool`; denied calls feed back as `denied: tool `SetState` blocked by allow_context_writes=false` strings, loop continues (ADR 0005 §3 discipline). Per-node state lives in a `std::sync::Mutex<Value>` buffer; `ToolInvocation` grows an optional `state_handle: Option<StateHandle<'a>>`. `AgentOutput` grows `state: Option<Value>`; `AgentExecutor` serializes `NodeResponse.output` as `{output, state?, finish_reason, usage}` so `nodes.<id>.state.<key>` is readable from downstream templates. Serialized-state size shares the engine's `max_output_bytes` cap; oversize writes become `ToolError::StateTooLarge { name, bytes, cap }` and roll back. `SetState` values are redacted through the per-run `Redactor` before storage and emission. Amends ADRs 0005 §3, 0008, 0010, 0020.
-
-Never revise an accepted ADR. Add an `## Amendments` section pointing to a newer ADR, or supersede with a new ADR. Historical decisions must remain readable.
-
-## Roadmap and YAML spec
-
-- `docs/roadmap.md` — phased plan for v0.1.0 strict-agentic-MVP (8–10 weeks), deferrals for v0.2.0+.
 - `docs/yaml-spec.md` — full v0.1.0 user-facing YAML shape. Examples in `examples/` conform to this shape (not to the current skeleton, which implements a subset).
-
-## Research context
-
-`docs/initial_research.md` (market landscape), `docs/implementation_toolset_research.md` (library selection), and `docs/chat.md` (agentic-loop architecture discussion) predate the ADRs. They are frozen reference documents — when their recommendations were overridden, the override is captured in an ADR (see 0002 for `genai`, 0008 for Architecture A).

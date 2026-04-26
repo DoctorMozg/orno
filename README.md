@@ -11,7 +11,7 @@ orno runs LLM agents under a runtime-enforced contract: bounded iteration, bound
 Static analysis of a pipeline. No LLM calls, no tool execution, no network. Emits one `plan_node` line per node followed by a single `plan_summary` line as NDJSON on stdout. Exit code is `0` iff the pipeline loads, validates, and is spendable.
 
 ```
-$ orno plan examples/hello.yaml
+$ orno plan examples/hello/pipeline.yaml
 {"type":"plan_node","node_id":"greet","kind":"agent","depends_on":[],"timeout_secs":null,"agent_name":"greeter","model":"openai/gpt-5","provider":"openrouter","tools":[],"max_iterations":1,"max_total_tokens":1000,"max_tool_calls":0,"allow_mutations":false,"allow_network":false,"allowed_domains":[],"blocked_domains":[]}
 {"type":"plan_summary","total_nodes":1,"agent_nodes":1,"shell_nodes":0,"agents_used":["greeter"],"max_iterations_total":1,"max_tokens_total":1000,"max_tool_calls_total":0,"mcp_servers":[],"dag_is_valid":true}
 ```
@@ -25,7 +25,7 @@ Given a bundle file recorded by a prior run, orno re-executes the pipeline from 
 Record a bundle:
 
 ```
-orno run examples/hello.yaml --record-bundle run.ndjson
+orno run examples/hello/pipeline.yaml --record-bundle run.ndjson
 ```
 
 Replay it:
@@ -48,35 +48,38 @@ Every `agent` node enforces all five at runtime. A breach terminates the node wi
 | Bounded resources        | Total tokens, total tool calls, subagent depth  | `policy.max_total_tokens`, `policy.max_tool_calls`, `policy.max_subagent_depth`                      |
 | Bounded non-determinism  | Every LLM call recorded; replay is exact        | `orno run --record-bundle` / `orno replay`                                                           |
 
-Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly to agent and shell nodes (ADR 0017).
+Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly to agent and shell nodes.
 
 ## Quickstart
 
 ### Installation
 
-```
-cargo install orno-cli
-```
+Build from source against the workspace's pinned toolchain (MSRV 1.95):
 
-(Stub — crates.io publishing happens at the v0.1.0 tag. Until then, run from source.)
+```
+git clone https://github.com/<owner>/orno.git
+cd orno
+cargo build --release -p orno-cli
+./target/release/orno --help
+```
 
 ### Run an example
 
-`examples/hello.yaml` calls a real LLM via OpenRouter. To run it without an API key, set the dummy transport — it returns a deterministic canned response:
+`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter. To run it without an API key, set the dummy transport — it returns a deterministic canned response:
 
 ```
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- plan examples/hello.yaml
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- plan examples/hello/pipeline.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
 For a real run:
 
 ```
 export OPENROUTER_API_KEY=sk-or-v1-...
-cargo run -p orno-cli -- run examples/hello.yaml
+cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
-`examples/hello.yaml` in full:
+`examples/hello/pipeline.yaml` in full:
 
 ```yaml
 version: 1
@@ -108,12 +111,12 @@ nodes:
 
 ## Pipeline YAML shape
 
-A pipeline declares `vars`, named `agents`, optional `mcp_servers`, and a list of `nodes` forming a DAG. Two node kinds ship in v0.1.0:
+A pipeline declares `vars`, named `agents`, optional `mcp_servers`, and a list of `nodes` forming a DAG. Two node kinds:
 
 - `kind: agent` — runs the strict loop against a named agent. Final assistant message is readable from downstream nodes as `nodes.<id>.output`.
 - `kind: shell` — deterministic subprocess. Output is split into `nodes.<id>.stdout`, `.stderr`, and `.exit_code`. Not subject to agent policy.
 
-Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipeline inputs), and `secrets.*` (redacted credentials). See `docs/yaml-spec.md` for the full grammar, and `examples/pr-review.yaml`, `examples/release-notes.yaml`, `examples/flaky-test-triage.yaml` for functionality-heavy samples.
+Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipeline inputs), and `secrets.*` (redacted credentials). See [`docs/yaml-spec.md`](docs/yaml-spec.md) for the full grammar, and the per-example folders under `examples/` for functionality-heavy samples.
 
 ## Commands
 
@@ -128,15 +131,16 @@ Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipelin
 
 `orno run` separates streams: NDJSON event envelopes go to stdout (downstream tools), tracing JSON goes to stderr (log pipelines). Both timestamps are RFC 3339 UTC, so the two streams join on wall clock. Exit `0` on success; non-zero on pipeline load failure or any node failure.
 
-## Deferred
+## Documentation
 
-- Parallel DAG execution — linear node execution in v0.1.0; parallel scheduling lands in v0.1.1.
-- `WebSearch` builtin — needs a `SearchProvider` trait with a Tavily/Brave impl. Use MCP for now.
-- SQLite `EventSink` — the seam exists; the impl ships when durability is requested.
-- Inline agent config at the node level — every agent lives under `agents.*` for readability.
-- Streaming LLM responses with mid-flight budget enforcement.
+Documentation lives under [`docs/`](docs/README.md):
 
-See `docs/roadmap.md` for the full deferred list and the v0.2.0+ plan.
+- [What is orno](docs/what-is-orno.md) — the runtime contract, in plain English.
+- [Install](docs/install.md) — building, running, and verifying a setup.
+- [Pipeline YAML grammar](docs/yaml-spec.md) — full surface, every field.
+- [Glossary](docs/glossary.md) and [FAQ](docs/faq.md).
+
+Browsable, runnable example pipelines live in [`examples/`](examples/README.md), one folder per example.
 
 ## License
 

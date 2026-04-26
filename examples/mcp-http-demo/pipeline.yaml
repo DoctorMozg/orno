@@ -1,9 +1,9 @@
-# yaml-language-server: $schema=../schemas/pipeline.schema.json
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
 #
 # MCP-over-HTTP demo — one agent that talks to a public, no-auth MCP
 # HTTP server (GitMCP) and produces a one-paragraph summary of a public
 # documentation surface. Exercises the streamable-HTTP transport path
-# wired in `RmcpClient::new_http` (ADR 0007, amended 2026-04-24).
+# of orno's MCP client.
 #
 # Why GitMCP for the demo?
 #   - Zero auth, zero credentials in the bundle, zero secrets to leak.
@@ -16,23 +16,22 @@
 #
 # Run live (LLM call + real HTTP MCP traffic):
 #   export OPENROUTER_API_KEY=sk-or-...
-#   cargo run -p orno-cli -- run examples/mcp-http-demo.yaml
+#   cargo run -p orno-cli -- run examples/mcp-http-demo/pipeline.yaml
 #
 # Record a replayable bundle (safe to commit if you used GitMCP — no
 # Authorization header is sent):
-#   cargo run -p orno-cli -- run examples/mcp-http-demo.yaml \
-#       --record-bundle examples/bundles/mcp-http-demo.ndjson
+#   cargo run -p orno-cli -- run examples/mcp-http-demo/pipeline.yaml \
+#       --record-bundle examples/mcp-http-demo/bundle.ndjson
 #
 # Replay (no LLM, no network):
-#   cargo run -p orno-cli -- replay examples/bundles/mcp-http-demo.ndjson
+#   cargo run -p orno-cli -- replay examples/mcp-http-demo/bundle.ndjson
 #
 # Swap servers:
 #   - Different public repo: change `mcp_servers.gitmcp.url` to
 #     `https://gitmcp.io/<owner>/<repo>` and update the
 #     `allowed_tools` to match the new repo slug.
 #   - Authenticated server: set `auth.kind: bearer` and supply a token
-#     from `secrets.<NAME>` (orno will redact it from the recorded
-#     bundle per ADR 0020).
+#     from `secrets.<NAME>` — orno redacts it from the recorded bundle.
 
 version: 1
 
@@ -78,12 +77,11 @@ agents:
       max_total_tokens: 8000
       max_tool_calls: 3
       max_subagent_depth: 0
-      # allow_mutations is required for any MCP call: the v0.1
-      # McpToolHandler classifies every MCP tool as
-      # `ToolEffect::MutationsAndNetwork` because orno cannot
-      # introspect a remote server's per-tool semantics at
-      # registration time. GitMCP is read-only by construction,
-      # so granting this is safe for this demo.
+      # allow_mutations is required for any MCP call: orno classifies
+      # every MCP tool as both mutating and networked because it
+      # cannot introspect a remote server's per-tool semantics at
+      # registration time. GitMCP is read-only by construction, so
+      # granting this is safe for this demo.
       allow_mutations: true
       allow_network: true
       allowed_domains: ["gitmcp.io"]

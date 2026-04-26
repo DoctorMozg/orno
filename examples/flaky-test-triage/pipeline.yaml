@@ -1,9 +1,9 @@
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
 # Single-agent flaky-test triager with a broad tool surface: filesystem
 # reads and edits, local test execution via Bash, GitHub search via MCP,
 # and constrained WebFetch for linked references. Demonstrates the full
 # effect model (allow_mutations + allow_network + domain allowlist) on
-# a single agent. Target shape per docs/yaml-spec.md; becomes executable
-# as Phase 6 of docs/roadmap.md lands.
+# a single agent.
 
 version: 1
 

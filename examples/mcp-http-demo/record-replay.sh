@@ -2,19 +2,19 @@
 #
 # End-to-end record/replay walkthrough for the MCP-over-HTTP demo.
 #
-# Scenario: a single agent (`doc_summarizer` in mcp-http-demo.yaml)
-# fetches the modelcontextprotocol/python-sdk documentation through a
-# public, no-auth GitMCP HTTP server and writes a one-paragraph
-# summary. We exercise the same pipeline three ways so the loop
-# closes — live -> recorded -> replayed:
+# Scenario: a single agent (`doc_summarizer` in pipeline.yaml) fetches
+# the modelcontextprotocol/python-sdk documentation through a public,
+# no-auth GitMCP HTTP server and writes a one-paragraph summary. We
+# exercise the same pipeline three ways so the loop closes — live ->
+# recorded -> replayed:
 #
 #   1) Live run     — real OpenRouter LLM call + real GitMCP HTTP
 #                     traffic. Costs API tokens.
 #   2) Record run   — same live behavior, plus a bundle file capturing
 #                     every LLM request/response and MCP exchange.
 #                     Safe to commit (GitMCP needs no Authorization
-#                     header, and orno's per-run Redactor strips the
-#                     OpenRouter key per ADR 0020).
+#                     header, and orno's per-run redactor strips the
+#                     OpenRouter key from the recorded bundle).
 #   3) Replay run   — drives the agent loop entirely from the bundle.
 #                     No network, no LLM cost, no OPENROUTER_API_KEY
 #                     needed. Output should match phase 2 modulo
@@ -23,16 +23,16 @@
 # Requires: cargo on PATH; OPENROUTER_API_KEY in $REPO_ROOT/.env.secrets
 # (only for phases 1 and 2).
 #
-# Usage: bash examples/mcp-http-record-replay.sh
+# Usage: bash examples/mcp-http-demo/record-replay.sh
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-PIPELINE="examples/mcp-http-demo.yaml"
-BUNDLE_DIR="examples/bundles"
-BUNDLE="$BUNDLE_DIR/mcp-http-demo.ndjson"
+PIPELINE="examples/mcp-http-demo/pipeline.yaml"
+BUNDLE_DIR="examples/mcp-http-demo"
+BUNDLE="$BUNDLE_DIR/bundle.ndjson"
 SECRETS=".env.secrets"
 
 if [[ -t 1 ]]; then
@@ -81,4 +81,4 @@ cargo run --quiet -p orno-cli -- replay "$BUNDLE"
 banner "Done"
 echo "Bundle artifact:    $BUNDLE"
 echo "Re-run replay only: cargo run -p orno-cli -- replay $BUNDLE"
-echo "Re-run this script: bash examples/mcp-http-record-replay.sh"
+echo "Re-run this script: bash examples/mcp-http-demo/record-replay.sh"

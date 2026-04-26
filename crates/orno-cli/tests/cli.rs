@@ -34,7 +34,7 @@ fn prints_version() {
 #[test]
 fn validates_example_pipeline() {
     orno()
-        .args(["validate", "../../examples/hello.yaml"])
+        .args(["validate", "../../examples/hello/pipeline.yaml"])
         .assert()
         .success()
         .stdout(contains("ok: version=1 nodes=1"));
@@ -49,7 +49,7 @@ fn validates_scoped_state_example() {
     // `orno-core`, and running the example end-to-end would require a
     // live LLM key (DummyTransport can't script tool calls).
     orno()
-        .args(["validate", "../../examples/scoped-state.yaml"])
+        .args(["validate", "../../examples/scoped-state/pipeline.yaml"])
         .assert()
         .success()
         .stdout(contains("ok: version=1 nodes=2"));
@@ -58,7 +58,7 @@ fn validates_scoped_state_example() {
 #[test]
 fn run_emits_lifecycle_events() {
     let assert = orno_with_dummy_transport()
-        .args(["run", "../../examples/hello.yaml"])
+        .args(["run", "../../examples/hello/pipeline.yaml"])
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -300,9 +300,9 @@ fn plan_hello_yaml_emits_plan_outputs() {
     // `orno plan` enumerates the DAG without executing — every node
     // surfaces a `plan_node` event and the run closes with a single
     // `plan_summary`. The example pipeline declares one agent node `greet`
-    // (see `examples/hello.yaml`).
+    // (see `examples/hello/pipeline.yaml`).
     let assert = orno()
-        .args(["plan", "../../examples/hello.yaml"])
+        .args(["plan", "../../examples/hello/pipeline.yaml"])
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
@@ -393,7 +393,7 @@ fn record_bundle_then_replay_exits_success() {
     orno_with_dummy_transport()
         .args([
             "run",
-            "../../examples/hello.yaml",
+            "../../examples/hello/pipeline.yaml",
             "--record-bundle",
             bundle_path,
         ])
@@ -537,12 +537,13 @@ nodes:
 
 #[test]
 fn plan_shows_allow_context_writes() {
-    // The `triager` agent in `examples/scoped-state.yaml` opts into
-    // scoped-state writes (ADR 0025). `orno plan` must surface that
-    // gate as a serialized field on the `plan_node` so a reviewer sees
-    // the elevated effect surface without running the pipeline.
+    // The `triager` agent in `examples/scoped-state/pipeline.yaml` opts
+    // into scoped-state writes via `policy.allow_context_writes`.
+    // `orno plan` must surface that gate as a serialized field on the
+    // `plan_node` so a reviewer sees the elevated effect surface
+    // without running the pipeline.
     let assert = orno()
-        .args(["plan", "../../examples/scoped-state.yaml"])
+        .args(["plan", "../../examples/scoped-state/pipeline.yaml"])
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();

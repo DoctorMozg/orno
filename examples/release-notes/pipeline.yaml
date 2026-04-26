@@ -1,9 +1,9 @@
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
 # Release-notes generation as a three-node DAG: a shell step collects the
 # commit range, a networked enricher fetches PR metadata via WebFetch (with
 # a tight domain allowlist), and a mutating synthesizer writes CHANGELOG.md.
 # Demonstrates heterogeneous node kinds, upstream output templating, and
-# per-agent policy separation. Target shape per docs/yaml-spec.md; becomes
-# executable as Phase 7 of docs/roadmap.md lands (DAG scheduler + polish).
+# per-agent policy separation.
 
 version: 1
 

@@ -1,8 +1,6 @@
-# Orno YAML Spec (v0.1.0 target shape)
+# Pipeline YAML
 
-This document specifies the full user-facing YAML shape orno accepts at v0.1.0 launch. The current skeleton implements a subset; new `examples/*.yaml` conform to this target shape and will become executable as the roadmap (`docs/roadmap.md`) phases land.
-
-The canonical JSON Schema lives at `schemas/pipeline.schema.json` and is regenerated from `orno_core::pipeline::Pipeline` via `cargo run -p orno-cli -- schema`. This document is the prose counterpart; when the two disagree, the generated schema wins at runtime — but this document is authoritative for the *design*.
+This document specifies the user-facing YAML shape orno accepts. The canonical JSON Schema lives at `schemas/pipeline.schema.json` and is regenerated from the in-tree types via `cargo run -p orno-cli -- schema`. When the two disagree, the generated schema wins at runtime.
 
 ## Top-level structure
 
@@ -33,7 +31,7 @@ vars:
 
 ## Environment and secrets
 
-Pipelines reference two external-value namespaces from templates — `env.*` for visible inputs and `secrets.*` for redacted credentials. ADR 0020 is the normative source; the rules below are the prose summary.
+Pipelines reference two external-value namespaces from templates — `env.*` for visible inputs and `secrets.*` for redacted credentials.
 
 ### `env.*` — pipeline inputs, opt-in
 
@@ -99,13 +97,11 @@ All three flags are repeatable. Missing files are a hard error — no silent fal
 Map of agent name to `AgentConfig`. Each named agent can be referenced by:
 
 - A node: `nodes[*].agent: <name>`.
-- Another agent's subagent tool: `handler: { kind: subagent, agent: <name> }`.
+- Another agent's subagent tool: `subagent.<agent-name>` in `allowed_tools`.
 
 ### Default provider
 
-`openrouter` is the default `LlmTransport` target for v0.1.0. OpenRouter exposes every upstream vendor behind a single OpenAI-compatible endpoint, so a single `OPENROUTER_API_KEY` unlocks OpenAI, Anthropic, Google, and open-weight models without per-vendor plumbing. Agents select the upstream by giving the OpenRouter route as `model:` (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.5`, `google/gemini-2.5-pro`). Direct-vendor `provider: openai` / `provider: anthropic` remain valid identifiers but require the matching vendor key and are not enabled by default.
-
-The backing `LlmTransport` impl is not wired yet (ADR 0002; roadmap Phase ≥2). This section fixes the naming convention so samples, event logs, and the future transport agree from day one.
+`openrouter` is the default provider. OpenRouter exposes every upstream vendor behind a single OpenAI-compatible endpoint, so a single `OPENROUTER_API_KEY` unlocks OpenAI, Anthropic, Google, and open-weight models without per-vendor plumbing. Agents select the upstream by giving the OpenRouter route as `model:` (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.5`, `google/gemini-2.5-pro`). Direct-vendor `provider: openai` / `provider: anthropic` remain valid identifiers but require the matching vendor key.
 
 ### `AgentConfig`
 
@@ -128,22 +124,22 @@ my_agent:
     max_subagent_depth: 3
     allow_mutations: false
     allow_network: false
-    allow_context_writes: false  # opt-in for SetState (ADR 0025)
+    allow_context_writes: false  # opt-in for SetState
     allowed_domains: []
     blocked_domains: []
     on_parse_error: fail       # fail | retry_once
-  # Wall-clock deadline is a node-level attribute (`timeout: 10m`)
-  # per ADR 0017, not an agent-policy field.
+  # Wall-clock deadline is a node-level attribute (`timeout: 10m`),
+  # not an agent-policy field.
 ```
 
 ### `allowed_tools` grammar
 
 Each entry matches one of:
 
-- A builtin name: `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `SetState` (ADR 0008 + ADR 0025).
+- A builtin name: `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `SetState`.
 - A specific MCP tool: `"mcp.<server>.<tool>"` where `<server>` is a key in the top-level `mcp_servers:` map and `<tool>` is a tool advertised by that server.
 - An MCP server wildcard: `"mcp.<server>.*"` — every tool the server advertises.
-- A subagent reference: `"subagent.<agent-name>"` where `<agent-name>` is a key in `agents:`. The tool takes `{ prompt: string }`; the parent's emitted prompt becomes the child's `initial_prompt` for a fresh agent run (ADR 0006). Requires `max_subagent_depth > 0`.
+- A subagent reference: `"subagent.<agent-name>"` where `<agent-name>` is a key in `agents:`. The tool takes `{ prompt: string }`; the parent's emitted prompt becomes the child's `initial_prompt` for a fresh agent run. Requires `max_subagent_depth > 0`.
 
 Wildcards on builtins and on subagents are disallowed. Listing a non-existent MCP server, MCP tool, or agent fails at `orno validate`.
 
@@ -153,22 +149,20 @@ YAML uses dots as readable separators in `mcp.<server>.<tool>` and `subagent.<ag
 
 ### `policy` semantics
 
-See ADR 0005 for full definitions. Brief reference:
-
 - `max_iterations` — agent-loop cap. Overrun → `IterationLimitExceeded` → terminate node.
 - `max_total_tokens` — sum across all LLM calls in this agent's loop (not including subagent tokens; subagents have their own caps, bounded from above by the parent's remaining budget).
 - `max_tool_calls` — counts every attempted tool call including blocked and subagent calls.
 - `max_subagent_depth` — 0 disables subagents entirely.
-- `allow_mutations` / `allow_network` — gate tool calls by declared effect class (ADR 0008).
-- `allow_context_writes` — gate `SetState` and other `context_self` tools (ADR 0025). Off by default; an agent that never writes scoped state has no reason to opt in. Refusal feeds back to the model as a denial string; the loop continues.
+- `allow_mutations` / `allow_network` — gate tool calls by declared effect class.
+- `allow_context_writes` — gate `SetState` and other context-self tools. Off by default; an agent that never writes scoped state has no reason to opt in. Refusal feeds back to the model as a denial string; the loop continues.
 - `allowed_domains` / `blocked_domains` — domain name list for `WebFetch` and network-capable MCP tools. Blocklist wins on overlap. Subdomain matching: `"api.github.com"` matches exactly; `".github.com"` matches any subdomain; `"github.com"` matches both the bare host and any subdomain.
 - `on_parse_error` — what to do when the model returns malformed JSON for a tool call's arguments. `fail` terminates; `retry_once` feeds the parse error back as a tool-result message and loops once more.
 
-Child-agent policy rules (ADR 0006): a child cannot be **less** strict than its parent on `allow_mutations` or `allow_network`. A read-only parent cannot delegate to a mutating child. Enforced at pipeline load.
+Child-agent policy rules: a child cannot be **less** strict than its parent on `allow_mutations` or `allow_network`. A read-only parent cannot delegate to a mutating child. Enforced at pipeline load.
 
 ## `mcp_servers`
 
-Map of server name to `McpServerConfig`. Each server is spawned at run start and shut down at run end (ADR 0007). Naming convention: lowercase with underscores.
+Map of server name to `McpServerConfig`. Each server is spawned at run start and shut down at run end. Naming convention: lowercase with underscores.
 
 ```yaml
 mcp_servers:
@@ -200,7 +194,7 @@ mcp_servers:
 
 - `transport: http` — required discriminator.
 - `url: string` — server endpoint.
-- `auth: AuthConfig` — optional. `kind: bearer | basic | none`. **v0.1 caveat**: only `bearer` and `none` connect; `basic` is parsed and validated but returns `UnsupportedTransport` at run start so misconfiguration surfaces loudly (use `kind: bearer` or supply an explicit `Authorization` header in `headers:` instead).
+- `auth: AuthConfig` — optional. `kind: bearer | basic | none`. Caveat: only `bearer` and `none` connect; `basic` is parsed and validated but returns `UnsupportedTransport` at run start so misconfiguration surfaces loudly (use `kind: bearer` or supply an explicit `Authorization` header in `headers:` instead).
 - `headers: { string: string }` — optional extra headers. Forwarded as request headers on every MCP call. Header names that violate RFC 7230 (e.g. spaces, control characters) fail at run start with `HandshakeFailed`.
 
 ## `nodes`
@@ -211,11 +205,9 @@ Array of `Node` entries. Each node:
 - `kind: agent | shell` — required; determines which fields follow.
 - `needs: [string]` — optional; IDs of nodes this node depends on. Drives DAG scheduling.
 
-(`llm` was collapsed into `agent` per ADR 0009. The former `external` kind is removed in v0.1 per ADR 0017 §3 — `kind: external` is a serde "unknown variant" parse error at load. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind.)
-
 ### `kind: agent`
 
-Agents run the loop from ADR 0005. A node references an agent defined in the top-level `agents:` block.
+Agents run the strict loop. A node references an agent defined in the top-level `agents:` block.
 
 ```yaml
 - id: review
@@ -225,10 +217,9 @@ Agents run the loop from ADR 0005. A node references an agent defined in the top
   needs: [fetch]               # optional
 ```
 
-Required fields: `id`, `kind: agent`, `agent`, `initial_prompt`.
-Optional: `needs`.
+Required fields: `id`, `kind: agent`, `agent`, `initial_prompt`. Optional: `needs`.
 
-**Inline agent config** at the node level (defining `model`, `provider`, `policy`, etc. directly on the node) is a v0.2.0+ convenience and is not in the v0.1.0 schema. Every agent configuration lives under `agents.*` so the agent shape is reviewable in one block.
+Inline agent config at the node level (defining `model`, `provider`, `policy`, etc. directly on the node) is not accepted. Every agent configuration lives under `agents.*` so the agent shape is reviewable in one block.
 
 ### `kind: shell`
 
@@ -274,8 +265,8 @@ Template context:
 - `env.<NAME>` — pipeline inputs. See [Environment and secrets](#environment-and-secrets); undeclared names are a template-render error, never a silent empty string.
 - `secrets.<NAME>` — redacted credentials. See [Environment and secrets](#environment-and-secrets); values are replaced with `***` in every event and trace.
 - `nodes.<id>.output` — final assistant message from a completed upstream `kind: agent` node. Available in nodes whose `needs:` includes `<id>`.
-- `nodes.<id>.state.<key>` — scoped key written by the upstream agent's `SetState` tool (ADR 0025). Only present when the agent made at least one `SetState` call; referencing an absent `state.<key>` is a template-render error. Keys are single-level identifiers (`[A-Za-z_][A-Za-z0-9_]*`), not dotted paths.
-- `nodes.<id>.stdout` / `.stderr` / `.exit_code` — per-channel results from a completed upstream `kind: shell` node (ADR 0017 §2). Shell nodes do **not** expose `.output`; referencing it is a template-render error.
+- `nodes.<id>.state.<key>` — scoped key written by the upstream agent's `SetState` tool. Only present when the agent made at least one `SetState` call; referencing an absent `state.<key>` is a template-render error. Keys are single-level identifiers (`[A-Za-z_][A-Za-z0-9_]*`), not dotted paths.
+- `nodes.<id>.stdout` / `.stderr` / `.exit_code` — per-channel results from a completed upstream `kind: shell` node. Shell nodes do **not** expose `.output`; referencing it is a template-render error.
 - `nodes.<id>.status` — terminal `NodeStatus` for any completed upstream node (`completed | failed | timed_out | skipped`).
 
 ## Effect-class reference
@@ -290,16 +281,16 @@ Template context:
 | `SetState` | context_self            | `allow_context_writes: true`              |
 | `mcp.*`    | declared by the server  | matches the advertised effect             |
 
-The `SetState` builtin writes a single top-level key under `nodes.<self>.state.*` (ADR 0025). Arguments: `{ key: string, value: <json> }`. `key` matches `^[A-Za-z_][A-Za-z0-9_]*$` — single-level only, no dotted paths. A second call with the same key overwrites the prior value wholesale; the whole state tree is size-capped at the engine's `max_output_bytes`. Secret-valued leaves are redacted before storage. State writes affect only the current node; downstream nodes that `needs:` this one read through `nodes.<id>.state.<key>`.
+The `SetState` builtin writes a single top-level key under `nodes.<self>.state.*`. Arguments: `{ key: string, value: <json> }`. `key` matches `^[A-Za-z_][A-Za-z0-9_]*$` — single-level only, no dotted paths. A second call with the same key overwrites the prior value wholesale; the whole state tree is size-capped at the engine's `max_output_bytes`. Secret-valued leaves are redacted before storage. State writes affect only the current node; downstream nodes that `needs:` this one read through `nodes.<id>.state.<key>`.
 
 Blocking behavior:
 
-- Violation of a precondition on a builtin → emit `MutatingCallBlocked` / `NetworkBlocked` / `DomainBlocked` and feed the failure back to the model as a tool-call error (per ADR 0005 dimension 3).
+- Violation of a precondition on a builtin → emit `MutatingCallBlocked` / `NetworkBlocked` / `DomainBlocked` and feed the failure back to the model as a tool-call error (the loop continues with the denial in context, so the model can recover or ask the operator).
 - Calling a tool not in `allowed_tools` → emit `UnknownToolCalled` and **terminate the node** (strict; no retry).
 
 ## Events emitted per agent node
 
-See ADR 0003 for the event log structure. Per-agent events include:
+Per-agent events include:
 
 - `AgentStarted { node_id, agent_name, depth }`
 - `LlmRequestStarted { request_id, iteration }`
@@ -349,15 +340,4 @@ nodes:
     initial_prompt: "Say hello in one sentence."
 ```
 
-See `examples/pr-review.yaml`, `examples/flaky-test-triage.yaml`, and `examples/release-notes.yaml` for functionality-heavy samples.
-
-## What v0.1.0 does not ship
-
-- `WebSearch` tool (ADR 0008 deferral).
-- Generic HTTP tool handler (use MCP instead).
-- User-authored tool JSON Schemas (Architecture A from `docs/chat.md` is not a v0.1.0 feature).
-- `kind: external` node execution (removed from v0.1 per ADR 0017; returns as a `transport:` axis on existing kinds in a later release).
-- Inline agent config at the node level.
-- Streaming LLM responses.
-- `EventSink` impls beyond `InMemorySink` (SQLite is planned, not shipped).
-- Auto-inferred `needs` from template references — specify both explicitly.
+See `examples/pr-review/`, `examples/flaky-test-triage/`, and `examples/release-notes/` for functionality-heavy samples.

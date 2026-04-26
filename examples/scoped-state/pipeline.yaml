@@ -1,25 +1,23 @@
-# yaml-language-server: $schema=../schemas/pipeline.schema.json
-# Scoped-state example (ADR 0025). An agent inspects a short bug
-# description, publishes structured triage fields via `SetState`, and a
-# downstream shell node renders those fields into a triage summary file
-# without re-parsing the assistant's free-form reply.
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
+# Scoped-state example. An agent inspects a short bug description,
+# publishes structured triage fields via `SetState`, and a downstream
+# shell node renders those fields into a triage summary file without
+# re-parsing the assistant's free-form reply.
 #
 # Demonstrates:
 #
 #   SetState                     — write `nodes.<self>.state.<key>`
-#   allow_context_writes: true   — the opt-in gate for `context_self`
-#                                  tools (ADR 0025 amending ADR 0005 §3)
+#   allow_context_writes: true   — the opt-in policy gate that lets the
+#                                  agent call `SetState` at all
 #   nodes.<id>.state.<key>       — downstream template access to a key
 #                                  the upstream agent wrote, sibling to
-#                                  the existing nodes.<id>.output slot
-#                                  (ADR 0025 amending ADR 0010).
+#                                  the existing `nodes.<id>.output` slot
 #
 # Prereqs:
 #   - $OPENROUTER_API_KEY in the environment
 #
-# This example exercises the happy path called out in ADR 0025 §7; it
-# does not demonstrate oversize-payload or malformed-key rejection —
-# both are covered by unit tests.
+# This example exercises the happy path; oversize-payload and
+# malformed-key rejection are covered by unit tests rather than here.
 
 version: 1
 
