@@ -102,8 +102,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: taiki-e/install-action@cargo-nextest
-      - run: cargo nextest run --workspace --all-targets --locked
-      - run: cargo test --doc --workspace --locked
+      # `--all-features` arms `orno-cli/test-transport` so the
+      # `ORNO_TEST_LLM_TRANSPORT` escape hatch is live in the binary the
+      # CLI integration tests invoke as a subprocess. The feature is off
+      # in default builds so `cargo install` users never see it.
+      - run: cargo nextest run --workspace --all-targets --all-features --locked
+      - run: cargo test --doc --workspace --all-features --locked
 
   test-mcp-real:
     name: test (real MCP)

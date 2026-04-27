@@ -15,6 +15,15 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Exposes the `ORNO_TEST_LLM_TRANSPORT` escape hatch (`dummy` /
+# `scripted`) to the binary. Off by default so a stock `cargo install`
+# build never honors the env var — a misconfigured operator cannot
+# swap in the no-API-key fakes by accident. Integration tests that
+# need the fakes must build with `--features test-transport`; the
+# `cfg(test)` cousin in the source covers in-crate unit tests.
+test-transport = []
+
 [dependencies]
 orno-core = { workspace = true }
 
@@ -23,6 +32,7 @@ async-trait = "0.1"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

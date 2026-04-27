@@ -237,6 +237,8 @@ mod tests {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
+            roots: Vec::new(),
+            max_message_history_bytes: None,
         }
     }
 
