@@ -21,10 +21,11 @@ mod convert;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use genai::Client;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, StopReason};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ChatResponse, StopReason};
 use tracing::instrument;
 
 use crate::error::LlmError;
@@ -32,9 +33,21 @@ use crate::pipeline::AgentConfig;
 
 use super::{LlmRequest, LlmResponse, LlmTransport, OrnoChatToolCall};
 use convert::{
-    KNOWN_PROVIDERS, build_client, convert_usage, map_genai_error, orno_msg_to_genai,
-    orno_tool_to_genai,
+    KNOWN_PROVIDERS, build_client, convert_usage, is_transient_genai_error, map_genai_error,
+    orno_msg_to_genai, orno_tool_to_genai,
 };
+
+/// How many *additional* attempts the transport will make after the
+/// initial call fails on a transient error. Each retry doubles the
+/// delay, starting at [`RETRY_BASE_DELAY_MS`]. The total budget across
+/// all attempts is bounded so a 503-storm cannot block a node for
+/// longer than its declared `timeout:` would otherwise allow.
+const LLM_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Initial backoff before the first retry. Doubled per attempt:
+/// 500 ms, 1 s, 2 s — totals 3.5 s of wall-clock retry budget on the
+/// worst case, leaving most of a per-node `timeout:` for productive
+/// work.
+const RETRY_BASE_DELAY_MS: u64 = 500;
 
 #[derive(Debug)]
 pub struct GenAiTransport {
@@ -111,10 +124,9 @@ impl LlmTransport for GenAiTransport {
             options = options.with_max_tokens(max);
         }
 
-        let response = client
-            .exec_chat(req.model.as_str(), chat, Some(&options))
-            .await
-            .map_err(|err| map_genai_error(&req.provider, &req.model, err))?;
+        let response =
+            exec_chat_with_retry(client, req.model.as_str(), &chat, &options, &req.provider)
+                .await?;
 
         let finish_reason = response.stop_reason.as_ref().map(|r| r.raw().to_string());
         let usage = convert_usage(&response.usage);
@@ -133,7 +145,7 @@ impl LlmTransport for GenAiTransport {
             return Ok(LlmResponse {
                 content: String::new(),
                 finish_reason,
-                usage: Some(usage),
+                usage,
                 tool_calls,
             });
         }
@@ -145,9 +157,50 @@ impl LlmTransport for GenAiTransport {
         Ok(LlmResponse {
             content,
             finish_reason,
-            usage: Some(usage),
+            usage,
             tool_calls: Vec::new(),
         })
+    }
+}
+
+/// Drive `exec_chat` with bounded exponential backoff on transient
+/// failures (HTTP 429/5xx, connect/timeout transport errors). Permanent
+/// errors (auth, model-not-found, payload problems) short-circuit on
+/// the first attempt — retrying a 401 only delays the inevitable and
+/// burns the operator's rate-limit budget. Each retry clones the
+/// request because `exec_chat` consumes its `ChatRequest`; cloning is
+/// cheap relative to the network round trip we are already paying.
+async fn exec_chat_with_retry(
+    client: &Client,
+    model: &str,
+    chat: &ChatRequest,
+    options: &ChatOptions,
+    provider: &str,
+) -> Result<ChatResponse, LlmError> {
+    let mut attempt: u32 = 0;
+    loop {
+        match client.exec_chat(model, chat.clone(), Some(options)).await {
+            Ok(resp) => return Ok(resp),
+            Err(err) => {
+                let transient = is_transient_genai_error(&err);
+                if attempt < LLM_RETRY_MAX_ATTEMPTS && transient {
+                    let delay_ms = RETRY_BASE_DELAY_MS.saturating_mul(1u64 << attempt);
+                    tracing::warn!(
+                        llm.provider = %provider,
+                        llm.model = %model,
+                        attempt = attempt + 1,
+                        max_attempts = LLM_RETRY_MAX_ATTEMPTS,
+                        delay_ms,
+                        error = %err,
+                        "LLM transient error; retrying after backoff",
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(map_genai_error(provider, model, err));
+            },
+        }
     }
 }
 
@@ -168,6 +221,8 @@ mod tests {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: crate::pipeline::OnParseError::Fail,
+            roots: Vec::new(),
+            max_message_history_bytes: None,
         }
     }
 

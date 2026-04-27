@@ -133,13 +133,13 @@ pub enum BundleError {
 /// recorded LLM and tool tape files.
 ///
 /// The tape files are read line-by-line and re-emitted as `LlmEntry` /
-/// `ToolEntry` lines in the bundle. Pipeline YAML is embedded as the
-/// original text after passing through [`scrub_pipeline_secrets`] so
-/// MCP HTTP bearer tokens land as `<REDACTED>`. Comments, indentation,
-/// and trailing whitespace are preserved because the scrub uses
-/// targeted string substitution rather than a parse-and-reemit round
-/// trip — `orno replay` still needs to see the YAML the original
-/// `orno run` did, modulo the literal secrets.
+/// `ToolEntry` lines in the bundle. Pipeline YAML is embedded after
+/// passing through [`scrub_pipeline_secrets`]: pipelines with no
+/// literal bearer tokens round-trip byte-for-byte (so comments and
+/// whitespace survive for human inspection), while pipelines that
+/// carry literal credentials are parsed, walked, and re-emitted with
+/// `<REDACTED>` substituted in. `orno replay` still sees the YAML the
+/// original `orno run` did, modulo the redacted secrets.
 ///
 /// Either tape path may be `None` when no entries of that kind were
 /// recorded; the bundle will simply omit those lines.
@@ -186,17 +186,25 @@ pub fn write_bundle(
 /// Replace literal MCP bearer tokens in `pipeline_yaml` with
 /// `<REDACTED>` so a shared bundle does not leak production credentials.
 ///
-/// The YAML is parsed once to locate `mcp_servers.*.auth.kind: bearer`
-/// entries; for each such entry, the literal token value is
-/// string-replaced in the YAML body. Template values
-/// (`{{ secrets.X }}`) are skipped because they are placeholders the
-/// run-time render resolves, not the secret. Tokens that round-trip
-/// safely through `serde_yaml_ng` (no quoting required) are matched
-/// directly; quoted tokens are matched both with and without their
-/// surrounding quotes so YAML escapes do not slip through unscrubbed.
+/// The pipeline is parsed first to discover whether any HTTP server is
+/// configured with a literal (non-templated) bearer token. When the
+/// answer is no, the input is returned verbatim so comments and
+/// whitespace round-trip byte-for-byte for human inspection of the
+/// bundle. When the answer is yes, the YAML body is parsed into a
+/// generic `serde_yaml_ng::Value` tree and walked structurally:
+/// string leaves under a credential-shaped key are replaced with the
+/// redaction placeholder, then the tree is re-serialized. This avoids
+/// the failure modes of a naive `str::replace` loop — which could
+/// corrupt unrelated text that happened to share a token's bytes — at
+/// the cost of dropping comments and re-normalizing whitespace on the
+/// scrub-required path.
 ///
-/// Returns the input verbatim when the pipeline has no HTTP servers
-/// with bearer auth, so the common case is a no-op.
+/// Template values (`{{ secrets.X }}`) are detected at every level and
+/// preserved verbatim, because they are placeholders the runtime
+/// renderer resolves, not the secret itself. If the structural walk
+/// fails (parse error on an otherwise-loadable pipeline body), the
+/// scrubber falls back to a literal-token Aho-Corasick replacement so
+/// the bundle is still emitted with the credentials redacted.
 pub fn scrub_pipeline_secrets(pipeline_yaml: &str) -> Result<String, BundleError> {
     let pipeline: Pipeline = serde_yaml_ng::from_str(pipeline_yaml)
         .map_err(|e| BundleError::PipelineParse(e.to_string()))?;
@@ -219,15 +227,103 @@ pub fn scrub_pipeline_secrets(pipeline_yaml: &str) -> Result<String, BundleError
         return Ok(pipeline_yaml.to_string());
     }
 
-    // Sort longest-first so an embedded substring of a longer token
-    // is not redacted independently and corrupting the longer match.
-    tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
-
-    let mut out = pipeline_yaml.to_string();
-    for token in tokens {
-        out = out.replace(&token, BEARER_REDACTION_PLACEHOLDER);
+    match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(pipeline_yaml) {
+        Ok(mut value) => {
+            scrub_yaml_value(&mut value);
+            serde_yaml_ng::to_string(&value).map_err(|e| BundleError::PipelineParse(e.to_string()))
+        },
+        Err(parse_err) => {
+            // The pipeline parsed as `Pipeline` above, so a generic
+            // `Value` parse should not normally fail. If it does, fall
+            // back to the literal-token path so the bundle still ships
+            // with the credentials redacted — the alternative would be
+            // emitting plaintext tokens.
+            tracing::warn!(
+                error = %parse_err,
+                "bundle scrub: generic YAML parse failed; falling back to literal-token replacement",
+            );
+            Ok(scrub_yaml_with_tokens(pipeline_yaml, &tokens))
+        },
     }
-    Ok(out)
+}
+
+/// Recursively walk a YAML `Value` tree, replacing string leaves whose
+/// keys look like credentials with [`BEARER_REDACTION_PLACEHOLDER`].
+/// Template strings (`{{ ... }}`) are left intact at every level so
+/// replay can still resolve placeholders against the live secret map.
+fn scrub_yaml_value(value: &mut serde_yaml_ng::Value) {
+    match value {
+        serde_yaml_ng::Value::Mapping(map) => {
+            for (key, val) in &mut *map {
+                let sensitive = match key {
+                    serde_yaml_ng::Value::String(s) => is_sensitive_key(s),
+                    _ => false,
+                };
+                let is_literal_string = sensitive
+                    && matches!(val, serde_yaml_ng::Value::String(t) if !t.contains("{{"));
+                if is_literal_string {
+                    *val = serde_yaml_ng::Value::String(BEARER_REDACTION_PLACEHOLDER.to_string());
+                    continue;
+                }
+                // Recurse on non-leaf values, even when the key is
+                // sensitive (e.g. `auth: { token: ... }` — the
+                // sensitive content lives one level deeper than `auth`).
+                scrub_yaml_value(val);
+            }
+        },
+        serde_yaml_ng::Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                scrub_yaml_value(item);
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Lower-cases `key` and returns `true` when it carries one of the
+/// well-known credential-shaped keywords. Substring match keeps
+/// compound names like `api_key` or `private_key` covered.
+fn is_sensitive_key(key: &str) -> bool {
+    const SENSITIVE_KEYWORDS: &[&str] = &[
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "access_key",
+        "private_key",
+        "credential",
+    ];
+    let lower = key.to_lowercase();
+    SENSITIVE_KEYWORDS.iter().any(|kw| lower.contains(kw))
+}
+
+/// Fallback path used only when the structural walk could not parse
+/// the YAML body. Replaces literal token bytes with the redaction
+/// placeholder via a single Aho-Corasick scan so the multi-pattern
+/// match runs in one pass over the haystack.
+fn scrub_yaml_with_tokens(pipeline_yaml: &str, tokens: &[String]) -> String {
+    use aho_corasick::{AhoCorasick, MatchKind};
+    if tokens.is_empty() {
+        return pipeline_yaml.to_string();
+    }
+    let Ok(ac) = AhoCorasick::builder()
+        .match_kind(MatchKind::LeftmostLongest)
+        .build(tokens)
+    else {
+        // Should not happen on a non-empty `&[String]` of valid UTF-8;
+        // returning the input unchanged is preferable to panicking
+        // inside an already-degraded fallback path.
+        return pipeline_yaml.to_string();
+    };
+    let mut out = String::with_capacity(pipeline_yaml.len());
+    let mut last = 0;
+    for mat in ac.find_iter(pipeline_yaml) {
+        out.push_str(&pipeline_yaml[last..mat.start()]);
+        out.push_str(BEARER_REDACTION_PLACEHOLDER);
+        last = mat.end();
+    }
+    out.push_str(&pipeline_yaml[last..]);
+    out
 }
 
 /// Read a bundle file back into its components.
