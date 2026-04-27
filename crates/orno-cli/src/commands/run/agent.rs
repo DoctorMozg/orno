@@ -88,10 +88,19 @@ pub(super) fn wrap_tool_tape(
     redactor: &Arc<Redactor>,
 ) -> Result<ToolTapePair> {
     if let Some(path) = &flags.record_tool_tape {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut opts = std::fs::OpenOptions::new();
+        // O_EXCL: prevent a pre-planted symlink at the path from redirecting
+        // writes to an attacker-controlled file, and force the caller to make
+        // an explicit decision when a stale tape already exists at the path.
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Tool tapes capture full request/response payloads including
+            // secrets — must not be readable by other local users.
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(path)
             .with_context(|| format!("creating tool tape `{}`", path.display()))?;
         let shared = Arc::new(Mutex::new(std::io::BufWriter::new(file)));

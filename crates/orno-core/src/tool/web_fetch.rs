@@ -157,19 +157,38 @@ impl ToolHandler for WebFetchHandler {
             .unwrap_or("unknown")
             .to_string();
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| ToolError::Invocation {
-                name: "WebFetch".to_string(),
-                source: Box::new(err),
-            })?;
-
-        let truncated = bytes.len() > MAX_BODY_BYTES;
-        let slice = bytes
-            .get(..MAX_BODY_BYTES.min(bytes.len()))
-            .unwrap_or(&bytes);
-        let body = String::from_utf8_lossy(slice).into_owned();
+        // Stream body in chunks up to MAX_BODY_BYTES. Loading the full body
+        // before capping would let a large response allocate hundreds of MiB
+        // before truncation fires; stopping at the cap closes the connection
+        // early and bounds RSS.
+        let mut buf = Vec::with_capacity(MAX_BODY_BYTES.min(65_536));
+        let mut truncated = false;
+        let mut response = response;
+        loop {
+            match response
+                .chunk()
+                .await
+                .map_err(|err| ToolError::Invocation {
+                    name: "WebFetch".to_string(),
+                    source: Box::new(err),
+                })? {
+                None => break,
+                Some(chunk) => {
+                    let remaining = MAX_BODY_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        truncated = true;
+                        break;
+                    }
+                    let take = chunk.len().min(remaining);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < chunk.len() {
+                        truncated = true;
+                        break;
+                    }
+                },
+            }
+        }
+        let body = String::from_utf8_lossy(&buf).into_owned();
 
         let mut out = format!("status: {status}\ncontent-type: {content_type}\n\n{body}");
         if truncated {
