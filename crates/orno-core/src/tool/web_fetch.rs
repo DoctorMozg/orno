@@ -1,6 +1,7 @@
 //! `WebFetch` tool — HTTP GET a URL. Requires `allow_network`.
 //! Domain policy is enforced by `LoopAgent` before dispatch.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,7 +10,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
+use crate::agent::loop_agent::policy::{is_blocked_ipv4, is_blocked_ipv6};
 use crate::error::ToolError;
+
+/// Cap on the number of redirects this client will follow. Lower than
+/// reqwest's default of 10 so a redirect-amplification chain does not
+/// burn the per-request timeout before the gate's IP block-list has a
+/// chance to interrupt it.
+const MAX_REDIRECTS: usize = 5;
 
 // Response bodies above this cap are truncated before being returned to
 // the agent. Keeps a runaway page from blowing out the LLM context
@@ -59,11 +67,34 @@ impl WebFetchHandler {
     pub fn new(default_timeout: Option<Duration>) -> Self {
         let default_timeout =
             default_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        // Redirect policy: re-run the literal-IP block list on each hop
+        // and cap the chain at MAX_REDIRECTS. The agent's policy gate
+        // only sees the original URL, so without this hook a permitted
+        // public host could redirect to `127.0.0.1` or a metadata IP
+        // and reqwest would happily follow.
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error(format!("too many redirects (>{MAX_REDIRECTS})"));
+            }
+            if let Some(host) = attempt.url().host_str()
+                && let Ok(ip) = host.parse::<IpAddr>()
+            {
+                let blocked = match ip {
+                    IpAddr::V4(v4) => is_blocked_ipv4(v4),
+                    IpAddr::V6(v6) => is_blocked_ipv6(v6),
+                };
+                if blocked {
+                    return attempt.error(format!("redirect to blocked IP `{ip}`"));
+                }
+            }
+            attempt.follow()
+        });
         // `reqwest::Client::builder().build()` only fails when TLS
         // backend init fails, which is a startup-fatal misconfiguration;
         // panic here is the same behavior as `Client::new()`.
         let client = reqwest::Client::builder()
             .timeout(default_timeout)
+            .redirect(redirect_policy)
             .build()
             .expect("default reqwest client must build");
         Self {
