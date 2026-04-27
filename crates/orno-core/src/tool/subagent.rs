@@ -187,10 +187,10 @@ impl ToolHandler for SubagentHandler {
 
         let child_req = AgentRequest {
             agent_name: self.child_agent_name.clone(),
-            initial_prompt: prompt,
-            system: self.child_config.system.clone(),
-            provider: self.child_config.provider.clone(),
-            model: self.child_config.model.clone(),
+            initial_prompt: Arc::from(prompt),
+            system: self.child_config.system.as_deref().map(Arc::from),
+            provider: Arc::from(self.child_config.provider.as_str()),
+            model: Arc::from(self.child_config.model.as_str()),
             policy: self.child_config.policy.clone(),
             allowed_tools: self.child_config.allowed_tools.clone(),
             depth: child_depth,
@@ -279,6 +279,8 @@ mod tests {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
+            roots: Vec::new(),
+            max_message_history_bytes: None,
         }
     }
 
