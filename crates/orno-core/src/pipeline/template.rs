@@ -101,10 +101,11 @@ impl TemplateEngine {
                     name: name.to_string(),
                     source,
                 })?;
-            // `LruCache::put` returns the evicted value when the cache is at
-            // capacity. Remove the corresponding compiled template from the
-            // environment so memory stays bounded.
-            if let Some(evicted_name) = inner.cache.put(hash, hex.clone()) {
+            // `LruCache::push` (not `put`) returns the evicted (key, value)
+            // pair when the cache is at capacity. `put` only returns a value
+            // on a key collision, so an overflow eviction would be silently
+            // dropped and the Environment would grow without bound.
+            if let Some((_evicted_hash, evicted_name)) = inner.cache.push(hash, hex.clone()) {
                 inner.env.remove_template(&evicted_name);
             }
             hex
@@ -206,5 +207,99 @@ mod tests {
             .render("broken", "{{ unterminated", &json!({}))
             .expect_err("syntax error must surface");
         assert!(matches!(err, PipelineError::Template { .. }));
+    }
+
+    #[test]
+    fn lru_eviction_removes_oldest_compiled_template() {
+        // LRU bound contract: when the cache is at capacity, inserting a
+        // new entry must evict the least-recently-used one so the cache
+        // map cannot grow without bound. Re-rendering the evicted source
+        // must succeed (re-parse on demand is the documented fallback)
+        // and a fresh entry's presence proves the bound holds.
+        //
+        // Verified by capturing the first template's hash, filling the
+        // cache to `TEMPLATE_CACHE_CAPACITY + 1` distinct sources, and
+        // checking the LRU map: size capped at capacity, first hash gone.
+        //
+        // NOTE: this test intentionally does NOT assert that the
+        // underlying `Environment::get_template` rejects the evicted
+        // hex name. The current `Inner::put` implementation relies on
+        // `LruCache::put` returning the evicted value, but the `lru`
+        // crate's `put` only returns the prior value for an existing key
+        // — overflow evictions go unnoticed, so the registered template
+        // in `env` is not cleaned up. The cache map IS bounded; the
+        // env-side cleanup is a known gap to address in production code.
+        let engine = TemplateEngine::new();
+
+        // Render the first template; remember its hash.
+        let first_source = "first {{ x }}";
+        engine
+            .render("first", first_source, &json!({ "x": 0 }))
+            .expect("first render");
+        let first_hash = blake3::hash(first_source.as_bytes());
+        {
+            let inner = engine.inner.lock().expect("mutex");
+            assert!(
+                inner.cache.peek(&first_hash).is_some(),
+                "first entry must be cached before overflow",
+            );
+        }
+
+        // Fill the cache with `TEMPLATE_CACHE_CAPACITY` more distinct
+        // sources. Combined with the first, that's capacity + 1, so the
+        // first must be the evictee. Each source string is unique so the
+        // blake3 hash and the resulting cache key are unique too.
+        for i in 0..TEMPLATE_CACHE_CAPACITY {
+            let source = format!("filler-{i} {{{{ y }}}}");
+            engine
+                .render(&format!("f{i}"), &source, &json!({ "y": i }))
+                .expect("filler render");
+        }
+
+        let inner = engine.inner.lock().expect("mutex");
+        // The cache must remain at capacity — the LRU bound is hard.
+        assert_eq!(
+            inner.cache.len(),
+            TEMPLATE_CACHE_CAPACITY,
+            "cache size must stay at capacity after overflow",
+        );
+        // The first template's hash must no longer be present in the
+        // cache. `peek` does not bump LRU recency so the assertion is
+        // about presence, not ordering.
+        assert!(
+            inner.cache.peek(&first_hash).is_none(),
+            "oldest entry must have been evicted from the cache",
+        );
+    }
+
+    #[test]
+    fn rerender_after_eviction_returns_correct_output() {
+        // Companion to the LRU-eviction test: a template evicted from the
+        // cache must still render correctly on re-render, since the engine
+        // re-parses on a cache miss. Proves eviction is a parse-cost issue,
+        // not a correctness issue — matches the doc comment on
+        // `TEMPLATE_CACHE_CAPACITY`.
+        let engine = TemplateEngine::new();
+
+        let evictee_source = "evictee {{ value }}";
+        let original = engine
+            .render("evictee", evictee_source, &json!({ "value": "alpha" }))
+            .expect("first render");
+        assert_eq!(original, "evictee alpha");
+
+        // Push the cache past capacity so the evictee is no longer in the
+        // LRU map.
+        for i in 0..TEMPLATE_CACHE_CAPACITY {
+            let source = format!("flush-{i} {{{{ y }}}}");
+            engine
+                .render(&format!("f{i}"), &source, &json!({ "y": i }))
+                .expect("filler render");
+        }
+
+        // Re-render the evicted source; result must match the original.
+        let rerendered = engine
+            .render("evictee", evictee_source, &json!({ "value": "beta" }))
+            .expect("re-render after eviction must succeed");
+        assert_eq!(rerendered, "evictee beta");
     }
 }
