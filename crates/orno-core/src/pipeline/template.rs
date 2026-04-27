@@ -221,14 +221,6 @@ mod tests {
         // cache to `TEMPLATE_CACHE_CAPACITY + 1` distinct sources, and
         // checking the LRU map: size capped at capacity, first hash gone.
         //
-        // NOTE: this test intentionally does NOT assert that the
-        // underlying `Environment::get_template` rejects the evicted
-        // hex name. The current `Inner::put` implementation relies on
-        // `LruCache::put` returning the evicted value, but the `lru`
-        // crate's `put` only returns the prior value for an existing key
-        // — overflow evictions go unnoticed, so the registered template
-        // in `env` is not cleaned up. The cache map IS bounded; the
-        // env-side cleanup is a known gap to address in production code.
         let engine = TemplateEngine::new();
 
         // Render the first template; remember its hash.
@@ -269,6 +261,35 @@ mod tests {
         assert!(
             inner.cache.peek(&first_hash).is_none(),
             "oldest entry must have been evicted from the cache",
+        );
+        // The compiled template must also be removed from the Environment
+        // so its memory is freed. This is the env-side half of eviction —
+        // `LruCache::push` (not `put`) returns the evicted name, which
+        // lets `remove_template` be called.
+        let evicted_name = first_hash.to_hex().to_string();
+        assert!(
+            inner.env.get_template(&evicted_name).is_err(),
+            "evicted template must be removed from the Environment",
+        );
+    }
+
+    #[test]
+    fn auto_escape_none_does_not_html_escape_variables() {
+        // Module doc-comment guarantee: `auto_escape` is forced to `None` so
+        // a value containing HTML-significant characters survives the render
+        // unchanged. Without this guard MiniJinja would HTML-escape the
+        // string — breaking any downstream consumer that expects the literal
+        // bytes (tool-call JSON, code blocks, prompts targeting models that
+        // do not parse HTML entities).
+        let engine = TemplateEngine::new();
+        let payload = "<script>alert(1)</script>";
+        let out = engine
+            .render("noescape", "Hello {{ name }}", &json!({ "name": payload }))
+            .expect("template renders");
+        assert_eq!(out, format!("Hello {payload}"));
+        assert!(
+            !out.contains("&lt;"),
+            "auto_escape=None must not HTML-escape: {out:?}",
         );
     }
 

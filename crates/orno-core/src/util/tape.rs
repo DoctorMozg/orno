@@ -248,4 +248,30 @@ mod tests {
         let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
         assert!(loaded.is_empty());
     }
+
+    #[test]
+    fn write_surfaces_serialize_failure_with_named_error() {
+        // Regression for the `serde_json::to_string -> map_err` branch in
+        // `write`. A type that always fails to serialize must surface as a
+        // `std::io::Error` whose payload mentions "tape serialize failed", so
+        // operators see the failure cause rather than a bare `Other` kind.
+        struct FailSer;
+        impl Serialize for FailSer {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("deliberate failure"))
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        let mut writer = TapeWriter::<FailSer>::create(&path).unwrap();
+        let err = writer
+            .write(&FailSer)
+            .expect_err("serialize failure must propagate as io::Error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tape serialize failed"),
+            "error must name the wrapping context, got {msg:?}",
+        );
+    }
 }

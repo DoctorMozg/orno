@@ -258,4 +258,32 @@ mod tests {
         assert_eq!(r.redact(input), clone.redact(input));
         assert_eq!(clone.redact(input).into_owned(), "say *** now");
     }
+
+    #[test]
+    fn repeated_secret_in_string_replaces_all_occurrences() {
+        // The Aho-Corasick scan walks the haystack to the end, so a secret
+        // that appears multiple times in one string must be redacted at
+        // every position — not just the first match.
+        let r = redactor_with(&[("k", "secret")]);
+        let out = r.redact("token=secret and secret again").into_owned();
+        assert_eq!(out, "token=*** and *** again");
+    }
+
+    #[test]
+    fn redact_json_handles_nested_objects_and_arrays() {
+        // Recursive walk must descend into nested objects and arrays without
+        // collapsing structure or rewriting non-string leaves. Numbers and
+        // booleans flow through unchanged; only string leaves get the
+        // redaction marker.
+        let r = redactor_with(&[("k", "topsecret")]);
+        let value = json!({
+            "outer": { "inner": "topsecret" },
+            "list": ["topsecret", 42, true],
+        });
+        let out = r.redact_json(&value);
+        assert_eq!(out["outer"]["inner"], json!("***"));
+        assert_eq!(out["list"][0], json!("***"));
+        assert_eq!(out["list"][1], json!(42));
+        assert_eq!(out["list"][2], json!(true));
+    }
 }

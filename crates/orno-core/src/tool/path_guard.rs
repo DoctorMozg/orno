@@ -127,6 +127,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_empty_path_with_no_file_name_component() {
+        // An empty path string has no `file_name` component, so a `Write`
+        // target would have nowhere to land. Must surface as `Denied` with
+        // the file-name reason rather than panic on the missing parent.
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let err = jail_path(tmp.path(), "").expect_err("empty path must be rejected");
+        match err {
+            ToolError::Denied { reason } => {
+                assert!(
+                    reason.contains("file-name"),
+                    "reason must name the missing file-name component, got {reason:?}",
+                );
+            },
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_root_path_outside_temp_root() {
+        // `/` exists and canonicalizes to itself, so it goes through the
+        // existing-path branch and surfaces as an "outside" denial. The
+        // assertion is that the function refuses it rather than letting a
+        // request escape to the filesystem root.
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let err = jail_path(tmp.path(), "/").expect_err("root path must be rejected");
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "expected Denied, got {err:?}",
+        );
+    }
+
+    #[test]
     fn rejects_symlink_escape() {
         let root = tempfile::TempDir::new().expect("create root");
         let other = tempfile::TempDir::new().expect("create other");
