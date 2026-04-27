@@ -19,7 +19,7 @@ detect_target() {
       case "$arch" in
         x86_64) echo "x86_64-unknown-linux-gnu" ;;
         *)
-          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc" >&2
+          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc" >&2
           exit 1
           ;;
       esac
@@ -27,9 +27,8 @@ detect_target() {
     Darwin)
       case "$arch" in
         arm64) echo "aarch64-apple-darwin" ;;
-        x86_64) echo "x86_64-apple-darwin" ;;
         *)
-          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc" >&2
+          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc" >&2
           exit 1
           ;;
       esac
@@ -41,13 +40,13 @@ detect_target() {
           echo "x86_64-pc-windows-msvc"
           ;;
         *)
-          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc" >&2
+          echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc" >&2
           exit 1
           ;;
       esac
       ;;
     *)
-      echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc" >&2
+      echo "error: unsupported platform: $os/$arch. Supported targets: x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc" >&2
       exit 1
       ;;
   esac
@@ -149,7 +148,9 @@ main() {
   version="${VERSION:-$(latest_version)}"
 
   scratch_dir=$(mktemp -d)
-  trap 'rm -rf "$scratch_dir"' EXIT
+  # Use double quotes so the path is expanded at trap-define-time; the local
+  # `scratch_dir` is out of scope by the time EXIT fires under `set -u`.
+  trap "rm -rf '$scratch_dir'" EXIT
 
   ext="tar.gz"
   case "$target" in
