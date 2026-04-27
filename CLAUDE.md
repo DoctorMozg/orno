@@ -47,7 +47,7 @@ After any batch of edits — before reporting the task as done — run the full 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 cargo deny check
 cargo machete
 typos

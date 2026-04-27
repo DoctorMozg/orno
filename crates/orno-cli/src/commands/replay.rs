@@ -76,6 +76,25 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
         .context("expanding MCP tool wildcards from recorded tape")?;
 
+    // Replay must never mutate the host filesystem or hit the network,
+    // regardless of what the bundle's embedded pipeline YAML claims.
+    // Force both policy flags off on every agent config so a malicious
+    // or stale bundle cannot smuggle a live mutation past replay's
+    // bounded-non-determinism guarantee.
+    let had_mutations = pipeline.agents.values().any(|a| a.policy.allow_mutations);
+    let had_network = pipeline.agents.values().any(|a| a.policy.allow_network);
+    for agent_cfg in pipeline.agents.values_mut() {
+        agent_cfg.policy.allow_mutations = false;
+        agent_cfg.policy.allow_network = false;
+    }
+    if had_mutations || had_network {
+        tracing::info!(
+            had_mutations,
+            had_network,
+            "replay: allow_mutations and allow_network overridden to false (bundle cannot mutate or access network)"
+        );
+    }
+
     // Replay transport is seeded directly from the bundle entries; a
     // tape miss surfaces as `LlmError::ReplayMiss` at call time.
     // No fallback to the live API — non-determinism is bounded.
