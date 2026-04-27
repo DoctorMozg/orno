@@ -1,7 +1,9 @@
 //! Small utilities used by more than one subsystem and not large enough
-//! to warrant their own module. Currently houses [`canonical_json`],
-//! the deterministic JSON serializer the record/replay layer hashes to
-//! produce tape keys.
+//! to warrant their own module.
+
+pub mod tape;
+
+pub use tape::{TapeReader, TapeWriter};
 
 /// Serialize a `serde_json::Value` with object keys in alphabetic order
 /// at every nesting level. Arrays preserve their element order; scalars
