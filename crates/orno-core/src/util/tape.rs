@@ -1,13 +1,16 @@
-//! Generic NDJSON tape I/O shared by the LLM and tool record/replay layers.
+//! Generic NDJSON tape I/O for the LLM and tool record/replay layers.
 //!
 //! Both layers persist their entries as newline-delimited JSON: one serialized
 //! struct per line, created with `O_EXCL` so stale tapes cannot be silently
 //! overwritten, and fsynced on flush so a power cut cannot corrupt the bounded
 //! non-determinism guarantee.
 //!
-//! `TapeWriter<T>` and `TapeReader<T>` centralize that file-I/O contract so
-//! neither the LLM nor the tool layer needs its own copy of the open/flush/
-//! sync/parse boilerplate.
+//! `TapeWriter<T>` and `TapeReader<T>` centralize that file-I/O contract.
+//! Migration of `llm/recording.rs`, `llm/replay.rs`, `tool/record.rs`, and
+//! `tool/replay.rs` to use these types is deferred — the LLM layer requires a
+//! redactor step between serialize and write, and the tool layer uses an
+//! `Arc<Mutex<BufWriter>>` for shared-tape writers across handlers; both need
+//! design work before the inlined boilerplate can be replaced.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -32,6 +35,15 @@ pub struct TapeWriter<T> {
     _phantom: PhantomData<T>,
 }
 
+// `BufWriter<File>` does not implement `Debug`, so derive cannot cover this.
+impl<T> std::fmt::Debug for TapeWriter<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TapeWriter")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: Serialize> TapeWriter<T> {
     /// Create a new tape at `path`, failing if the file already exists.
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
@@ -54,6 +66,9 @@ impl<T: Serialize> TapeWriter<T> {
         })
     }
 
+    /// Path the tape is being written to. Primarily useful for tests
+    /// that need to round-trip through a [`TapeReader`].
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -107,5 +122,130 @@ impl<T: DeserializeOwned> TapeReader<T> {
             entries.push(entry);
         }
         Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use serde::{Deserialize, Serialize};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Entry {
+        key: String,
+        value: u32,
+    }
+
+    fn tmp_path(dir: &TempDir) -> PathBuf {
+        dir.path().join("tape.ndjson")
+    }
+
+    #[test]
+    fn round_trip_preserves_order() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+
+        let entries = vec![
+            Entry {
+                key: "a".into(),
+                value: 1,
+            },
+            Entry {
+                key: "b".into(),
+                value: 2,
+            },
+            Entry {
+                key: "c".into(),
+                value: 3,
+            },
+        ];
+
+        let mut writer = TapeWriter::create(&path).unwrap();
+        for e in &entries {
+            writer.write(e).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
+        assert_eq!(loaded, entries);
+    }
+
+    #[test]
+    fn create_fails_when_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        // Pre-create the file so the second open must fail.
+        std::fs::write(&path, b"").unwrap();
+
+        let err = TapeWriter::<Entry>::create(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_sets_mode_0o600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        let mut w = TapeWriter::<Entry>::create(&path).unwrap();
+        w.flush().unwrap();
+        let perm = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(
+            perm.mode() & 0o777,
+            0o600,
+            "tape file must not be world-readable"
+        );
+    }
+
+    #[test]
+    fn load_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        let line = serde_json::to_string(&Entry {
+            key: "x".into(),
+            value: 7,
+        })
+        .unwrap();
+        std::fs::write(&path, format!("{line}\n\n{line}\n")).unwrap();
+
+        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn load_reports_path_and_lineno_on_corrupt_entry() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        let good = serde_json::to_string(&Entry {
+            key: "ok".into(),
+            value: 0,
+        })
+        .unwrap();
+        std::fs::write(&path, format!("{good}\nnot-json\n")).unwrap();
+
+        let err = TapeReader::<Entry>::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(path.display().to_string().as_str()),
+            "error should name the tape file: {msg}"
+        );
+        assert!(
+            msg.contains(":2:"),
+            "error should include 1-indexed line number: {msg}"
+        );
+    }
+
+    #[test]
+    fn flush_on_empty_writer_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_path(&dir);
+        let mut writer = TapeWriter::<Entry>::create(&path).unwrap();
+        writer.flush().unwrap();
+        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
+        assert!(loaded.is_empty());
     }
 }
