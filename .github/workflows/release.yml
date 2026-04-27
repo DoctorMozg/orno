@@ -21,10 +21,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft)
+        # TODO: pin to SHA. Run:
+        #   gh api repos/softprops/action-gh-release/git/refs/tags/v2 --jq .object.sha
+        # to obtain the commit SHA, then replace `@v2` with `@<sha> # v2`.
         uses: softprops/action-gh-release@v2
         with:
-          draft: false
+          # Created as draft so consumers cannot pull a release whose binary
+          # assets have not finished uploading yet (see publish-release below).
+          draft: true
           prerelease: ${{ contains(github.ref, '-') }}
           generate_release_notes: true
 
@@ -33,7 +38,9 @@ jobs:
     needs: create-release
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      # Default fail-fast (true) prevents publishing a release with a partial
+      # asset matrix: any platform failure aborts the rest, leaving the draft
+      # in place for manual triage rather than auto-publishing later.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -48,6 +55,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # TODO: pin to SHA. Run:
+      #   gh api repos/taiki-e/upload-rust-binary-action/git/refs/tags/v1 --jq .object.sha
+      # to obtain the commit SHA, then replace `@v1` with `@<sha> # v1`.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: orno
@@ -58,11 +68,34 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256
 
+  publish-release:
+    name: publish release
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release (un-draft)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Flip draft to false only after every matrix asset has uploaded.
+          # Until this step runs, install.sh's "latest release" lookup will
+          # not see the tag, so users cannot pull an incomplete release.
+          gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+
   update-major-tag:
     name: update major tag
-    needs: [create-release, upload-assets]
+    needs: publish-release
     runs-on: ubuntu-latest
     if: ${{ !contains(github.ref, '-') }}
+    # Serialize concurrent runs against the same ref so two overlapping
+    # releases cannot race on `git push -f origin <major>` and end up with
+    # a major tag that points at the wrong commit.
+    concurrency:
+      group: release-major-tag-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -74,6 +107,14 @@ jobs:
           FULL_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # Reject anything that doesn't look like a clean release tag before
+          # we feed it to git -- the `if:` above already filters prereleases,
+          # but a defense-in-depth check stops a malformed ref from reaching
+          # `git tag -f`.
+          if ! echo "$FULL_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: unexpected tag format: $FULL_TAG" >&2
+            exit 1
+          fi
           major="${FULL_TAG%%.*}"
           if [ -z "$major" ] || [ "$major" = "$FULL_TAG" ]; then
             echo "could not derive major tag from $FULL_TAG" >&2

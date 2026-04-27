@@ -35,7 +35,18 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p "$ORNO_INSTALL_DIR"
-        REF="${ORNO_VERSION:-master}"
+        # Never silently default to master: fall back to the SHA the caller pinned
+        # in their workflow (uses: DoctorMozg/orno@<ref>) via GITHUB_ACTION_REF,
+        # which the runner sets automatically for composite actions.
+        if [ -n "${ORNO_VERSION:-}" ]; then
+          REF="$ORNO_VERSION"
+        elif [ -n "${GITHUB_ACTION_REF:-}" ]; then
+          REF="$GITHUB_ACTION_REF"
+          echo "::warning::ORNO_VERSION not set; using caller-pinned ref: $REF"
+        else
+          REF="master"
+          echo "::warning::ORNO_VERSION and GITHUB_ACTION_REF both empty; falling back to master (insecure)"
+        fi
         curl --proto '=https' --tlsv1.2 -fsSL \
           "https://raw.githubusercontent.com/DoctorMozg/orno/${REF}/install.sh" | bash
         echo "$ORNO_INSTALL_DIR" >> "$GITHUB_PATH"
@@ -57,6 +68,18 @@ runs:
         if [ -n "$ORNO_SECRETS_FILE" ]; then
           secrets_flag=(--secrets-file "$ORNO_SECRETS_FILE")
         fi
-        # ORNO_EXTRA_ARGS is intentionally unquoted so users can pass multiple flags.
-        # shellcheck disable=SC2086
-        orno "$ORNO_COMMAND" "$ORNO_PIPELINE" "${secrets_flag[@]}" $ORNO_EXTRA_ARGS
+        # Build the args array safely: prefer JSON array form so a value like
+        # `--flag "value with spaces"` cannot inject extra flags via word-splitting
+        # of attacker-controlled input. Fall back to whitespace splitting only
+        # when the caller did not supply JSON (preserves legacy ergonomics).
+        args_arr=()
+        if [ -n "$ORNO_EXTRA_ARGS" ]; then
+          if echo "$ORNO_EXTRA_ARGS" | grep -q '^\['; then
+            while IFS= read -r arg; do
+              args_arr+=("$arg")
+            done < <(echo "$ORNO_EXTRA_ARGS" | jq -r '.[]' 2>/dev/null || echo "$ORNO_EXTRA_ARGS")
+          else
+            read -ra args_arr <<< "$ORNO_EXTRA_ARGS"
+          fi
+        fi
+        orno "$ORNO_COMMAND" "$ORNO_PIPELINE" "${secrets_flag[@]}" "${args_arr[@]}"
