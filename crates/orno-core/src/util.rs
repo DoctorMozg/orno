@@ -11,7 +11,7 @@
 /// # Why this exists
 ///
 /// Tape-key derivation in [`crate::llm::replay`] and
-/// [`crate::tool::recording`] hashes the request payload to derive a
+/// [`crate::tool::record`] hashes the request payload to derive a
 /// stable replay key. Nested JSON objects in the payload — for example
 /// tool argument schemas produced by `schemars` — are not guaranteed
 /// to emit keys in the same order across crate versions. Without a

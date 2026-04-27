@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 use tracing::{instrument, warn};
 
 use crate::error::NodeError;
@@ -168,30 +169,8 @@ impl NodeExecutor for ShellExecutor {
             source: Box::new(e),
         })?;
 
-        let (stdout_buf, stdout_total) = stdout_handle
-            .await
-            .map_err(|e| NodeError::Execution {
-                id: id.to_string(),
-                source: Box::new(std::io::Error::other(format!(
-                    "stdout reader task panicked: {e}",
-                ))),
-            })?
-            .map_err(|e| NodeError::Execution {
-                id: id.to_string(),
-                source: Box::new(e),
-            })?;
-        let (stderr_buf, stderr_total) = stderr_handle
-            .await
-            .map_err(|e| NodeError::Execution {
-                id: id.to_string(),
-                source: Box::new(std::io::Error::other(format!(
-                    "stderr reader task panicked: {e}",
-                ))),
-            })?
-            .map_err(|e| NodeError::Execution {
-                id: id.to_string(),
-                source: Box::new(e),
-            })?;
+        let (stdout_buf, stdout_total) = join_pipe_handle(stdout_handle, id, "stdout").await?;
+        let (stderr_buf, stderr_total) = join_pipe_handle(stderr_handle, id, "stderr").await?;
 
         if let Some(handle) = writer_handle {
             match handle.await {
@@ -212,42 +191,10 @@ impl NodeExecutor for ShellExecutor {
         // alongside the captured total so a downstream tool can
         // surface "captured / cap" without a follow-up query.
         if stdout_total > cap {
-            warn!(
-                node.id = %id,
-                stream = "stdout",
-                captured_bytes = stdout_total,
-                cap_bytes = cap,
-                "shell node stdout truncated to cap",
-            );
-            self.sink
-                .record(Event::NodeOutputTruncated {
-                    run_id: run_id.to_string(),
-                    node_id: id.to_string(),
-                    node_kind: "shell".to_string(),
-                    stream: "stdout".to_string(),
-                    captured_bytes: stdout_total as u64,
-                    cap_bytes: cap as u64,
-                })
-                .await;
+            emit_truncation(&self.sink, run_id, id, "stdout", stdout_total, cap).await;
         }
         if stderr_total > cap {
-            warn!(
-                node.id = %id,
-                stream = "stderr",
-                captured_bytes = stderr_total,
-                cap_bytes = cap,
-                "shell node stderr truncated to cap",
-            );
-            self.sink
-                .record(Event::NodeOutputTruncated {
-                    run_id: run_id.to_string(),
-                    node_id: id.to_string(),
-                    node_kind: "shell".to_string(),
-                    stream: "stderr".to_string(),
-                    captured_bytes: stderr_total as u64,
-                    cap_bytes: cap as u64,
-                })
-                .await;
+            emit_truncation(&self.sink, run_id, id, "stderr", stderr_total, cap).await;
         }
 
         let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
@@ -271,6 +218,67 @@ impl NodeExecutor for ShellExecutor {
             }),
         })
     }
+}
+
+/// Resolve a pipe-reader join handle into the captured bytes and the
+/// child's total write count, mapping both the join failure and the
+/// inner I/O failure into a `NodeError::Execution` keyed on the node
+/// id. `stream` names the pipe in the panic message so the failure
+/// surface keeps stdout / stderr distinguishable.
+async fn join_pipe_handle(
+    handle: JoinHandle<std::io::Result<(Vec<u8>, usize)>>,
+    id: &str,
+    stream: &str,
+) -> Result<(Vec<u8>, usize), NodeError> {
+    handle
+        .await
+        .map_err(|e| NodeError::Execution {
+            id: id.to_string(),
+            source: Box::new(std::io::Error::other(format!(
+                "{stream} reader task panicked: {e}",
+            ))),
+        })?
+        .map_err(|e| NodeError::Execution {
+            id: id.to_string(),
+            source: Box::new(e),
+        })
+}
+
+/// Log and emit a single `NodeOutputTruncated` envelope for one of the
+/// child's pipes. The captured total is reported alongside the cap so
+/// downstream tools can render "captured / cap" without a follow-up
+/// lookup.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private helper extracted from execute(); each arg is a distinct \
+              primitive identifier (run_id, node id, stream name, totals, cap) \
+              and bundling them into a struct would only push the same six \
+              fields one indirection away"
+)]
+async fn emit_truncation(
+    sink: &Arc<dyn EventSink>,
+    run_id: &str,
+    id: &str,
+    stream: &str,
+    total: usize,
+    cap: usize,
+) {
+    warn!(
+        node.id = %id,
+        stream = stream,
+        captured_bytes = total,
+        cap_bytes = cap,
+        "shell node output truncated to cap",
+    );
+    sink.record(Event::NodeOutputTruncated {
+        run_id: run_id.to_string(),
+        node_id: id.to_string(),
+        node_kind: "shell".to_string(),
+        stream: stream.to_string(),
+        captured_bytes: total as u64,
+        cap_bytes: cap as u64,
+    })
+    .await;
 }
 
 /// Stream a child pipe into a `Vec<u8>` capped at `cap` bytes. Returns

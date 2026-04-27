@@ -12,7 +12,7 @@ orno is a Rust workspace with two crates: `orno-core` (library) and `orno-cli` (
 ## Build from source
 
 ```bash
-git clone https://github.com/<owner>/orno.git
+git clone https://github.com/DoctorMozg/orno.git
 cd orno
 cargo build --release -p orno-cli
 ./target/release/orno --help

@@ -3,16 +3,16 @@ resolver = "2"
 members = ["crates/orno-core", "crates/orno-cli"]
 
 [workspace.package]
-version = "0.0.1-dev"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
-repository = "https://github.com/drmozg/orno"
+repository = "https://github.com/DoctorMozg/orno"
 authors = ["Stanislav Gonorovskii"]
 
 [workspace.dependencies]
 # Intra-workspace
-orno-core = { path = "crates/orno-core", version = "0.0.1-dev" }
+orno-core = { path = "crates/orno-core", version = "0.1.0" }
 
 # Errors
 thiserror = "2"
