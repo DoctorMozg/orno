@@ -26,11 +26,16 @@ genai = { workspace = true }
 blake3 = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
+aho-corasick = { workspace = true }
+lru = { workspace = true }
 async-trait = "0.1"
+# `tempfile::NamedTempFile` is used by the `EditHandler` / `WriteHandler`
+# atomic-write path in production, so the dep stays in `[dependencies]`
+# rather than `[dev-dependencies]`.
+tempfile = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
-tempfile = { workspace = true }
 # Used in tests to capture and assert on `tracing::warn!` output from
 # failure paths inside the engine. Production code only depends on the
 # `tracing` macro crate; this is test-only.

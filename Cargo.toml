@@ -101,6 +101,20 @@ rmcp = { version = "1.5", default-features = false, features = [
 # provider+model pair indexes `ReplayTransport`'s in-memory map.
 blake3 = "1"
 
+# Multi-pattern substring matcher used by the per-run secret `Redactor`.
+# `regex` already pulls aho-corasick 1.x transitively, so adding a direct
+# dep does not multiply versions in the lock file. `std` is required for
+# the standard `AhoCorasick::new` constructor; `perf-literal` opts into
+# the memchr-backed fast path which is the whole point of using this
+# crate over a hand-rolled scan.
+aho-corasick = { version = "1", default-features = false, features = ["std", "perf-literal"] }
+
+# LRU eviction cache for `TemplateEngine`. Caps the number of compiled
+# MiniJinja templates so a long-lived engine cannot grow without bound.
+# `default-features = false` keeps the hashbrown backend in place and
+# omits the optional `serde` support that orno does not need.
+lru = { version = "0.12", default-features = false }
+
 # Tape I/O for `RecordingTransport` / `ReplayTransport` tests. Used from
 # integration tests and from round-trip unit tests — pulled at workspace
 # level so both crates share the same version.
