@@ -159,6 +159,31 @@ pub struct AgentPolicy {
     #[serde(default)]
     pub blocked_domains: Vec<String>,
     pub on_parse_error: OnParseError,
+    /// Filesystem roots the `Read` / `Write` / `Edit` builtins are
+    /// jailed to. When the agent's `allowed_tools` list contains any
+    /// of those names, this list must be non-empty — `LoopAgent`
+    /// rejects with `AgentError::InvalidPolicy` at run start.
+    /// Currently only `roots[0]` is consulted; multi-root agents are
+    /// a v0.2+ extension.
+    #[serde(default)]
+    pub roots: Vec<std::path::PathBuf>,
+    /// Soft cap on the approximate byte size of the accumulated
+    /// conversation history (sum of content lengths across all
+    /// `OrnoChatMessage` variants). When the history exceeds this
+    /// threshold after a push, the loop evicts the oldest messages
+    /// until the history is back under the cap, always retaining the
+    /// two most recent messages so the model sees at least one
+    /// request-response round.
+    ///
+    /// `None` disables the cap (not recommended for long-running agents).
+    /// The default (4 MiB) is generous enough for normal tool-call loops
+    /// and tight enough to prevent multi-gigabyte prompt payloads.
+    #[serde(default = "default_max_message_history_bytes")]
+    pub max_message_history_bytes: Option<usize>,
+}
+
+fn default_max_message_history_bytes() -> Option<usize> {
+    Some(4 * 1024 * 1024)
 }
 
 /// What the loop does when the model returns malformed JSON for a

@@ -27,20 +27,25 @@ pub use loop_agent::{LoopAgent, LoopAgentConfig};
 /// `crate::node::AgentNodeRequest` but is independent of `NodeRequest`
 /// so the seam is not coupled to node dispatch — a future embedder can
 /// drive `Agent` directly without constructing a `NodeRequest`.
+///
+/// Immutable string fields (`provider`, `model`, `system`,
+/// `initial_prompt`) are `Arc<str>` / `Option<Arc<str>>` so cloning the
+/// struct per-iteration inside `LoopAgent::run` is a pointer bump rather
+/// than a heap allocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     /// Named reference from the pipeline's `agents:` map. Kept for
     /// diagnostics and subagent-event correlation.
     pub agent_name: String,
     /// First user message, already rendered.
-    pub initial_prompt: String,
+    pub initial_prompt: Arc<str>,
     /// System prompt, already rendered. `None` when the agent config
     /// omits `system:`.
-    pub system: Option<String>,
+    pub system: Option<Arc<str>>,
     /// `LlmTransport` provider key.
-    pub provider: String,
+    pub provider: Arc<str>,
     /// Provider-side model identifier.
-    pub model: String,
+    pub model: Arc<str>,
     /// Strictness knobs. Enforced inside the agent impl.
     pub policy: AgentPolicy,
     /// Tool allowlist. Each name must match a `ToolHandler` registered
