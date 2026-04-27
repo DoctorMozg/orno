@@ -73,7 +73,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMo
 
 The script downloads `orno` from GitHub Releases into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin` or pin a version with `ORNO_VERSION=v0.1.0`.
 
-Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
+Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
 
 ### Use as a GitHub Action
 
