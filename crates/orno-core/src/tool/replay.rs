@@ -5,11 +5,11 @@
 //! is what makes it usable as the bounded-non-determinism guarantee
 //! in the strictness contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -23,14 +23,24 @@ use crate::error::ToolError;
 /// calling the real handler. A tape miss is a hard error.
 pub struct ReplayToolHandler {
     inner: Arc<dyn ToolHandler>,
-    entries: HashMap<String, ToolTapeEntry>,
+    // Per-key FIFO of recorded entries: an agent that calls the same
+    // tool twice with byte-identical args (same `tool_name`, `call_id`,
+    // canonical args JSON) produced two tape entries on the live run,
+    // and replay must hand them back in order. A flat
+    // `HashMap<_, ToolTapeEntry>` collapsed those into one entry,
+    // silently dropping every duplicate after the first.
+    entries: Mutex<HashMap<String, VecDeque<ToolTapeEntry>>>,
 }
 
 impl std::fmt::Debug for ReplayToolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let entry_count = self
+            .entries
+            .lock()
+            .map_or(0, |guard| guard.values().map(VecDeque::len).sum::<usize>());
         f.debug_struct("ReplayToolHandler")
             .field("tool", &self.inner.name())
-            .field("entries", &self.entries.len())
+            .field("entries", &entry_count)
             .finish()
     }
 }
@@ -46,7 +56,7 @@ impl ReplayToolHandler {
         let path_ref = path.as_ref();
         let path_disp = path_ref.display().to_string();
         let file = File::open(path_ref)?;
-        let mut entries = HashMap::new();
+        let mut entries: HashMap<String, VecDeque<ToolTapeEntry>> = HashMap::new();
         for (lineno, line) in BufReader::new(file).lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
@@ -54,9 +64,20 @@ impl ReplayToolHandler {
             }
             let entry: ToolTapeEntry = serde_json::from_str(&line)
                 .map_err(|e| std::io::Error::other(format!("{path_disp}:{}: {e}", lineno + 1)))?;
-            entries.insert(entry.key.clone(), entry);
+            let key = entry.key.clone();
+            let deque = entries.entry(key.clone()).or_default();
+            if !deque.is_empty() {
+                tracing::warn!(
+                    key_prefix = %&key[..20.min(key.len())],
+                    "duplicate tool tape key detected on load — replay will return entries in sequence"
+                );
+            }
+            deque.push_back(entry);
         }
-        Ok(Self { inner, entries })
+        Ok(Self {
+            inner,
+            entries: Mutex::new(entries),
+        })
     }
 
     /// In-memory constructor — skips file I/O. Useful when entries
@@ -64,11 +85,33 @@ impl ReplayToolHandler {
     /// standalone tape file on disk.
     #[must_use]
     pub fn from_entries(inner: Arc<dyn ToolHandler>, entries: Vec<ToolTapeEntry>) -> Self {
-        let map = entries.into_iter().map(|e| (e.key.clone(), e)).collect();
+        let mut map: HashMap<String, VecDeque<ToolTapeEntry>> = HashMap::new();
+        for entry in entries {
+            let key = entry.key.clone();
+            let deque = map.entry(key.clone()).or_default();
+            if !deque.is_empty() {
+                tracing::warn!(
+                    key_prefix = %&key[..20.min(key.len())],
+                    "duplicate tool tape key detected on load — replay will return entries in sequence"
+                );
+            }
+            deque.push_back(entry);
+        }
         Self {
             inner,
-            entries: map,
+            entries: Mutex::new(map),
         }
+    }
+
+    /// Pop the next recorded entry for `key`. Each tape entry is
+    /// consumed exactly once; subsequent calls with the same key
+    /// surface as a tape miss once the FIFO is drained.
+    fn consume(&self, key: &str) -> Option<ToolTapeEntry> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(key)?
+            .pop_front()
     }
 }
 
@@ -89,22 +132,19 @@ impl ToolHandler for ReplayToolHandler {
 
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let key = tool_tape_key(self.inner.name(), inv.call_id, &args);
-        let entry = self
-            .entries
-            .get(&key)
-            .ok_or_else(|| ToolError::Invocation {
-                name: self.inner.name().to_string(),
-                source: Box::new(std::io::Error::other(format!(
-                    "tool tape miss for key `{key}` — was this call recorded?"
-                ))),
-            })?;
+        let entry = self.consume(&key).ok_or_else(|| ToolError::Invocation {
+            name: self.inner.name().to_string(),
+            source: Box::new(std::io::Error::other(format!(
+                "tool tape miss for key `{key}` — was this call recorded?"
+            ))),
+        })?;
 
-        if let Some(content) = &entry.content {
-            Ok(content.clone())
-        } else if let Some(err_msg) = &entry.error {
+        if let Some(content) = entry.content {
+            Ok(content)
+        } else if let Some(err_msg) = entry.error {
             Err(ToolError::Invocation {
                 name: self.inner.name().to_string(),
-                source: Box::new(std::io::Error::other(err_msg.clone())),
+                source: Box::new(std::io::Error::other(err_msg)),
             })
         } else {
             Err(ToolError::Invocation {
@@ -191,8 +231,11 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_success() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingToolHandler::create` opens with `O_EXCL`, so the
+        // tape path must not exist before the call. Use a fresh
+        // subdirectory and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
 
         let rec = RecordingToolHandler::create(
             Arc::new(EchoHandler),
@@ -218,8 +261,11 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_error() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingToolHandler::create` opens with `O_EXCL`, so the
+        // tape path must not exist before the call. Use a fresh
+        // subdirectory and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
 
         let rec = RecordingToolHandler::create(
             Arc::new(AlwaysErrHandler),
@@ -243,8 +289,11 @@ mod tests {
 
     #[tokio::test]
     async fn tape_miss_returns_error() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingToolHandler::create` opens with `O_EXCL`, so the
+        // tape path must not exist before the call. Use a fresh
+        // subdirectory and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
 
         // Write a tape with call_id "c1"
         let rec = RecordingToolHandler::create(

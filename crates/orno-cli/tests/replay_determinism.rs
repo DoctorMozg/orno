@@ -115,8 +115,12 @@ fn validate_pr_review_yaml_succeeds() {
 
 #[test]
 fn record_then_replay_produces_identical_event_type_sequence() {
-    let tape = tempfile::NamedTempFile::new().expect("tempfile for tape");
-    let tape_path = tape.path().to_str().expect("utf8 tape path");
+    // `NamedTempFile::new()` creates the file immediately; `create_new(true)`
+    // in `RecordingTransport` would refuse to overwrite it.  Use a tempdir
+    // instead and hand a non-existent path inside it to `--record-tape`.
+    let tape_dir = tempfile::tempdir().expect("tempdir for tape");
+    let tape_path_buf = tape_dir.path().join("tape.ndjson");
+    let tape_path = tape_path_buf.to_str().expect("utf8 tape path");
 
     // Phase 1: record — run hello.yaml with DummyTransport and capture the
     // LLM tape. `--record-tape` wraps DummyTransport in RecordingTransport
@@ -134,7 +138,9 @@ fn record_then_replay_produces_identical_event_type_sequence() {
         String::from_utf8(record_assert.get_output().stdout.clone()).expect("utf8 stdout");
 
     // Sanity: tape must be non-empty (i.e. at least one LLM call was made).
-    let tape_bytes = std::fs::metadata(tape.path()).expect("tape metadata").len();
+    let tape_bytes = std::fs::metadata(&tape_path_buf)
+        .expect("tape metadata")
+        .len();
     assert!(
         tape_bytes > 0,
         "record tape should be non-empty after a run with an agent node",
@@ -250,8 +256,9 @@ nodes:
     file.flush().expect("flush");
     let pipeline_path = file.path().to_str().expect("utf8 pipeline path");
 
-    let tape = tempfile::NamedTempFile::new().expect("tape tempfile");
-    let tape_path = tape.path().to_str().expect("utf8 tape path");
+    let tape_dir = tempfile::tempdir().expect("tempdir for tape");
+    let tape_path_buf = tape_dir.path().join("tape.ndjson");
+    let tape_path = tape_path_buf.to_str().expect("utf8 tape path");
 
     let record_assert = orno()
         .args(["run", "--record-tape", tape_path, pipeline_path])
@@ -304,8 +311,9 @@ fn three_subagent_run_record_then_replay_preserves_event_sequence() {
     let scripted_file = tempfile::NamedTempFile::new().expect("scripted tempfile");
     std::fs::write(scripted_file.path(), &scripted_json).expect("write scripted tape");
 
-    let tape = tempfile::NamedTempFile::new().expect("tape tempfile");
-    let tape_path = tape.path().to_str().expect("utf8 tape path");
+    let tape_dir = tempfile::tempdir().expect("tempdir for tape");
+    let tape_path_buf = tape_dir.path().join("tape.ndjson");
+    let tape_path = tape_path_buf.to_str().expect("utf8 tape path");
 
     // Phase 1: record — run three-lens.yaml with ScriptedTransport and
     // capture the LLM tape.
@@ -339,7 +347,9 @@ fn three_subagent_run_record_then_replay_preserves_event_sequence() {
     );
 
     // Tape must be non-empty.
-    let tape_bytes = std::fs::metadata(tape.path()).expect("tape metadata").len();
+    let tape_bytes = std::fs::metadata(&tape_path_buf)
+        .expect("tape metadata")
+        .len();
     assert!(
         tape_bytes > 0,
         "LLM tape must be non-empty after subagent run"

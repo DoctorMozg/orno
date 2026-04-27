@@ -15,10 +15,11 @@
 //! branching decision in the live run replays as the same failure
 //! without ever touching the network.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 
@@ -30,7 +31,13 @@ use super::{LlmRequest, LlmResponse, LlmTransport};
 
 #[derive(Debug)]
 pub struct ReplayTransport {
-    entries: HashMap<String, TapeOutcome>,
+    // Per-key FIFO of recorded outcomes: a pipeline that issues the
+    // same request twice (same provider, model, prompt, message
+    // history, sampling knobs) produced two tape entries on the live
+    // run, and replay must hand them back in the same order. A flat
+    // `HashMap<_, TapeOutcome>` collapsed those entries into one,
+    // silently dropping every duplicate after the first.
+    entries: Mutex<HashMap<String, VecDeque<TapeOutcome>>>,
 }
 
 impl ReplayTransport {
@@ -46,7 +53,7 @@ impl ReplayTransport {
                 e,
             ))
         })?;
-        let mut entries = HashMap::new();
+        let mut entries: HashMap<String, VecDeque<TapeOutcome>> = HashMap::new();
         for (lineno, line) in BufReader::new(file).lines().enumerate() {
             let line = line.map_err(|e| {
                 LlmError::ConfigError(format!("tape read error on line {}: {}", lineno + 1, e))
@@ -57,19 +64,51 @@ impl ReplayTransport {
             let entry: TapeEntry = serde_json::from_str(&line).map_err(|e| {
                 LlmError::ConfigError(format!("tape parse error on line {}: {}", lineno + 1, e))
             })?;
-            entries.insert(tape_key(&entry.req), entry.outcome);
+            let key = tape_key(&entry.req);
+            let deque = entries.entry(key.clone()).or_default();
+            if !deque.is_empty() {
+                tracing::warn!(
+                    key_prefix = %&key[..20.min(key.len())],
+                    "duplicate tape key detected on load — replay will return entries in sequence"
+                );
+            }
+            deque.push_back(entry.outcome);
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries: Mutex::new(entries),
+        })
     }
 
     /// In-memory constructor for tests — skips file I/O.
     #[must_use]
     pub fn from_entries(entries: Vec<TapeEntry>) -> Self {
-        let map = entries
-            .into_iter()
-            .map(|e| (tape_key(&e.req), e.outcome))
-            .collect();
-        Self { entries: map }
+        let mut map: HashMap<String, VecDeque<TapeOutcome>> = HashMap::new();
+        for entry in entries {
+            let key = tape_key(&entry.req);
+            let deque = map.entry(key.clone()).or_default();
+            if !deque.is_empty() {
+                tracing::warn!(
+                    key_prefix = %&key[..20.min(key.len())],
+                    "duplicate tape key detected on load — replay will return entries in sequence"
+                );
+            }
+            deque.push_back(entry.outcome);
+        }
+        Self {
+            entries: Mutex::new(map),
+        }
+    }
+
+    /// Pop the next recorded outcome for `key`. Each tape entry is
+    /// consumed exactly once; subsequent calls with the same key
+    /// surface as `ReplayMiss` once the FIFO is drained, which is the
+    /// load-bearing property for duplicate-request replay.
+    fn consume(&self, key: &str) -> Option<TapeOutcome> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(key)?
+            .pop_front()
     }
 }
 
@@ -77,8 +116,8 @@ impl ReplayTransport {
 impl LlmTransport for ReplayTransport {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
         let key = tape_key(&req);
-        match self.entries.get(&key) {
-            Some(TapeOutcome::Ok { res }) => Ok(res.clone()),
+        match self.consume(&key) {
+            Some(TapeOutcome::Ok { res }) => Ok(res),
             Some(TapeOutcome::Err { err }) => Err(err.to_llm_error(&req.provider, &req.model)),
             None => Err(LlmError::ReplayMiss { key }),
         }
@@ -138,8 +177,11 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_dummy_to_replay_is_bit_identical() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let rec = RecordingTransport::create(
             Arc::new(DummyTransport),
             &path,
@@ -288,8 +330,11 @@ mod tests {
         }
 
         let calls = Arc::new(Mutex::new(0_usize));
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
 
         let rec = RecordingTransport::create(
             Arc::new(ApiFailure {
