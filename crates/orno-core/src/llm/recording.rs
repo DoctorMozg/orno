@@ -83,9 +83,10 @@ pub enum TapeOutcome {
 }
 
 impl RecordingTransport {
-    /// Create or truncate the tape file at `path` and wrap `inner`.
-    /// Parent directory must exist — the tape file itself is created
-    /// or truncated by this call.
+    /// Create the tape file at `path` and wrap `inner`. Parent
+    /// directory must exist; the path itself must not exist —
+    /// `O_EXCL` forces an explicit caller decision about reusing a
+    /// stale tape.
     ///
     /// `redactor` is applied to every tape entry before it is written
     /// to disk. Pass `Arc::new(Redactor::default())` when recording
@@ -96,11 +97,23 @@ impl RecordingTransport {
         redactor: Arc<Redactor>,
     ) -> Result<Self, std::io::Error> {
         let path = path.into();
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let file = {
+            let mut opts = OpenOptions::new();
+            // `create_new` (O_EXCL) prevents a local attacker from
+            // pre-creating a symlink at the tape path that would
+            // redirect writes elsewhere; if a stale tape sits at the
+            // path the caller must delete it before re-recording.
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Tape files capture full LLM payloads (prompts,
+                // responses, tool args) — they must not be world-
+                // readable on shared hosts.
+                opts.mode(0o600);
+            }
+            opts.open(&path)?
+        };
         Ok(Self {
             inner,
             tape: Arc::new(Mutex::new(BufWriter::new(file))),
@@ -120,8 +133,16 @@ impl RecordingTransport {
     /// tape must survive a crash mid-run. `Drop` flushes too, but
     /// silently — errors get lost.
     pub fn flush(&self) -> Result<(), std::io::Error> {
-        let mut guard = self.tape.lock().expect("tape mutex poisoned");
-        guard.flush()
+        let mut guard = self
+            .tape
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.flush()?;
+        // fsync: a `BufWriter::flush` only pushes bytes to the kernel;
+        // without `sync_all` the OS page cache can lose the tape across
+        // a power cut, breaking the bounded-non-determinism guarantee
+        // when replay runs against an apparently-flushed file.
+        guard.get_mut().sync_all()
     }
 
     /// Serialize one tape entry, redact, and write as an NDJSON line.
@@ -164,7 +185,16 @@ impl LlmTransport for RecordingTransport {
                 // persisted (disk full, file vanished), surface the
                 // tape error rather than the original — the missing
                 // tape line is the more dangerous failure for replay.
-                self.write_entry(&entry)?;
+                // Log the original LLM error first so it is not
+                // silently lost when the tape-write failure replaces
+                // it on the wire.
+                if let Err(tape_err) = self.write_entry(&entry) {
+                    tracing::warn!(
+                        original_error = ?err,
+                        "original LLM error masked by tape-write failure; see tape error below"
+                    );
+                    return Err(tape_err);
+                }
                 Err(err)
             },
         }
@@ -179,8 +209,11 @@ mod tests {
 
     #[tokio::test]
     async fn writes_ndjson_entry_per_call() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let rec = RecordingTransport::create(
             Arc::new(DummyTransport),
             &path,
@@ -232,8 +265,11 @@ mod tests {
     async fn secret_not_written_to_tape() {
         use std::collections::BTreeMap;
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let mut secrets = BTreeMap::new();
         secrets.insert("api_key".to_string(), "sk-secret-abc123".to_string());
         let rec = RecordingTransport::create(
@@ -301,8 +337,11 @@ mod tests {
         // surfaces to the caller. Both paths must hold — hiding the
         // failure from the tape breaks replay determinism; hiding it
         // from the caller breaks the agent loop's error handling.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let rec = RecordingTransport::create(
             Arc::new(FailingTransport {
                 kind: ErrorKind::AuthFailed,
@@ -346,8 +385,11 @@ mod tests {
         // A provider that returns megabytes of debug HTML must not
         // flood the tape file. The recorded excerpt is bounded by
         // `RECORDED_API_BODY_EXCERPT_BYTES`.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let huge = "x".repeat(10 * RECORDED_API_BODY_EXCERPT_BYTES);
         let rec = RecordingTransport::create(
             Arc::new(FailingTransport {
@@ -408,8 +450,11 @@ mod tests {
         // valid `TapeOutcome::Err` discriminator — a subtle wire-
         // format regression would surface here as a deserialization
         // error rather than a typed match failure.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let path = tmp.path().to_path_buf();
+        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
+        // path must not exist before the call. Use a fresh subdirectory
+        // and pick an unused filename inside it.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
         let rec = RecordingTransport::create(
             Arc::new(FailingTransport {
                 kind: ErrorKind::RateLimited,
