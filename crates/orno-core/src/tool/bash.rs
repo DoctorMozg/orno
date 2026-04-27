@@ -1,6 +1,7 @@
 //! `Bash` tool — run a shell command. Requires both
 //! `allow_mutations` and `allow_network`.
 
+use std::fmt::Write as _;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, instrument};
 
@@ -17,12 +19,42 @@ use crate::error::ToolError;
 /// Default `timeout_secs` when the caller omits the field.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// Lower bound on `timeout_secs`. Anything below would round to zero in
+/// practice and let a runaway command never get cancelled.
+const MIN_TIMEOUT_SECS: u64 = 1;
+
+/// Upper bound on `timeout_secs`. Ten minutes is the longest the loop
+/// will wait for a single shell invocation; longer running work belongs
+/// in a dedicated `kind: shell` node where the universal node-level
+/// `timeout:` attribute applies.
+const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Per-stream cap on captured Bash output. Mirrors the agent loop's
+/// default `max_tool_output_bytes` so a runaway shell command cannot
+/// drag the next LLM request past the provider's prompt-size ceiling.
+/// The agent loop applies its own (potentially smaller) cap when the
+/// pipeline configures `max_tool_output_bytes`; this constant only
+/// bounds the bytes the handler holds in memory.
+const MAX_OUTPUT_BYTES_PER_STREAM: usize = 256 * 1024;
+
+/// Pipe drain buffer size. 8 KiB matches the task spec; a typical pipe
+/// buffer is 64 KiB on Linux so the child rarely blocks waiting for
+/// the reader between chunks.
+const READ_CHUNK_BYTES: usize = 8 * 1024;
+
+/// Allowlist of environment variables the spawned shell inherits.
+/// Everything outside this list is dropped via `Command::env_clear`
+/// so the agent cannot leak provider API keys or other host secrets
+/// into a child process. Each entry is a name the host process may
+/// or may not have set; missing entries are silently skipped.
+const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "TERM"];
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct BashArgs {
     #[schemars(description = "Shell command to execute.")]
     command: String,
-    #[schemars(description = "Max seconds to wait. Defaults to 60.")]
+    #[schemars(description = "Max seconds to wait. Must be between 1 and 600. Defaults to 60.")]
     #[serde(default)]
     timeout_secs: Option<u64>,
     #[schemars(description = "Working directory override.")]
@@ -67,6 +99,19 @@ impl ToolHandler for BashHandler {
             message: e.to_string(),
         })?;
 
+        if let Some(secs) = timeout_secs
+            && !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&secs)
+        {
+            return Err(ToolError::Invocation {
+                name: "Bash".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "timeout_secs must be between {MIN_TIMEOUT_SECS} and {MAX_TIMEOUT_SECS}",
+                    ),
+                )),
+            });
+        }
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         let mut cmd = Command::new("/bin/sh");
@@ -76,6 +121,19 @@ impl ToolHandler for BashHandler {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Drop every host environment variable, then re-export only the
+        // entries on the safe allowlist. Without this the spawned shell
+        // would inherit provider API keys (`OPENAI_API_KEY`, etc.) and
+        // any other secrets the orno process was launched with — a
+        // prompt-injected command could exfiltrate them with a single
+        // `env` or `curl`.
+        cmd.env_clear();
+        for name in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(name) {
+                cmd.env(name, val);
+            }
+        }
 
         if let Some(dir) = &cwd {
             cmd.current_dir(dir);
@@ -89,33 +147,180 @@ impl ToolHandler for BashHandler {
             "invoking shell command",
         );
 
-        let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
-            .await
-            .map_err(|_| ToolError::Invocation {
-                name: "Bash".to_string(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("command timed out after {timeout_secs}s"),
-                )),
-            })?
-            .map_err(|e| ToolError::Invocation {
-                name: "Bash".to_string(),
-                source: Box::new(e),
-            })?;
+        let RunOutcome {
+            status,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        } = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            run_with_capped_pipes(cmd),
+        )
+        .await
+        .map_err(|_| ToolError::Invocation {
+            name: "Bash".to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {timeout_secs}s"),
+            )),
+        })??;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let (exit_code_label, signal_suffix) = format_status(output.status);
+        let (exit_code_label, signal_suffix) = format_status(status);
 
         debug!(
             exit_code = exit_code_label.as_str(),
             signal_suffix = signal_suffix.as_str(),
+            stdout_truncated,
+            stderr_truncated,
             "shell command finished",
         );
 
-        Ok(format!(
-            "exit_code: {exit_code_label}{signal_suffix}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        ))
+        let mut out = String::new();
+        if stdout_truncated {
+            let _ = writeln!(
+                out,
+                "[stdout truncated at {MAX_OUTPUT_BYTES_PER_STREAM} bytes]",
+            );
+        }
+        if stderr_truncated {
+            let _ = writeln!(
+                out,
+                "[stderr truncated at {MAX_OUTPUT_BYTES_PER_STREAM} bytes]",
+            );
+        }
+        let _ = write!(
+            out,
+            "exit_code: {exit_code_label}{signal_suffix}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        Ok(out)
+    }
+}
+
+/// Outcome of a single capped Bash invocation. Bundles the child's exit
+/// status with the captured output and per-stream truncation flags so
+/// the caller can prefix the result string with the right marker.
+struct RunOutcome {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+/// Spawn the child, drain stdout and stderr concurrently into in-memory
+/// buffers each capped at `MAX_OUTPUT_BYTES_PER_STREAM`, then await
+/// the child's exit. Past the cap each reader keeps draining its pipe
+/// to a scratch buffer so the child does not block on a full PIPE
+/// buffer; the overflow bytes are counted but discarded. The outer
+/// `tokio::time::timeout` enforces wall-clock; this helper assumes it
+/// will be polled from inside that timeout (drop-cancellation kills
+/// the spawned child via `kill_on_drop`).
+async fn run_with_capped_pipes(mut cmd: Command) -> Result<RunOutcome, ToolError> {
+    let mut child = cmd.spawn().map_err(|e| ToolError::Invocation {
+        name: "Bash".to_string(),
+        source: Box::new(e),
+    })?;
+
+    let stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+    let stdout_fut = read_capped(stdout_pipe, MAX_OUTPUT_BYTES_PER_STREAM);
+    let stderr_fut = read_capped(stderr_pipe, MAX_OUTPUT_BYTES_PER_STREAM);
+    let ((stdout_buf, stdout_total), (stderr_buf, stderr_total)) =
+        tokio::try_join!(stdout_fut, stderr_fut).map_err(|e| ToolError::Invocation {
+            name: "Bash".to_string(),
+            source: Box::new(e),
+        })?;
+
+    let status = child.wait().await.map_err(|e| ToolError::Invocation {
+        name: "Bash".to_string(),
+        source: Box::new(e),
+    })?;
+
+    let stdout_truncated = stdout_total > MAX_OUTPUT_BYTES_PER_STREAM;
+    let stderr_truncated = stderr_total > MAX_OUTPUT_BYTES_PER_STREAM;
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+
+    Ok(RunOutcome {
+        status,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+/// Stream a child pipe into a `Vec<u8>` capped at `cap` bytes. Returns
+/// `(captured_buffer, total_bytes_written_by_child)`. Past the cap the
+/// reader keeps draining the pipe so the child does not block on a
+/// full PIPE buffer; the overflow bytes are counted but discarded.
+/// Truncates the captured buffer back to the nearest UTF-8 lead byte
+/// when the cap split a multi-byte sequence so downstream consumers do
+/// not see a phantom replacement char.
+async fn read_capped<R>(mut pipe: R, cap: usize) -> std::io::Result<(Vec<u8>, usize)>
+where
+    R: AsyncReadExt + Unpin + Send,
+{
+    let mut captured: Vec<u8> = Vec::with_capacity(cap.min(READ_CHUNK_BYTES));
+    let mut total: usize = 0;
+    let mut scratch = vec![0u8; READ_CHUNK_BYTES];
+
+    loop {
+        let n = pipe.read(&mut scratch).await?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if captured.len() < cap {
+            let remaining = cap - captured.len();
+            let take = remaining.min(n);
+            captured.extend_from_slice(&scratch[..take]);
+        }
+    }
+
+    if captured.len() == cap {
+        let mut end = captured.len();
+        while end > 0 {
+            // A continuation byte has the high bits 10xxxxxx.
+            if (captured[end - 1] & 0b1100_0000) == 0b1000_0000 {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        // If we walked back past a leading byte that takes more bytes
+        // than we have, drop that leading byte too.
+        if end > 0 && (captured[end - 1] & 0b1000_0000) != 0 {
+            let lead = captured[end - 1];
+            let expected = utf8_lead_byte_len(lead);
+            let have = captured.len() - end + 1;
+            if expected > have {
+                end -= 1;
+            }
+        }
+        captured.truncate(end);
+    }
+
+    Ok((captured, total))
+}
+
+/// Decode the expected length of a UTF-8 sequence given its leading
+/// byte. Returns 1 for ASCII / invalid leads (which then fall through
+/// to a single-byte truncation), so the caller never reads past
+/// `captured.len()`.
+fn utf8_lead_byte_len(b: u8) -> usize {
+    if b & 0b1000_0000 == 0 {
+        1
+    } else if b & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if b & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if b & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        1
     }
 }
 
