@@ -275,9 +275,20 @@ impl McpClient for RmcpClient {
                     tracing::warn!(server = %self.server, error = ?e, "mcp shutdown task panicked");
                 },
                 Err(_) => {
-                    tracing::warn!(
+                    // On timeout, the cancel() future is dropped, which
+                    // drops the rmcp `RunningService` and its underlying
+                    // `TokioChildProcess`. rmcp's `ChildWithCleanup::drop`
+                    // spawns a fire-and-forget kill task — the child
+                    // *should* die as a result, but we cannot await that
+                    // kill from here because rmcp does not expose the
+                    // child handle. Escalate to `error!` so the orphan
+                    // is loud in operator logs even though the process
+                    // table will reflect the kill on a sub-second delay.
+                    tracing::error!(
                         server = %self.server,
-                        "mcp shutdown timed out after {MCP_HANDSHAKE_TIMEOUT_SECS}s",
+                        timeout_secs = MCP_HANDSHAKE_TIMEOUT_SECS,
+                        "MCP shutdown timed out; relying on rmcp's drop-time kill — \
+                         child process may briefly outlive this call",
                     );
                 },
                 Ok(Ok(_quit_reason)) => {},
@@ -305,6 +316,17 @@ async fn spawn_stdio_client(
     let mut cmd = tokio::process::Command::new(&cfg.command[0]);
     if cfg.command.len() > 1 {
         cmd.args(&cfg.command[1..]);
+    }
+    // Hard-isolate the child env from the parent's: the parent process
+    // may carry secrets, build-artifact paths, or test harness state that
+    // an MCP server has no business reading. Strip everything, then
+    // re-introduce only the keys the operator declared in
+    // `mcp_servers.<name>.env`. `PATH` is the one mandatory exception —
+    // without it the kernel cannot resolve a bare command name like
+    // `npx` or `uvx`, which is how every reference MCP server ships.
+    cmd.env_clear();
+    if let Ok(path_val) = std::env::var("PATH") {
+        cmd.env("PATH", path_val);
     }
     for (k, v) in &cfg.env {
         cmd.env(k, v);

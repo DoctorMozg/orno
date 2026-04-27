@@ -78,19 +78,32 @@ impl EventSink for StreamingSink {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.next_seq += 1;
-        let envelope = EventEnvelope::new(guard.next_seq, event);
+        // Build the envelope at a tentative seq, but commit the counter
+        // only after serialization succeeds. Bumping `next_seq` first and
+        // then dropping on a serde failure leaves a hole in the seq
+        // sequence — replay's strict-monotonic invariant treats holes as
+        // dropped events and aborts the tape. Defer the commit so a
+        // serializer panic on event N does not silently corrupt event
+        // N+1's seq.
+        let tentative_seq = guard.next_seq + 1;
+        let envelope = EventEnvelope::new(tentative_seq, event);
         let line = match serde_json::to_string(&envelope) {
             Ok(line) => line,
             Err(e) => {
                 // Serialization failure is a bug in the event shape,
                 // not a runtime condition the engine can recover from
                 // per-event. Log and drop — `EventSink::record` returns
-                // `()` so we cannot surface it to the caller.
-                tracing::warn!(error = %e, "failed to serialize event envelope");
+                // `()` so we cannot surface it to the caller. The
+                // tentative seq is discarded so the next call reuses it.
+                tracing::warn!(
+                    error = %e,
+                    seq = tentative_seq,
+                    "failed to serialize event envelope; seq not advanced",
+                );
                 return;
             },
         };
+        guard.next_seq = tentative_seq;
         if let Err(e) = guard
             .writer
             .write_all(line.as_bytes())

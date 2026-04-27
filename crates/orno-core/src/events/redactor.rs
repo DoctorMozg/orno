@@ -6,13 +6,16 @@
 //! The redactor is value-based (not key-based): we substitute raw
 //! secret strings inside prompts, node outputs, and other payloads,
 //! because the sensitive content flows by value once templates have
-//! been rendered. Sorting longest-first guarantees a secret that is a
-//! substring of another longer secret cannot sneak through by being
-//! matched first.
+//! been rendered. An Aho-Corasick automaton matches every secret in a
+//! single linear scan of the haystack — `leftmost-longest` semantics
+//! guarantee that a secret which is a substring of a longer secret
+//! cannot sneak through by being matched first.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use serde_json::Value;
 
 /// Replaces every occurrence of a known secret value with `"***"`.
@@ -21,16 +24,26 @@ use serde_json::Value;
 /// the engine's emission sites. Empty-valued secrets are dropped — an
 /// empty-string match would replace every zero-width position in the
 /// haystack, which is worse than not redacting at all.
-#[derive(Debug, Clone, Default)]
+///
+/// Internally, the secret list is compiled into an Aho-Corasick
+/// automaton so a single pass over the haystack catches every match
+/// regardless of how many secrets are registered. `MatchKind::LeftmostLongest`
+/// preserves the previous "longest secret wins" behavior in the rare
+/// case where two secrets overlap.
+#[derive(Default)]
 pub struct Redactor {
+    /// Original secret values, retained for `Clone` reconstruction
+    /// (the automaton itself does not expose its source patterns).
     values: Vec<String>,
+    /// Compiled multi-pattern matcher. `None` when no secrets were
+    /// registered so the no-op path costs nothing.
+    ac: Option<AhoCorasick>,
 }
 
 impl Redactor {
     /// Build a redactor from the run's `secrets.*` namespace. Duplicate
-    /// values collapse to one entry; the final list is sorted
-    /// longest-first so overlapping secrets redact in the expected
-    /// order (a longer secret is matched before any of its prefixes).
+    /// values collapse to one entry; empty values are dropped because a
+    /// zero-width match would corrupt every position in the haystack.
     #[must_use]
     pub fn new(secrets: &BTreeMap<String, String>) -> Self {
         let mut values: Vec<String> = secrets
@@ -40,10 +53,34 @@ impl Redactor {
             .collect();
         values.sort();
         values.dedup();
-        // Longest first: a secret that is a substring of another secret
-        // must not win the replacement race.
-        values.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        Self { values }
+        Self::from_values(values)
+    }
+
+    /// Compile an `AhoCorasick` automaton over `values`. Pulled out so
+    /// `Clone` can rebuild the automaton from the retained pattern list
+    /// without re-deriving the constructor's deduplication step.
+    fn from_values(values: Vec<String>) -> Self {
+        let ac = if values.is_empty() {
+            None
+        } else {
+            // `LeftmostLongest` preserves the legacy semantics: when two
+            // secrets overlap at the same start position, the longer one
+            // wins so a shorter substring secret never slices a longer
+            // one mid-token.
+            //
+            // `expect` here is acceptable: the only documented failure
+            // mode of `AhoCorasick::new` over a non-empty `&[String]`
+            // input is exhausting the internal state-id space, which
+            // requires far more than the handful of secrets a real
+            // pipeline registers.
+            Some(
+                AhoCorasick::builder()
+                    .match_kind(MatchKind::LeftmostLongest)
+                    .build(&values)
+                    .expect("Redactor: Aho-Corasick build failed on valid UTF-8 secret values"),
+            )
+        };
+        Self { values, ac }
     }
 
     /// `true` when the redactor holds no secrets and can be skipped.
@@ -57,15 +94,20 @@ impl Redactor {
     /// allocation.
     #[must_use]
     pub fn redact<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        if self.values.is_empty() || !self.values.iter().any(|v| s.contains(v.as_str())) {
+        let Some(ac) = self.ac.as_ref() else {
+            return Cow::Borrowed(s);
+        };
+        if !ac.is_match(s) {
             return Cow::Borrowed(s);
         }
-        let mut out = s.to_string();
-        for v in &self.values {
-            if out.contains(v.as_str()) {
-                out = out.replace(v.as_str(), "***");
-            }
+        let mut out = String::with_capacity(s.len());
+        let mut last = 0;
+        for mat in ac.find_iter(s) {
+            out.push_str(&s[last..mat.start()]);
+            out.push_str("***");
+            last = mat.end();
         }
+        out.push_str(&s[last..]);
         Cow::Owned(out)
     }
 
@@ -90,5 +132,25 @@ impl Redactor {
             // return unchanged so the caller skips any allocation.
             other => other.clone(),
         }
+    }
+}
+
+// `AhoCorasick` is not `Debug`, so we omit it from the printed form and
+// surface only the secret count. Secret values themselves must never be
+// emitted through `Debug` — that would defeat the redactor's purpose.
+impl fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Redactor")
+            .field("secret_count", &self.values.len())
+            .finish_non_exhaustive()
+    }
+}
+
+// `AhoCorasick` itself is `Clone` (cheap `Arc` bump), but rebuilding
+// from `values` keeps the public field set tight and avoids relying on
+// implementation details of the upstream crate.
+impl Clone for Redactor {
+    fn clone(&self) -> Self {
+        Self::from_values(self.values.clone())
     }
 }
