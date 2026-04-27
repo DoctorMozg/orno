@@ -161,6 +161,7 @@ mod tests {
             max_total_tokens: 0,
             max_tool_calls: 0,
             max_subagent_depth: 0,
+            max_tool_output_bytes: None,
             allow_mutations: false,
             allow_network: false,
             allow_context_writes: false,

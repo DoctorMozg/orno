@@ -141,12 +141,13 @@ mod tests {
     use crate::error::{AgentError, LlmError, ToolError};
     use crate::events::{BudgetKind, Event, InMemorySink, LlmFailure};
     use crate::llm::{
-        DummyTransport, LlmRequest, LlmResponse, OrnoChatToolCall, Usage, dummy::ScriptedTransport,
+        DummyTransport, LlmRequest, LlmResponse, OrnoChatMessage, OrnoChatToolCall, Usage,
+        dummy::ScriptedTransport,
     };
-    use crate::pipeline::{AgentPolicy, OnParseError};
+    use crate::pipeline::{AgentConfig, AgentPolicy, OnParseError};
     use crate::tool::{ToolEffect, ToolInvocation};
     use async_trait::async_trait;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Weak};
 
     /// Transport stub that returns a caller-chosen `LlmError`. Lives in
     /// the test module because production code never wants a transport
@@ -182,6 +183,7 @@ mod tests {
             max_total_tokens: 1000,
             max_tool_calls: 0,
             max_subagent_depth: 0,
+            max_tool_output_bytes: None,
             allow_mutations: false,
             allow_network: false,
             allow_context_writes: false,
@@ -201,6 +203,7 @@ mod tests {
             policy: policy(),
             allowed_tools: Vec::new(),
             depth: 0,
+            parent_token_counter: None,
         }
     }
 
@@ -1241,7 +1244,7 @@ mod tests {
         use crate::tool::WebFetchHandler;
 
         let sink = Arc::new(InMemorySink::new());
-        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler::default());
 
         let transport = ScriptedTransport::new(vec![
             ScriptedTransport::tool_call_response(
@@ -1309,7 +1312,7 @@ mod tests {
         use crate::tool::WebFetchHandler;
 
         let sink = Arc::new(InMemorySink::new());
-        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler::default());
 
         let transport = ScriptedTransport::new(vec![
             ScriptedTransport::tool_call_response(
@@ -1365,7 +1368,7 @@ mod tests {
         use crate::tool::WebFetchHandler;
 
         let sink = Arc::new(InMemorySink::new());
-        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler::default());
 
         let transport = ScriptedTransport::new(vec![
             ScriptedTransport::tool_call_response(
@@ -1473,7 +1476,7 @@ mod tests {
         use crate::tool::WebFetchHandler;
 
         let sink = Arc::new(InMemorySink::new());
-        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler);
+        let handler: Arc<dyn ToolHandler> = Arc::new(WebFetchHandler::default());
 
         let transport = ScriptedTransport::new(vec![
             ScriptedTransport::tool_call_response(
@@ -1573,6 +1576,145 @@ mod tests {
         assert!(
             denied.is_none(),
             "ToolDenied must NOT fire for sub.api.trusted.com on an api.trusted.com allowlist: {denied:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_http_scheme_denied() {
+        // file://, ftp://, data:// are disallowed regardless of domain lists.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "should not reach here"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "EchoTool",
+                serde_json::json!({ "url": "file:///etc/passwd" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("scheme denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must fire for non-HTTP scheme");
+        assert!(
+            reason.contains("file"),
+            "reason should name the disallowed scheme: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_ip_denied() {
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "should not reach here"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "EchoTool",
+                serde_json::json!({ "url": "http://127.0.0.1/secret" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("IP denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must fire for loopback IP");
+        assert!(
+            reason.contains("127.0.0.1"),
+            "reason should name the IP: {reason:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn private_ip_denied() {
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(EchoTool::new(ToolEffect::Network, "should not reach here"));
+
+        let transport = ScriptedTransport::new(vec![
+            ScriptedTransport::tool_call_response(
+                "c1",
+                "EchoTool",
+                serde_json::json!({ "url": "http://192.168.1.100/internal" }),
+            ),
+            ScriptedTransport::text_response("ok"),
+        ]);
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: Arc::new(transport),
+            sink: sink.clone(),
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.allow_network = true;
+        req.allowed_tools = vec!["EchoTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("private IP denial must feed back, not terminate");
+
+        let events = sink.snapshot();
+        let reason = events
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::ToolDenied { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("ToolDenied must fire for private IP");
+        assert!(
+            reason.contains("192.168.1.100"),
+            "reason should name the IP: {reason:?}",
         );
     }
 
@@ -1798,6 +1940,7 @@ mod tests {
     struct RecordingScriptedTransport {
         responses: Mutex<std::collections::VecDeque<LlmResponse>>,
         max_tokens_seen: Mutex<Vec<Option<u32>>>,
+        messages_seen: Mutex<Vec<Vec<OrnoChatMessage>>>,
     }
 
     impl RecordingScriptedTransport {
@@ -1805,11 +1948,19 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into()),
                 max_tokens_seen: Mutex::new(Vec::new()),
+                messages_seen: Mutex::new(Vec::new()),
             }
         }
 
         fn max_tokens_seen(&self) -> Vec<Option<u32>> {
             self.max_tokens_seen
+                .lock()
+                .expect("RecordingScriptedTransport mutex poisoned")
+                .clone()
+        }
+
+        fn messages_seen(&self) -> Vec<Vec<OrnoChatMessage>> {
+            self.messages_seen
                 .lock()
                 .expect("RecordingScriptedTransport mutex poisoned")
                 .clone()
@@ -1823,6 +1974,10 @@ mod tests {
                 .lock()
                 .expect("RecordingScriptedTransport mutex poisoned")
                 .push(req.max_tokens);
+            self.messages_seen
+                .lock()
+                .expect("RecordingScriptedTransport mutex poisoned")
+                .push(req.messages.clone());
             self.responses
                 .lock()
                 .expect("RecordingScriptedTransport mutex poisoned")
@@ -1902,6 +2057,434 @@ mod tests {
             seen[1],
             Some(600),
             "second iteration must request the remaining budget after a 400-token first turn",
+        );
+    }
+
+    /// Long-output tool used by the truncation regression below. Returns
+    /// a string of `count` ASCII bytes so byte-length assertions on the
+    /// truncated payload remain trivial.
+    struct LongOutputTool {
+        len: usize,
+    }
+
+    impl LongOutputTool {
+        fn new(len: usize) -> Self {
+            Self { len }
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for LongOutputTool {
+        fn name(&self) -> &str {
+            "LongOutputTool"
+        }
+        fn description(&self) -> &str {
+            "Returns a long ASCII string of the configured length."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+        async fn invoke(
+            &self,
+            _inv: ToolInvocation<'_>,
+            _args: serde_json::Value,
+        ) -> Result<String, ToolError> {
+            Ok("a".repeat(self.len))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_output_truncated_in_conversation_history() {
+        // WU-3.1 regression: a tool result whose byte length exceeds
+        // `policy.max_tool_output_bytes` must be head-truncated to the
+        // cap and an ellipsis marker appended before being pushed onto
+        // `messages`. The assertion targets the messages observed by the
+        // SECOND `complete()` call — that's the request the loop builds
+        // from the first turn's tool result.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(LongOutputTool::new(1_000));
+
+        let first = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: "c1".into(),
+                fn_name: "LongOutputTool".into(),
+                fn_arguments: serde_json::json!({}),
+            }],
+        };
+        let second = LlmResponse {
+            content: "done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            tool_calls: Vec::new(),
+        };
+        let transport = Arc::new(RecordingScriptedTransport::new(vec![first, second]));
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: transport.clone(),
+            sink,
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.max_tool_calls = 1;
+        req.policy.max_tool_output_bytes = Some(10);
+        req.allowed_tools = vec!["LongOutputTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("loop must complete after the truncated tool result");
+
+        let observed = transport.messages_seen();
+        assert_eq!(observed.len(), 2, "transport must observe two requests");
+
+        // Second call carries the assistant tool-call turn followed by
+        // the truncated tool result.
+        let second_req = &observed[1];
+        let result_msg = second_req
+            .iter()
+            .find_map(|m| match m {
+                OrnoChatMessage::ToolResult { call_id, content } if call_id == "c1" => {
+                    Some(content)
+                },
+                _ => None,
+            })
+            .expect("second request must contain the tool-result message");
+
+        // 10 bytes of 'a' + the 3-byte UTF-8 ellipsis '…'.
+        assert_eq!(
+            result_msg.len(),
+            10 + '…'.len_utf8(),
+            "truncated content must equal cap + ellipsis byte length",
+        );
+        assert!(
+            result_msg.ends_with('…'),
+            "truncated content must end with the ellipsis marker, got {result_msg:?}",
+        );
+        assert!(
+            result_msg.starts_with("aaaaaaaaaa"),
+            "truncated content must keep the first `cap` bytes",
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_under_cap_passes_through_unchanged() {
+        // Companion to the regression above: when the tool result fits
+        // within the configured cap, the message must arrive on the next
+        // request byte-for-byte with no ellipsis appended.
+        let sink = Arc::new(InMemorySink::new());
+        let tool = Arc::new(LongOutputTool::new(5));
+
+        let first = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: "c1".into(),
+                fn_name: "LongOutputTool".into(),
+                fn_arguments: serde_json::json!({}),
+            }],
+        };
+        let second = LlmResponse {
+            content: "done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            tool_calls: Vec::new(),
+        };
+        let transport = Arc::new(RecordingScriptedTransport::new(vec![first, second]));
+
+        let agent = LoopAgent::new(LoopAgentConfig {
+            transport: transport.clone(),
+            sink,
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools: vec![tool],
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 3;
+        req.policy.max_tool_calls = 1;
+        req.policy.max_tool_output_bytes = Some(10);
+        req.allowed_tools = vec!["LongOutputTool".into()];
+
+        agent
+            .run("run_test", "n", req)
+            .await
+            .expect("under-cap tool result must not derail the loop");
+
+        let observed = transport.messages_seen();
+        let result_msg = observed[1]
+            .iter()
+            .find_map(|m| match m {
+                OrnoChatMessage::ToolResult { call_id, content } if call_id == "c1" => {
+                    Some(content)
+                },
+                _ => None,
+            })
+            .expect("second request must contain the tool-result message");
+        assert_eq!(result_msg, "aaaaa");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "WU-3.3 regression test that wires a parent + subagent + recording transport end-to-end; splitting it would obscure the propagation invariant being asserted"
+    )]
+    async fn parent_token_budget_covers_subagent_spend() {
+        // WU-3.3 regression: a subagent loop's per-LLM-response usage
+        // must charge against the parent loop's `max_total_tokens`. The
+        // assertion runs against the recording transport's captured
+        // `max_tokens` field on the parent's SECOND request — that's
+        // the iteration the parent enters after the subagent returned.
+        //
+        // Wiring: parent budget = 100 tokens, child uses 80 tokens
+        // inside a single subagent dispatch. Parent's second iteration
+        // must request `Some(20)`, not `Some(100)` — the latter would
+        // mean child usage was lost.
+        //
+        // Transport call ordering across the same recorder:
+        //   [0] parent iter 0 → tool_call subagent_child (max=Some(100))
+        //   [1] child  iter 0 → text answer with usage 80 (max=Some(<child policy>))
+        //   [2] parent iter 1 → text answer terminating loop (max=Some(20))
+        let sink = Arc::new(InMemorySink::new());
+
+        let parent_first = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: "c1".into(),
+                fn_name: "subagent_child".into(),
+                fn_arguments: serde_json::json!({"prompt": "do thing"}),
+            }],
+        };
+        let child_only = LlmResponse {
+            content: "child done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 40,
+                completion_tokens: 40,
+                total_tokens: 80,
+            }),
+            tool_calls: Vec::new(),
+        };
+        let parent_second = LlmResponse {
+            content: "all done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+            tool_calls: Vec::new(),
+        };
+        let transport = Arc::new(RecordingScriptedTransport::new(vec![
+            parent_first,
+            child_only,
+            parent_second,
+        ]));
+
+        // Child config: a small policy registered under the subagent
+        // name. Provider/model are placeholders — the recording transport
+        // does not branch on them.
+        let child_config = AgentConfig {
+            model: "gpt-5".into(),
+            provider: "openai".into(),
+            system: None,
+            allowed_tools: Vec::new(),
+            policy: AgentPolicy {
+                max_iterations: 1,
+                max_total_tokens: 1_000,
+                max_tool_calls: 0,
+                max_subagent_depth: 0,
+                max_tool_output_bytes: None,
+                allow_mutations: false,
+                allow_network: false,
+                allow_context_writes: false,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                on_parse_error: OnParseError::Fail,
+            },
+        };
+
+        let event_sink: Arc<dyn EventSink> = sink.clone();
+        let transport_dyn: Arc<dyn LlmTransport> = transport.clone();
+
+        // `Arc::new_cyclic` matches the production wiring in
+        // `cli/run.rs`: a `SubagentHandler` holds a `Weak<LoopAgent>`
+        // back-pointer to break the Arc cycle.
+        let agent: Arc<LoopAgent> = Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
+            let subagent: Arc<dyn ToolHandler> = Arc::new(crate::tool::SubagentHandler::new(
+                "subagent.child".into(),
+                "child".into(),
+                child_config,
+                weak.clone(),
+                event_sink.clone(),
+            ));
+            LoopAgent::new(LoopAgentConfig {
+                transport: transport_dyn,
+                sink: event_sink,
+                redactor: Arc::new(Redactor::default()),
+                body_excerpt_max_bytes: 256,
+                tools: vec![subagent],
+            })
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 5;
+        req.policy.max_total_tokens = 100;
+        req.policy.max_tool_calls = 5;
+        req.policy.max_subagent_depth = 1;
+        req.allowed_tools = vec!["subagent.child".into()];
+
+        let out = agent
+            .run("run_test", "n", req)
+            .await
+            .expect("parent loop must terminate cleanly within budget");
+        assert_eq!(
+            out.total_tokens, 80,
+            "parent's reported total_tokens must include the subagent's 80 tokens",
+        );
+
+        let max_tokens_seen = transport.max_tokens_seen();
+        assert_eq!(
+            max_tokens_seen.len(),
+            3,
+            "transport must observe 3 calls (parent#1, child#1, parent#2)",
+        );
+        assert_eq!(
+            max_tokens_seen[0],
+            Some(100),
+            "parent's first call must request the full 100-token budget",
+        );
+        assert_eq!(
+            max_tokens_seen[2],
+            Some(20),
+            "parent's second call must request 20 tokens (100 - 80 child spend)",
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "WU-3.3 regression test that wires a parent + subagent + recording transport end-to-end and asserts terminal-variant behavior after the subagent overruns; splitting it would obscure the bound being proven"
+    )]
+    async fn parent_token_budget_breach_on_subagent_overrun() {
+        // Companion: when a subagent's spend pushes the parent's running
+        // total past `max_total_tokens`, the parent's NEXT iteration
+        // entry detects the breach. The parent never reaches a third
+        // LLM request; it terminates with `BudgetExceeded { Tokens }`
+        // because the per-iteration check at the top of `run()`
+        // saturates `remaining` to zero, but the post-response check
+        // from the previous iteration already breached.
+        //
+        // Wiring: parent budget = 50; child uses 80 tokens. The loop
+        // sees 80 > 50 on the post-child iteration's assistant turn
+        // and terminates.
+        let sink = Arc::new(InMemorySink::new());
+
+        let parent_first = LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: "c1".into(),
+                fn_name: "subagent_child".into(),
+                fn_arguments: serde_json::json!({"prompt": "do thing"}),
+            }],
+        };
+        let child_only = LlmResponse {
+            content: "child done".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 40,
+                completion_tokens: 40,
+                total_tokens: 80,
+            }),
+            tool_calls: Vec::new(),
+        };
+        // Parent's second response would charge another 30 tokens; the
+        // post-response check totals 80 + 30 = 110 > 50 → BudgetExceeded.
+        let parent_second = LlmResponse {
+            content: "after child".into(),
+            finish_reason: Some("stop".to_string()),
+            usage: Some(Usage {
+                prompt_tokens: 15,
+                completion_tokens: 15,
+                total_tokens: 30,
+            }),
+            tool_calls: Vec::new(),
+        };
+        let transport = Arc::new(RecordingScriptedTransport::new(vec![
+            parent_first,
+            child_only,
+            parent_second,
+        ]));
+
+        let child_config = AgentConfig {
+            model: "gpt-5".into(),
+            provider: "openai".into(),
+            system: None,
+            allowed_tools: Vec::new(),
+            policy: AgentPolicy {
+                max_iterations: 1,
+                max_total_tokens: 1_000,
+                max_tool_calls: 0,
+                max_subagent_depth: 0,
+                max_tool_output_bytes: None,
+                allow_mutations: false,
+                allow_network: false,
+                allow_context_writes: false,
+                allowed_domains: Vec::new(),
+                blocked_domains: Vec::new(),
+                on_parse_error: OnParseError::Fail,
+            },
+        };
+
+        let event_sink: Arc<dyn EventSink> = sink.clone();
+        let transport_dyn: Arc<dyn LlmTransport> = transport.clone();
+
+        let agent: Arc<LoopAgent> = Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
+            let subagent: Arc<dyn ToolHandler> = Arc::new(crate::tool::SubagentHandler::new(
+                "subagent.child".into(),
+                "child".into(),
+                child_config,
+                weak.clone(),
+                event_sink.clone(),
+            ));
+            LoopAgent::new(LoopAgentConfig {
+                transport: transport_dyn,
+                sink: event_sink,
+                redactor: Arc::new(Redactor::default()),
+                body_excerpt_max_bytes: 256,
+                tools: vec![subagent],
+            })
+        });
+
+        let mut req = request();
+        req.policy.max_iterations = 5;
+        req.policy.max_total_tokens = 50;
+        req.policy.max_tool_calls = 5;
+        req.policy.max_subagent_depth = 1;
+        req.allowed_tools = vec!["subagent.child".into()];
+
+        let err = agent
+            .run("run_test", "n", req)
+            .await
+            .expect_err("budget breach via child spend must terminate the parent");
+        assert!(
+            matches!(
+                err,
+                AgentError::BudgetExceeded {
+                    kind: BudgetKind::Tokens
+                }
+            ),
+            "expected BudgetExceeded(Tokens), got {err:?}",
         );
     }
 }

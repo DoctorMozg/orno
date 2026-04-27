@@ -19,7 +19,7 @@ Every event is wrapped in:
 
 | Field            | Type        | Description                                                                                          |
 | ---------------- | ----------- | ---------------------------------------------------------------------------------------------------- |
-| `schema_version` | integer     | Currently `1`. Bumped on backwards-incompatible event-schema changes.                                |
+| `schema_version` | integer     | Currently `3`. Bumped on backwards-incompatible event-schema changes.                                |
 | `seq`            | integer     | Monotonic emission order, starting at `0` for `run_started`. Use this as the strict-ordering key.    |
 | `timestamp`      | string      | RFC 3339 UTC instant (`time::serde::rfc3339`). Joinable with stderr `tracing` lines on wall clock.   |
 | `event`          | object      | Internally-tagged variant — `event.type` discriminates.                                              |
@@ -120,6 +120,32 @@ Emitted when a node's `timeout:` budget elapses before the executor returns.
 ```
 
 Paired with a subsequent `node_finished { ok: false, failure: { kind: "timed_out", limit_secs } }`.
+
+### `node_output_truncated`
+
+Emitted when a `kind: shell` node's captured `stdout` or `stderr` exceeded the engine's `max_node_output_bytes` cap (default 8 MiB; tunable via `--max-node-output-bytes`). The captured prefix is preserved in `nodes.<id>.{stdout,stderr}`; the child keeps running so it does not block on a full pipe buffer (the overflow is drained to `/dev/null`). One envelope per truncated stream.
+
+```json
+{
+  "type": "node_output_truncated",
+  "run_id": "run_...",
+  "node_id": "noisy_build",
+  "node_kind": "shell",
+  "stream": "stdout",
+  "captured_bytes": 12582912,
+  "cap_bytes": 8388608
+}
+```
+
+| Field            | Type    | Description                                                                                |
+| ---------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `node_id`        | string  | The shell node whose stream overflowed.                                                    |
+| `node_kind`      | string  | Always `"shell"` today. Carried for symmetry with the rest of the per-node envelopes.      |
+| `stream`         | string  | `"stdout"` or `"stderr"`.                                                                  |
+| `captured_bytes` | integer | Total bytes the child wrote on the stream before exiting. Always `>= cap_bytes`.           |
+| `cap_bytes`      | integer | The cap that fired. Echoes `EngineConfig.max_node_output_bytes` for the run.               |
+
+Added in `schema_version: 3`.
 
 ## Agent-loop events
 

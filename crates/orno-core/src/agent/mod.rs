@@ -11,6 +11,9 @@
 
 pub mod loop_agent;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +54,18 @@ pub struct AgentRequest {
     /// in-memory construction sites stay source-compatible.
     #[serde(default)]
     pub depth: u32,
+    /// Parent loop's token counter, set by `SubagentHandler` when the
+    /// child loop is dispatched as a subagent tool call. Each LLM
+    /// response with `usage` in the child loop bumps the parent counter
+    /// in lockstep with the child's local counter, so the parent's
+    /// `policy.max_total_tokens` budget transitively covers child
+    /// subagent token spend (ADR 0023). `None` on the root request
+    /// constructed by `AgentExecutor` — the root has no parent.
+    /// Skipped on serialization because `Arc<AtomicU64>` is a runtime
+    /// shared handle, not a wire payload; record/replay reproduces the
+    /// counter graph by re-running the loop, not by serializing it.
+    #[serde(skip)]
+    pub parent_token_counter: Option<Arc<AtomicU64>>,
 }
 
 /// Successful agent-loop output. Returns the LLM's terminal text

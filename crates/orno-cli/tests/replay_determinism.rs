@@ -194,8 +194,10 @@ fn record_then_replay_produces_identical_event_type_sequence() {
 fn replay_tape_miss_is_reported_as_node_failure() {
     // An empty tape causes every LLM call to miss. ReplayTransport returns
     // LlmError::ReplayMiss, which the LoopAgent surfaces as a node failure.
-    // The CLI process still exits 0 — node failures are pipeline-level
-    // signals, not process-level ones.
+    // After WU-2.4 the CLI also exits non-zero whenever the run reports
+    // `ok: false`, so the process-level signal matches the stream-level
+    // signal — `orno run --replay-tape … && next-step` short-circuits on
+    // a tape miss instead of silently proceeding.
     let empty_tape = tempfile::NamedTempFile::new().expect("tempfile for empty tape");
     let tape_path = empty_tape.path().to_str().expect("utf8 tape path");
 
@@ -207,7 +209,7 @@ fn replay_tape_miss_is_reported_as_node_failure() {
             "../../examples/hello/pipeline.yaml",
         ])
         .assert()
-        .success(); // process still exits 0
+        .failure();
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
 

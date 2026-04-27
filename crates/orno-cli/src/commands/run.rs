@@ -17,6 +17,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -53,6 +54,19 @@ use serde_json::Value;
 /// (Phase 6). The var name is intentionally awkward — end users
 /// should never set it.
 const TEST_TRANSPORT_ENV: &str = "ORNO_TEST_LLM_TRANSPORT";
+
+/// Maximum time spent draining MCP servers after SIGINT before the
+/// SIGINT branch returns and lets `main` translate `Interrupted` into
+/// exit code 130. Bounded so a hung MCP child cannot indefinitely
+/// delay the operator's cancel; the OS reaps any stragglers when the
+/// parent exits.
+const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Sentinel inserted into `RunFinished.failed_nodes` on SIGINT so a
+/// downstream consumer reading the NDJSON stream can tell an
+/// interrupted run apart from a node-level failure without needing
+/// out-of-band exit-code context.
+const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
 
 /// Mutex-guarded wrapper that lets the orchestrator hold a single MCP
 /// client behind `Arc<dyn McpClient>` for `McpToolHandler` dispatch while
@@ -100,6 +114,10 @@ pub struct RunFlags {
     /// resolves the default-vs-verbose policy before this struct
     /// is built.
     pub max_output_bytes: usize,
+    /// Threaded into `EngineConfig.max_node_output_bytes`. Caps a
+    /// shell node's captured stdout/stderr per stream. Default 8 MiB
+    /// (resolved by the CLI before this struct is built).
+    pub max_node_output_bytes: usize,
     /// When `Some`, wrap the live transport in `RecordingTransport`
     /// and flush to this path at run end. Mutually exclusive with
     /// `replay_tape`.
@@ -162,11 +180,17 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     let engine_config = EngineConfig {
         verbose: flags.verbose,
         max_output_bytes: flags.max_output_bytes,
+        max_node_output_bytes: flags.max_node_output_bytes,
     };
 
     let inputs = resolve_inputs(&pipeline, &flags)?;
 
-    let sink: Arc<dyn EventSink> = Arc::new(StreamingSink::stdout());
+    // Keep a typed handle to `StreamingSink` so the CLI can read its
+    // `is_broken` flag after `engine.run` returns. The engine only
+    // sees the trait-object form. Both Arcs point at the same value
+    // so a write failure latched during `record` is observable here.
+    let streaming_sink = Arc::new(StreamingSink::stdout());
+    let sink: Arc<dyn EventSink> = streaming_sink.clone();
 
     // Mint `run_id` immediately after the sink so every lifecycle
     // envelope (MCP init included) carries a valid correlation id, and
@@ -177,13 +201,20 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     let base_transport: Arc<dyn LlmTransport> = match std::env::var(TEST_TRANSPORT_ENV).as_deref() {
         Ok("dummy") => Arc::new(DummyTransport),
         Ok("scripted") => {
-            let tape_path = std::env::var("ORNO_TEST_SCRIPTED_TAPE").unwrap_or_else(|_| {
-                panic!("ORNO_TEST_SCRIPTED_TAPE must be set when ORNO_TEST_LLM_TRANSPORT=scripted")
-            });
+            // Misconfiguration of the test-only `scripted` transport
+            // surfaces as a structured CLI error (non-zero exit) rather
+            // than a process panic — keeps stack traces out of test
+            // logs and lets the integration harness assert on a clean
+            // anyhow message.
+            let tape_path = std::env::var("ORNO_TEST_SCRIPTED_TAPE").map_err(|_| {
+                anyhow!("ORNO_TEST_SCRIPTED_TAPE must be set when ORNO_TEST_LLM_TRANSPORT=scripted")
+            })?;
             let json = std::fs::read_to_string(&tape_path)
-                .unwrap_or_else(|e| panic!("reading scripted tape `{tape_path}`: {e}"));
+                .with_context(|| format!("reading scripted tape `{tape_path}`"))?;
             let responses: Vec<orno_core::llm::LlmResponse> = serde_json::from_str(&json)
-                .unwrap_or_else(|e| panic!("parsing scripted tape as Vec<LlmResponse>: {e}"));
+                .with_context(|| {
+                    format!("parsing scripted tape `{tape_path}` as Vec<LlmResponse>")
+                })?;
             Arc::new(ScriptedTransport::new(responses))
         },
         _ => Arc::new(
@@ -191,6 +222,11 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
                 .context("constructing LLM transport from pipeline agents")?,
         ),
     };
+
+    // Build the redactor once from the resolved `secrets.*` map. Share it
+    // across recording transports and the agent executor; both hold Arc refs
+    // to the same value list, so redaction is consistent everywhere.
+    let redactor = Arc::new(Redactor::new(&inputs.secrets));
 
     // --replay-tape: swap the live transport for a tape reader. A tape
     // miss is a hard error — no fallback to the live API.
@@ -204,7 +240,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         Arc::new(replay)
     } else if let Some(path) = &flags.record_tape {
         let rec = Arc::new(
-            RecordingTransport::create(base_transport, path)
+            RecordingTransport::create(base_transport, path, redactor.clone())
                 .with_context(|| format!("creating record tape `{}`", path.display()))?,
         );
         recording_transport = Some(rec.clone());
@@ -213,17 +249,14 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         base_transport
     };
 
-    // Build the redactor once from the resolved `secrets.*` map and
-    // share it with the agent executor. The engine builds its own
-    // instance inside `Engine::run` from the same secret map — the two
-    // instances carry the same value list, so redaction is consistent
-    // across agent-emitted `LlmRequestStarted` excerpts and
-    // scheduler-emitted `NodeFailure` tails. Using
-    // an `Arc` avoids cloning the secret-value list per `LlmRequest`.
-    let redactor = Arc::new(Redactor::new(&inputs.secrets));
-
     let mut registry = NodeRegistry::new();
-    registry.register("shell", Arc::new(ShellExecutor));
+    registry.register(
+        "shell",
+        Arc::new(ShellExecutor::with_config(
+            sink.clone(),
+            engine_config.max_node_output_bytes,
+        )),
+    );
 
     // Reuse the engine's `max_output_bytes` for the LLM body excerpt
     // cap so a truncated stderr tail, a truncated HTTP error body, and
@@ -316,25 +349,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
                 // so a mid-init crash never leaks live MCP subprocesses.
                 // Reuses the same shutdown sequence as the success path
                 // at the bottom of `run()`.
-                for client in &mcp_clients {
-                    sink.record(Event::McpServerShuttingDown {
-                        run_id: run_id.clone(),
-                        server: client.server.clone(),
-                    })
-                    .await;
-                    if let Err(shutdown_err) = client.inner.lock().await.shutdown().await {
-                        tracing::warn!(
-                            server = %client.server,
-                            error = ?shutdown_err,
-                            "MCP server shutdown failed during crash recovery",
-                        );
-                    }
-                    sink.record(Event::McpServerExited {
-                        run_id: run_id.clone(),
-                        server: client.server.clone(),
-                    })
-                    .await;
-                }
+                shutdown_mcp_servers(&sink, &run_id, &mcp_clients).await;
                 // No nodes ran on this path, so the lifecycle aggregate
                 // vectors are empty. The CLI owns the `RunStarted` /
                 // `RunFinished { ok: false }` pair on the crash path
@@ -367,7 +382,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         Arc::new(ReadHandler),
         Arc::new(WriteHandler),
         Arc::new(EditHandler),
-        Arc::new(WebFetchHandler),
+        Arc::new(WebFetchHandler::default()),
         Arc::new(SetStateHandler::new(
             redactor.clone(),
             body_excerpt_max_bytes,
@@ -395,6 +410,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
                     h,
                     shared.clone(),
                     path_buf.clone(),
+                    redactor.clone(),
                 )) as Arc<dyn ToolHandler>
             })
             .collect();
@@ -449,7 +465,48 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
 
     let engine = Engine::new(sink.clone(), registry, templates, engine_config);
 
-    engine.run(&run_id, &pipeline, inputs).await?;
+    // SIGINT handling: race `engine.run` against `ctrl_c`. On a clean
+    // exit we proceed with the existing post-run flow. On SIGINT we
+    // emit a sentinel `RunFinished { ok: false, failed_nodes:
+    // ["<interrupted>"] }`, flush the recording handles so the tape
+    // captures whatever did reach disk, drain MCP servers under a 5s
+    // timeout (so a stuck child cannot prevent shutdown), and bubble
+    // up `Interrupted` — `main` downcasts that sentinel error and
+    // translates it to exit code 130 so a wrapping shell can tell
+    // operator cancellation apart from a normal pipeline failure
+    // (which exits 1).
+    let run_outcome = tokio::select! {
+        biased;
+        () = super::sigint_with_warning() => {
+            sink.record(Event::RunFinished {
+                run_id: run_id.clone(),
+                ok: false,
+                failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
+                skipped_nodes: Vec::new(),
+            })
+            .await;
+            if let Some(rec) = &recording_transport
+                && let Err(e) = rec.flush()
+            {
+                tracing::warn!(error = ?e, "flushing LLM tape on SIGINT failed");
+            }
+            if let Some(tape) = &tool_tape_to_flush
+                && let Ok(mut guard) = tape.lock()
+                && let Err(e) = guard.flush()
+            {
+                tracing::warn!(error = ?e, "flushing tool tape on SIGINT failed");
+            }
+            let shutdown_fut = shutdown_mcp_servers(&sink, &run_id, &mcp_clients);
+            if tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, shutdown_fut).await.is_err() {
+                tracing::warn!(
+                    timeout_secs = MCP_SHUTDOWN_TIMEOUT.as_secs(),
+                    "MCP shutdown exceeded grace window on SIGINT"
+                );
+            }
+            return Err(super::Interrupted.into());
+        }
+        res = engine.run(&run_id, &pipeline, inputs) => res?,
+    };
 
     if let Some(rec) = recording_transport {
         rec.flush().context("flushing LLM tape after run")?;
@@ -487,20 +544,32 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
 
     // Shut down MCP servers in declaration order. Best-effort:
     // a failing shutdown emits a warning but does not abort a successful run.
-    for client in &mcp_clients {
-        sink.record(Event::McpServerShuttingDown {
-            run_id: run_id.clone(),
-            server: client.server.clone(),
-        })
-        .await;
-        if let Err(e) = client.inner.lock().await.shutdown().await {
-            tracing::warn!(server = %client.server, error = ?e, "MCP server shutdown failed");
-        }
-        sink.record(Event::McpServerExited {
-            run_id: run_id.clone(),
-            server: client.server.clone(),
-        })
-        .await;
+    shutdown_mcp_servers(&sink, &run_id, &mcp_clients).await;
+
+    // The streaming sink swallows write errors so that a single
+    // EPIPE during the run does not poison every subsequent
+    // `record` call — but we still owe the operator a non-zero
+    // exit. Checked after MCP shutdown so the shutdown envelopes
+    // had a chance to fail too. Done last so a clean run still
+    // reports `Ok(())`.
+    if streaming_sink.is_broken() {
+        bail!("event stream write failed (downstream closed?); run output is incomplete");
+    }
+
+    // Stream-level failure → process-level failure. Until this point
+    // the CLI exited 0 even when nodes failed, so wrappers like
+    // `orno run | tee log` could not branch on success. The diagnostic
+    // names the specific failed nodes so the operator does not have
+    // to re-read the NDJSON to find them. Skipped descendants are
+    // visible in the stream as `node_skipped` envelopes; we do not
+    // re-list them here to keep the CLI message tight.
+    if !run_outcome.ok {
+        let names = if run_outcome.failed_nodes.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            run_outcome.failed_nodes.join(", ")
+        };
+        bail!("run failed: nodes [{names}] reported ok:false");
     }
 
     Ok(())
@@ -529,6 +598,40 @@ async fn emit_run_lifecycle_failure(
         skipped_nodes,
     })
     .await;
+}
+
+/// Drain MCP servers in declaration order, emitting the
+/// `McpServerShuttingDown` / `McpServerExited` envelope pair for each
+/// one. Used by the success path, the MCP-init crash recovery path,
+/// and the SIGINT path so all three keep the same wire-level
+/// shutdown framing — anything observing the stream sees the same
+/// shape regardless of why the run is winding down. Best-effort:
+/// a failing `shutdown()` only surfaces as a `tracing::warn!`; the
+/// process exits anyway.
+async fn shutdown_mcp_servers(
+    sink: &Arc<dyn EventSink>,
+    run_id: &str,
+    clients: &[Arc<SharedMcpClient>],
+) {
+    for client in clients {
+        sink.record(Event::McpServerShuttingDown {
+            run_id: run_id.to_string(),
+            server: client.server.clone(),
+        })
+        .await;
+        if let Err(e) = client.inner.lock().await.shutdown().await {
+            tracing::warn!(
+                server = %client.server,
+                error = ?e,
+                "MCP server shutdown failed",
+            );
+        }
+        sink.record(Event::McpServerExited {
+            run_id: run_id.to_string(),
+            server: client.server.clone(),
+        })
+        .await;
+    }
 }
 
 /// Resolve `env` and `secrets` per the documented precedence order.
@@ -603,10 +706,15 @@ fn parse_inline_env(s: &str) -> Result<(String, String)> {
     Ok((k.to_string(), v.to_string()))
 }
 
-/// Minimal dotenv parser: `KEY=VAL` per line, `#` comments, blank
-/// lines skipped. No quoting, no variable expansion — the v0.1
-/// surface is intentionally narrow. Later duplicate keys within
-/// the same file win on the consumer side via `BTreeMap::insert`.
+/// Dotenv parser supporting the dialect features common to bash-style
+/// `.env` files: `KEY=VAL` per line, blank lines and full-line `#`
+/// comments skipped, optional `export` prefix stripped, double-quoted
+/// or single-quoted values (literal contents, no escape processing),
+/// and inline `# comment` after an unquoted value when preceded by
+/// whitespace. Variable expansion (`$OTHER`) is intentionally not
+/// supported — the parser must not silently change a secret literal.
+/// Later duplicate keys within the same file win on the consumer side
+/// via `BTreeMap::insert`.
 fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading env file `{}`", path.display()))?;
@@ -616,7 +724,12 @@ fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (k, v) = line.split_once('=').ok_or_else(|| {
+        // Strip the optional `export ` prefix (literal — a single ASCII
+        // space). Other whitespace (e.g. tabs) between `export` and the
+        // key is uncommon in real .env files and easy to flag as the
+        // user's typo by failing the `KEY=VAL` parse below.
+        let body = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let (k, raw_value) = body.split_once('=').ok_or_else(|| {
             anyhow!(
                 "`{}` line {}: expected `KEY=VAL`, got `{}`",
                 path.display(),
@@ -628,7 +741,211 @@ fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
         if key.is_empty() {
             bail!("`{}` line {}: empty key", path.display(), lineno + 1);
         }
-        out.push((key.to_string(), v.to_string()));
+        let value = parse_dotenv_value(raw_value).with_context(|| {
+            format!(
+                "`{}` line {}: malformed value for `{key}`",
+                path.display(),
+                lineno + 1,
+            )
+        })?;
+        out.push((key.to_string(), value));
     }
     Ok(out)
+}
+
+/// Decode the right-hand side of a `KEY=VAL` line according to the
+/// dotenv dialect documented on `parse_dotenv`. Single- and
+/// double-quoted forms are literal — no escape sequences are
+/// interpreted, so a secret containing `\n` round-trips byte-for-byte.
+fn parse_dotenv_value(raw: &str) -> Result<String> {
+    let trimmed = raw.trim_start();
+    // Empty value, or value area is only an inline comment.
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(String::new());
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let end = rest
+            .find('"')
+            .ok_or_else(|| anyhow!("unterminated double-quoted value"))?;
+        let value = &rest[..end];
+        let tail = rest[end + 1..].trim_start();
+        if !tail.is_empty() && !tail.starts_with('#') {
+            bail!("trailing content after closing double-quote: `{tail}`");
+        }
+        return Ok(value.to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix('\'') {
+        let end = rest
+            .find('\'')
+            .ok_or_else(|| anyhow!("unterminated single-quoted value"))?;
+        let value = &rest[..end];
+        let tail = rest[end + 1..].trim_start();
+        if !tail.is_empty() && !tail.starts_with('#') {
+            bail!("trailing content after closing single-quote: `{tail}`");
+        }
+        return Ok(value.to_string());
+    }
+
+    // Unquoted value. An inline comment starts at the first whitespace
+    // followed by `#`; a `#` directly inside the token (e.g. a password
+    // with `#` characters) is preserved.
+    let cut = trimmed
+        .find(" #")
+        .or_else(|| trimmed.find("\t#"))
+        .unwrap_or(trimmed.len());
+    Ok(trimmed[..cut].trim_end().to_string())
+}
+
+#[cfg(test)]
+mod parse_dotenv_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Write `body` to a temp file and parse it through `parse_dotenv`,
+    /// returning the parsed (key, value) pairs.
+    fn parse(body: &str) -> Result<Vec<(String, String)>> {
+        let mut tmp = NamedTempFile::new().expect("temp file");
+        tmp.write_all(body.as_bytes()).expect("write");
+        parse_dotenv(tmp.path())
+    }
+
+    #[test]
+    fn plain_key_value_lines_parse() {
+        let out = parse("FOO=bar\nBAZ=qux\n").expect("parse");
+        assert_eq!(
+            out,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_line_comments_and_blank_lines_are_skipped() {
+        let out = parse("# comment\n\nFOO=bar\n# another\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn export_prefix_is_stripped() {
+        let out = parse("export FOO=bar\nexport BAZ=qux\n").expect("parse");
+        assert_eq!(
+            out,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_quoted_value_strips_quotes_and_preserves_internal_whitespace() {
+        let out = parse("FOO=\"  spaced value  \"\n").expect("parse");
+        assert_eq!(
+            out,
+            vec![("FOO".to_string(), "  spaced value  ".to_string())]
+        );
+    }
+
+    #[test]
+    fn single_quoted_value_strips_quotes_and_preserves_internal_hash() {
+        let out = parse("FOO='val#with#hash'\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "val#with#hash".to_string())]);
+    }
+
+    #[test]
+    fn quoted_value_may_be_followed_by_inline_comment() {
+        let out = parse("FOO=\"value\" # trailing comment\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "value".to_string())]);
+    }
+
+    #[test]
+    fn unquoted_inline_comment_strips_at_first_space_hash() {
+        let out = parse("FOO=bar # this is a comment\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn unquoted_value_keeps_internal_hash_without_preceding_whitespace() {
+        // A value like `pa#word` has no space before the `#`, so the
+        // `#` is part of the value, not the start of a comment.
+        let out = parse("FOO=pa#word\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "pa#word".to_string())]);
+    }
+
+    #[test]
+    fn empty_value_is_empty_string() {
+        let out = parse("FOO=\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn value_area_that_is_only_a_comment_yields_empty_string() {
+        let out = parse("FOO=  # only comment\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), String::new())]);
+    }
+
+    #[test]
+    fn unterminated_double_quote_is_rejected() {
+        let err = parse("FOO=\"unterminated\n").expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unterminated double-quoted"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("FOO"), "must name the offending key: {msg}");
+    }
+
+    #[test]
+    fn unterminated_single_quote_is_rejected() {
+        let err = parse("FOO='unterminated\n").expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unterminated single-quoted"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn trailing_content_after_closing_quote_is_rejected() {
+        let err = parse("FOO=\"value\" garbage\n").expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trailing content"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn missing_equals_sign_is_rejected_with_line_number() {
+        let err = parse("FOO\n").expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("line 1"), "must include line number: {msg}");
+        assert!(msg.contains("KEY=VAL"), "must show expected form: {msg}");
+    }
+
+    #[test]
+    fn empty_key_is_rejected() {
+        let err = parse("=value\n").expect_err("must error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty key"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn value_with_equals_sign_inside_keeps_after_first_equals() {
+        let out = parse("FOO=key=value=more\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "key=value=more".to_string())]);
+    }
+
+    #[test]
+    fn quoted_value_may_contain_equals_sign() {
+        let out = parse("FOO=\"a=b=c\"\n").expect("parse");
+        assert_eq!(out, vec![("FOO".to_string(), "a=b=c".to_string())]);
+    }
+
+    #[test]
+    fn export_prefix_combines_with_quoted_value() {
+        let out = parse("export TOKEN=\"sk-abc-123\"\n").expect("parse");
+        assert_eq!(out, vec![("TOKEN".to_string(), "sk-abc-123".to_string())]);
+    }
 }

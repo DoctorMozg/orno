@@ -135,6 +135,16 @@ pub struct AgentPolicy {
     pub max_total_tokens: u64,
     pub max_tool_calls: u32,
     pub max_subagent_depth: u32,
+    /// Cap on per-call tool output (in bytes) appended to the
+    /// conversation history that the next LLM turn sees. A handler may
+    /// legally return any size; the loop truncates the head bytes that
+    /// fit and appends an ellipsis marker before pushing the
+    /// `ToolResult` message. `None` keeps the built-in default (256 KiB)
+    /// — large enough for typical Read / `WebFetch` results, small enough
+    /// to bound conversation growth on a runaway tool. Set to a small
+    /// value in tests to make the truncation observable.
+    #[serde(default)]
+    pub max_tool_output_bytes: Option<usize>,
     pub allow_mutations: bool,
     pub allow_network: bool,
     /// Gates `ToolEffect::ContextSelf` (the `SetState` builtin).

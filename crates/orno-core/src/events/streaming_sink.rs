@@ -12,6 +12,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
@@ -25,6 +26,15 @@ struct Inner {
 
 pub struct StreamingSink {
     inner: Mutex<Inner>,
+    /// Set the first time a write to the underlying stream fails.
+    /// `record` returns `()`, so a downstream EPIPE (operator closed
+    /// the consumer of `orno run | jq …`) cannot reach the engine
+    /// in-band — but the CLI checks this flag after `engine.run` so
+    /// the process can exit non-zero instead of silently swallowing
+    /// the failure. `Ordering::Relaxed` is enough because the CLI
+    /// reads it strictly after `engine.run` awaits to completion,
+    /// which already provides happens-before through the runtime.
+    broken: AtomicBool,
 }
 
 impl StreamingSink {
@@ -37,6 +47,7 @@ impl StreamingSink {
                 writer,
                 next_seq: 0,
             }),
+            broken: AtomicBool::new(false),
         }
     }
 
@@ -45,6 +56,16 @@ impl StreamingSink {
     #[must_use]
     pub fn stdout() -> Self {
         Self::new(Box::new(std::io::stdout()))
+    }
+
+    /// True when at least one envelope failed to reach the
+    /// underlying writer (most commonly EPIPE from a closed
+    /// downstream consumer). Latches once set; the CLI bails on
+    /// `true` so `orno run | head -n1` exits non-zero rather than
+    /// pretending the run produced a complete NDJSON stream.
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::Relaxed)
     }
 }
 
@@ -77,6 +98,79 @@ impl EventSink for StreamingSink {
             .and_then(|()| guard.writer.flush())
         {
             tracing::warn!(error = %e, "failed to write event envelope to stream");
+            // Latch the broken flag so the CLI can bail after the run
+            // completes. `Relaxed` is fine: the CLI reads strictly
+            // after `engine.run().await`, which carries its own
+            // happens-before barrier.
+            self.broken.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::ErrorKind;
+
+    /// Writer that fails every `write_all`. Stand-in for a closed
+    /// downstream pipe so the test does not depend on `dup2`/EPIPE
+    /// plumbing.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(ErrorKind::BrokenPipe, "test EPIPE"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn is_broken_starts_false_and_latches_after_write_failure() {
+        // The CLI relies on this latch to convert a swallowed EPIPE
+        // (record returns `()`) into a non-zero exit. Without the
+        // latch, a downstream `head -n1` would silently succeed even
+        // though the bulk of the run never reached the consumer.
+        let sink = StreamingSink::new(Box::new(FailingWriter));
+        assert!(!sink.is_broken(), "fresh sink should not report broken");
+
+        sink.record(Event::RunStarted {
+            run_id: "run_test".to_string(),
+        })
+        .await;
+
+        assert!(
+            sink.is_broken(),
+            "is_broken must latch after a failed write"
+        );
+    }
+
+    /// Writer that always succeeds. Confirms the broken flag stays
+    /// false on a clean run — guards against a regression where the
+    /// flag is set unconditionally.
+    struct OkWriter;
+
+    impl Write for OkWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn is_broken_stays_false_when_writes_succeed() {
+        let sink = StreamingSink::new(Box::new(OkWriter));
+        sink.record(Event::RunStarted {
+            run_id: "run_test".to_string(),
+        })
+        .await;
+        assert!(
+            !sink.is_broken(),
+            "clean writes must not latch the broken flag"
+        );
     }
 }

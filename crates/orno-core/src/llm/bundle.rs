@@ -5,7 +5,8 @@
 //! ```text
 //! {"type":"bundle_header","format_version":1}
 //! {"type":"pipeline_yaml","content":"version: 1\n..."}
-//! {"type":"llm_entry","req":{...},"res":{...}}
+//! {"type":"llm_entry","req":{...},"outcome":{"kind":"ok","res":{...}}}
+//! {"type":"llm_entry","req":{...},"outcome":{"kind":"err","err":{...}}}
 //! {"type":"tool_entry","key":"<hex>","content":"...","error":null}
 //! ```
 //! `LlmEntry` and `ToolEntry` use newtype variants; serde's internal
@@ -15,7 +16,17 @@
 //!
 //! `read_bundle` is forgiving on unknown future entry types via
 //! `#[non_exhaustive]` on the enum, but a missing `pipeline_yaml`
-//! section is a hard error: `orno replay` cannot proceed without one.
+//! section is a hard error: `orno replay` cannot proceed without one,
+//! and a `bundle_header` whose `format_version` does not match
+//! [`CURRENT_BUNDLE_VERSION`] is also a hard error so a future-version
+//! bundle is rejected up front rather than silently misinterpreted.
+//!
+//! Bearer-token scrub: `write_bundle` walks the parsed pipeline's
+//! `mcp_servers` block for HTTP servers with `auth.kind: bearer` and
+//! replaces any literal token value with `<REDACTED>` in the embedded
+//! YAML. Template values (`{{ secrets.X }}`) are left untouched —
+//! they are placeholders, not the secret itself. This is a defense-in-
+//! depth measure against bundles being shared as repro artifacts.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -23,9 +34,24 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::Pipeline;
+use crate::pipeline::schema::{McpAuthConfig, McpServerConfig};
 use crate::tool::ToolTapeEntry;
 
 use super::recording::TapeEntry;
+
+/// Wire-format version emitted in the `bundle_header` line. Bumped on
+/// any incompatible change to the bundle layout. `read_bundle` rejects
+/// bundles whose header carries a different value so a stale reader
+/// cannot silently misinterpret a newer bundle, and a newer reader
+/// does not blindly replay an older bundle whose semantics may have
+/// shifted.
+pub const CURRENT_BUNDLE_VERSION: u32 = 1;
+
+/// Replacement string substituted for literal bearer tokens during
+/// bundle write. Chosen to be visually loud in a diff and to never
+/// collide with a real token shape.
+const BEARER_REDACTION_PLACEHOLDER: &str = "<REDACTED>";
 
 /// One line in a record/replay bundle. Internally tagged on `"type"`,
 /// so each variant lands as a flat object on the wire.
@@ -78,6 +104,21 @@ pub enum BundleError {
     /// reconstruct the run without it.
     #[error("bundle is missing pipeline YAML section")]
     MissingPipelineYaml,
+    /// Bundle's `bundle_header` carried a `format_version` this build
+    /// cannot interpret. Returned only by [`read_bundle`].
+    #[error("bundle format version {found} is not supported by this build (expected {expected})")]
+    IncompatibleVersion {
+        /// `format_version` value read from the bundle header.
+        found: u32,
+        /// Version this build is compiled against.
+        expected: u32,
+    },
+    /// `pipeline_yaml` body could not be parsed before scrubbing
+    /// secrets on write. Returned only by [`write_bundle`]; an unparsable
+    /// body must not be embedded verbatim because secrets cannot be
+    /// located without a parsed `mcp_servers` block.
+    #[error("pipeline YAML parse error during bundle write: {0}")]
+    PipelineParse(String),
     /// A bundle line could not be deserialized as a `BundleEntry`.
     #[error("bundle parse error on line {line}: {msg}")]
     ParseError {
@@ -92,9 +133,13 @@ pub enum BundleError {
 /// recorded LLM and tool tape files.
 ///
 /// The tape files are read line-by-line and re-emitted as `LlmEntry` /
-/// `ToolEntry` lines in the bundle. Pipeline YAML is embedded verbatim
-/// without re-parsing — the bundle preserves whatever the original
-/// `orno run` saw, including comments and trailing whitespace.
+/// `ToolEntry` lines in the bundle. Pipeline YAML is embedded as the
+/// original text after passing through [`scrub_pipeline_secrets`] so
+/// MCP HTTP bearer tokens land as `<REDACTED>`. Comments, indentation,
+/// and trailing whitespace are preserved because the scrub uses
+/// targeted string substitution rather than a parse-and-reemit round
+/// trip — `orno replay` still needs to see the YAML the original
+/// `orno run` did, modulo the literal secrets.
 ///
 /// Either tape path may be `None` when no entries of that kind were
 /// recorded; the bundle will simply omit those lines.
@@ -104,6 +149,8 @@ pub fn write_bundle(
     tool_tape_path: Option<&Path>,
     out: &Path,
 ) -> Result<(), BundleError> {
+    let scrubbed_yaml = scrub_pipeline_secrets(pipeline_yaml)?;
+
     let file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -113,12 +160,14 @@ pub fn write_bundle(
 
     write_entry(
         &mut writer,
-        &BundleEntry::BundleHeader { format_version: 1 },
+        &BundleEntry::BundleHeader {
+            format_version: CURRENT_BUNDLE_VERSION,
+        },
     )?;
     write_entry(
         &mut writer,
         &BundleEntry::PipelineYaml {
-            content: pipeline_yaml.to_string(),
+            content: scrubbed_yaml,
         },
     )?;
 
@@ -134,11 +183,60 @@ pub fn write_bundle(
     Ok(())
 }
 
+/// Replace literal MCP bearer tokens in `pipeline_yaml` with
+/// `<REDACTED>` so a shared bundle does not leak production credentials.
+///
+/// The YAML is parsed once to locate `mcp_servers.*.auth.kind: bearer`
+/// entries; for each such entry, the literal token value is
+/// string-replaced in the YAML body. Template values
+/// (`{{ secrets.X }}`) are skipped because they are placeholders the
+/// run-time render resolves, not the secret. Tokens that round-trip
+/// safely through `serde_yaml_ng` (no quoting required) are matched
+/// directly; quoted tokens are matched both with and without their
+/// surrounding quotes so YAML escapes do not slip through unscrubbed.
+///
+/// Returns the input verbatim when the pipeline has no HTTP servers
+/// with bearer auth, so the common case is a no-op.
+pub fn scrub_pipeline_secrets(pipeline_yaml: &str) -> Result<String, BundleError> {
+    let pipeline: Pipeline = serde_yaml_ng::from_str(pipeline_yaml)
+        .map_err(|e| BundleError::PipelineParse(e.to_string()))?;
+
+    let mut tokens: Vec<String> = Vec::new();
+    for server in pipeline.mcp_servers.values() {
+        if let McpServerConfig::Http(http) = server
+            && let Some(McpAuthConfig::Bearer { token }) = &http.auth
+        {
+            // Template placeholders are not literal secrets — skip
+            // them so the rendered YAML still resolves at replay time.
+            if token.contains("{{") || token.is_empty() {
+                continue;
+            }
+            tokens.push(token.clone());
+        }
+    }
+
+    if tokens.is_empty() {
+        return Ok(pipeline_yaml.to_string());
+    }
+
+    // Sort longest-first so an embedded substring of a longer token
+    // is not redacted independently and corrupting the longer match.
+    tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
+
+    let mut out = pipeline_yaml.to_string();
+    for token in tokens {
+        out = out.replace(&token, BEARER_REDACTION_PLACEHOLDER);
+    }
+    Ok(out)
+}
+
 /// Read a bundle file back into its components.
 ///
 /// Returns [`BundleError::MissingPipelineYaml`] when no `pipeline_yaml`
-/// line was found. Corrupt lines surface as
-/// [`BundleError::ParseError`] carrying the 1-based line number.
+/// line was found, [`BundleError::IncompatibleVersion`] when the
+/// `bundle_header` carries a `format_version` other than
+/// [`CURRENT_BUNDLE_VERSION`], and [`BundleError::ParseError`] for
+/// corrupt lines (carrying the 1-based line number).
 pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -158,7 +256,18 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
                 msg: e.to_string(),
             })?;
         match entry {
-            BundleEntry::BundleHeader { .. } => {},
+            BundleEntry::BundleHeader { format_version } => {
+                // Reject mismatched versions up front so a future bundle
+                // is never fed into an older reader that would silently
+                // ignore new fields, and an older bundle is never
+                // replayed under semantics it was not recorded against.
+                if format_version != CURRENT_BUNDLE_VERSION {
+                    return Err(BundleError::IncompatibleVersion {
+                        found: format_version,
+                        expected: CURRENT_BUNDLE_VERSION,
+                    });
+                }
+            },
             BundleEntry::PipelineYaml { content } => pipeline_yaml = Some(content),
             BundleEntry::LlmEntry(e) => llm_entries.push(e),
             BundleEntry::ToolEntry(e) => tool_entries.push(e),
@@ -214,6 +323,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::recording::TapeOutcome;
     use crate::llm::{LlmRequest, LlmResponse, Usage};
     use std::io::Write;
 
@@ -227,15 +337,17 @@ mod tests {
                 None,
                 None,
             ),
-            res: LlmResponse {
-                content: format!("answer to {prompt}"),
-                finish_reason: Some("stop".into()),
-                usage: Some(Usage {
-                    prompt_tokens: 1,
-                    completion_tokens: 2,
-                    total_tokens: 3,
-                }),
-                tool_calls: Vec::new(),
+            outcome: TapeOutcome::Ok {
+                res: LlmResponse {
+                    content: format!("answer to {prompt}"),
+                    finish_reason: Some("stop".into()),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 2,
+                        total_tokens: 3,
+                    }),
+                    tool_calls: Vec::new(),
+                },
             },
         }
     }
@@ -259,7 +371,7 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_pipeline_and_entries() {
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: true\n";
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
         let llm = vec![sample_tape_entry("hello"), sample_tape_entry("world")];
         let tools = vec![
             sample_tool_entry("aaaa", "first"),
@@ -291,7 +403,10 @@ mod tests {
 
     #[test]
     fn write_with_no_tapes_emits_only_header_and_yaml() {
-        let yaml_body = "version: 1\n";
+        // Minimal but parseable: `nodes:` is required by the Pipeline
+        // struct, and `scrub_pipeline_secrets` parses the YAML as part
+        // of locating bearer tokens to redact.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
         let out = tempfile::NamedTempFile::new().unwrap();
 
         write_bundle(yaml_body, None, None, out.path()).unwrap();
@@ -305,7 +420,11 @@ mod tests {
     #[test]
     fn missing_pipeline_yaml_is_rejected() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, r#"{{"type":"bundle_header","format_version":1}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"bundle_header","format_version":{CURRENT_BUNDLE_VERSION}}}"#,
+        )
+        .unwrap();
         f.flush().unwrap();
 
         let err = read_bundle(f.path()).expect_err("must reject bundle without pipeline_yaml");
@@ -315,7 +434,11 @@ mod tests {
     #[test]
     fn corrupt_line_is_rejected_with_line_number() {
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, r#"{{"type":"bundle_header","format_version":1}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"bundle_header","format_version":{CURRENT_BUNDLE_VERSION}}}"#,
+        )
+        .unwrap();
         writeln!(f, "{{not json").unwrap();
         f.flush().unwrap();
 
@@ -324,5 +447,141 @@ mod tests {
             BundleError::ParseError { line, .. } => assert_eq!(line, 2),
             other => panic!("expected ParseError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn future_format_version_is_rejected() {
+        // Defense against silent misinterpretation: a bundle written by
+        // a future build with new entry types must not be replayed by an
+        // older reader that would skip them as `BundleHeader { .. }`.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"type":"bundle_header","format_version":999}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"pipeline_yaml","content":"version: 1\nnodes: []\n"}}"#
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let err = read_bundle(f.path()).expect_err("must reject incompatible version");
+        match err {
+            BundleError::IncompatibleVersion { found, expected } => {
+                assert_eq!(found, 999);
+                assert_eq!(expected, CURRENT_BUNDLE_VERSION);
+            },
+            other => panic!("expected IncompatibleVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_uses_current_bundle_version_constant() {
+        // Pin the wire-format version emitted by `write_bundle` to the
+        // public constant so an unintentional bump is caught here
+        // before it escapes a release.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).unwrap();
+
+        let raw = std::fs::read_to_string(out.path()).unwrap();
+        let header_line = raw.lines().next().expect("bundle has at least one line");
+        assert!(
+            header_line.contains(&format!(r#""format_version":{CURRENT_BUNDLE_VERSION}"#)),
+            "header line `{header_line}` must encode CURRENT_BUNDLE_VERSION = {CURRENT_BUNDLE_VERSION}",
+        );
+    }
+
+    #[test]
+    fn bearer_token_is_scrubbed_in_bundle() {
+        // Real-world threat: a debug bundle gets shared in a bug
+        // report, leaking the bearer token verbatim. Scrub on write
+        // must replace the literal value with the placeholder.
+        let yaml_body = "\
+version: 1
+mcp_servers:
+  prod:
+    transport: http
+    url: https://mcp.example.com
+    auth:
+      kind: bearer
+      token: sk-very-secret-bearer-abc123
+nodes:
+  - id: n
+    kind: shell
+    command: \"true\"
+";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+
+        let read = read_bundle(out.path()).expect("bundle read");
+        assert!(
+            !read.pipeline_yaml.contains("sk-very-secret-bearer-abc123"),
+            "literal bearer token must not survive bundle write: {}",
+            read.pipeline_yaml,
+        );
+        assert!(
+            read.pipeline_yaml.contains(BEARER_REDACTION_PLACEHOLDER),
+            "bundle YAML must contain the redaction placeholder: {}",
+            read.pipeline_yaml,
+        );
+    }
+
+    #[test]
+    fn templated_bearer_token_is_left_intact() {
+        // Templates are placeholders — `secrets.X` resolves at run /
+        // replay time. Scrubbing them would break replay because the
+        // template would no longer exist for the renderer to fill in.
+        let yaml_body = "\
+version: 1
+secrets:
+  - PROD_TOKEN
+mcp_servers:
+  prod:
+    transport: http
+    url: https://mcp.example.com
+    auth:
+      kind: bearer
+      token: '{{ secrets.PROD_TOKEN }}'
+nodes:
+  - id: n
+    kind: shell
+    command: \"true\"
+";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+
+        let read = read_bundle(out.path()).expect("bundle read");
+        assert!(
+            read.pipeline_yaml.contains("{{ secrets.PROD_TOKEN }}"),
+            "template-form token must be preserved verbatim: {}",
+            read.pipeline_yaml,
+        );
+        assert!(
+            !read.pipeline_yaml.contains(BEARER_REDACTION_PLACEHOLDER),
+            "no redaction placeholder should appear when token was templated: {}",
+            read.pipeline_yaml,
+        );
+    }
+
+    #[test]
+    fn pipeline_with_no_bearer_auth_is_not_modified() {
+        // Common-case no-op: a pipeline with no MCP HTTP bearer auth
+        // must round-trip the YAML byte-for-byte so comments and
+        // whitespace survive for human inspection of the bundle.
+        let yaml_body = "\
+# top-of-file comment
+version: 1
+nodes:
+  - id: n
+    kind: shell
+    command: \"true\"   # trailing comment
+";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).unwrap();
+
+        let read = read_bundle(out.path()).unwrap();
+        assert_eq!(
+            read.pipeline_yaml, yaml_body,
+            "no-bearer pipeline must be embedded verbatim",
+        );
     }
 }

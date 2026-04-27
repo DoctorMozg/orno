@@ -5,7 +5,13 @@ use std::path::Path;
 
 use crate::error::PipelineError;
 
-use super::schema::Pipeline;
+use super::schema::{McpServerConfig, Pipeline};
+
+/// Highest `Pipeline.version` this build understands. Bumped whenever
+/// the pipeline schema changes in a backwards-incompatible way so an
+/// older build refuses a newer pipeline rather than misinterpreting it,
+/// and a newer build can branch on version when reading older shapes.
+pub const CURRENT_PIPELINE_VERSION: u32 = 1;
 
 /// Load a pipeline from an on-disk YAML file and validate it.
 pub fn load_from_path(path: &Path) -> Result<Pipeline, PipelineError> {
@@ -36,8 +42,34 @@ pub fn load_from_str(yaml: &str) -> Result<Pipeline, PipelineError> {
     reason = "validation covers all schema constraints; acceptable until v0.1.0 node types stabilize"
 )]
 pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
+    // Reject schema versions this build does not understand. A version
+    // ahead of CURRENT_PIPELINE_VERSION can carry shapes the executor
+    // does not know how to dispatch; behind, the executor may apply
+    // semantics the author did not opt into. Either way, refuse fast
+    // with an actionable message rather than misinterpreting silently.
+    if pipeline.version != CURRENT_PIPELINE_VERSION {
+        return Err(PipelineError::Validation(format!(
+            "pipeline version {} is not supported by this build (expected {CURRENT_PIPELINE_VERSION})",
+            pipeline.version,
+        )));
+    }
+
     if pipeline.nodes.is_empty() {
         return Err(PipelineError::Validation("pipeline has no nodes".into()));
+    }
+
+    // Reject any MCP stdio server with an empty `command:` argv. An
+    // empty command would fail with an opaque "no such file" at run
+    // start; surfacing it at validate-time turns it into a YAML
+    // authoring error instead.
+    for (name, server) in &pipeline.mcp_servers {
+        if let McpServerConfig::Stdio(stdio) = server
+            && stdio.command.is_empty()
+        {
+            return Err(PipelineError::Validation(format!(
+                "mcp_servers.`{name}`: stdio transport requires a non-empty `command:` argv",
+            )));
+        }
     }
 
     let mut ids = HashSet::new();
@@ -295,12 +327,51 @@ mod tests {
         assert!(validate(&p).is_ok(), "valid pipeline should pass");
     }
 
+    #[test]
+    fn unsupported_pipeline_version_is_rejected() {
+        // A pipeline marked `version: 999` may carry shapes this build
+        // does not understand; refuse rather than dispatch nodes whose
+        // semantics may have shifted between schema revisions.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.version = 999;
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error on unsupported pipeline version");
+        };
+        assert!(
+            msg.contains("999") && msg.contains(&CURRENT_PIPELINE_VERSION.to_string()),
+            "error should mention found and expected version: {msg}",
+        );
+    }
+
+    #[test]
+    fn mcp_stdio_with_empty_command_is_rejected() {
+        // An empty argv would fail at spawn time with an opaque OS
+        // error. Catching it during validation turns the failure into
+        // an actionable YAML authoring error.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert(
+            "broken".to_string(),
+            McpServerConfig::Stdio(McpStdioConfig {
+                command: Vec::new(),
+                env: BTreeMap::new(),
+            }),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for empty stdio command");
+        };
+        assert!(
+            msg.contains("broken") && msg.contains("command"),
+            "error should name the server and mention `command`: {msg}",
+        );
+    }
+
     fn base_policy(allow_mutations: bool, allow_network: bool) -> AgentPolicy {
         AgentPolicy {
             max_iterations: 1,
             max_total_tokens: 1000,
             max_tool_calls: 5,
             max_subagent_depth: 1,
+            max_tool_output_bytes: None,
             allow_mutations,
             allow_network,
             allow_context_writes: false,

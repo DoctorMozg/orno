@@ -144,6 +144,10 @@ Documentation lives under [`docs/`](docs/README.md):
 
 Browsable, runnable example pipelines live in [`examples/`](examples/README.md), one folder per example.
 
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md) for notable changes between releases. The pre-v0.1 development log lives there until the first tagged release ships.
+
 ## License
 
 AGPL-3.0-only. See `Cargo.toml` for the canonical SPDX identifier.

@@ -260,6 +260,8 @@ Non-agentic subprocess invocation. Not subject to agent policy.
 
 For subprocess invocations **inside** an agent loop, use the `Bash` tool (which *is* policy-gated). `kind: shell` exists for deterministic pipeline steps that don't need a model.
 
+> **Policy note.** `kind: shell` runs entirely outside the agent strictness sandbox. It does **not** consult any agent's `allow_mutations`, `allow_network`, `allowed_domains`, `blocked_domains`, or any other tool-effect gate — those policies apply only to tool calls dispatched by an `agent` node's loop. A shell node can read or write any path the orno process can reach, open arbitrary network sockets, and exec any program on `PATH`, subject only to the OS-level permissions of the orno process itself. Treat the `command` and `args` fields as fully privileged: render-time templating is the boundary, and a value reaching them must already be trusted (a literal, a `{{ vars.* }}` from a vetted pipeline, or a `{{ nodes.<id>.* }}` whose upstream output you control). For untrusted-input subprocesses, route them through an `agent` node with `Bash` in `allowed_tools` so the strictness contract applies.
+
 ## Templates
 
 MiniJinja (auto-escape disabled) renders the following strings:

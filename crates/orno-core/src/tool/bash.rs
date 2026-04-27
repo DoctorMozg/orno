@@ -50,6 +50,14 @@ impl ToolHandler for BashHandler {
 
     #[instrument(skip(self, args), fields(tool.name = "Bash", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (inv, args);
+            return Err(ToolError::NotImplemented {
+                name: "Bash".to_string(),
+                feature: "requires Unix /bin/sh — not available on Windows".to_string(),
+            });
+        }
         let BashArgs {
             command,
             timeout_secs,
@@ -97,14 +105,46 @@ impl ToolHandler for BashHandler {
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code().unwrap_or(-1);
+        let (exit_code_label, signal_suffix) = format_status(output.status);
 
-        debug!(exit_code, "shell command finished");
+        debug!(
+            exit_code = exit_code_label.as_str(),
+            signal_suffix = signal_suffix.as_str(),
+            "shell command finished",
+        );
 
         Ok(format!(
-            "exit_code: {exit_code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "exit_code: {exit_code_label}{signal_suffix}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         ))
     }
+}
+
+/// Render a child process exit status into the two header pieces used
+/// by the model-facing tool output. `exit_code_label` is the numeric
+/// exit code on a normal exit, or the literal `"signal"` when the
+/// child was killed (in which case `signal_suffix` carries
+/// ` (signal: N)`). Keeping signal information visible to the model
+/// matches the wire-format `NodePayloadFailure { signal }` addition
+/// in `schema_version: 2` so the agent reasons over the same data.
+fn format_status(status: std::process::ExitStatus) -> (String, String) {
+    if let Some(code) = status.code() {
+        (code.to_string(), String::new())
+    } else if let Some(sig) = signal_from_status(status) {
+        ("signal".to_string(), format!(" (signal: {sig})"))
+    } else {
+        ("unknown".to_string(), String::new())
+    }
+}
+
+#[cfg(unix)]
+fn signal_from_status(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn signal_from_status(_status: std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(test)]

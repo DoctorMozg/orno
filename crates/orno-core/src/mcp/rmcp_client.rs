@@ -13,6 +13,7 @@
 //! 4. Call [`shutdown`][super::McpClient::shutdown] at run end.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -29,6 +30,16 @@ use crate::error::McpError;
 use crate::pipeline::schema::{McpAuthConfig, McpHttpConfig, McpStdioConfig};
 
 use super::{McpClient, McpTool, McpToolCallResult};
+
+/// Maximum time a single MCP handshake step (transport `serve`,
+/// `list_all_tools`, shutdown `cancel`) may run before the client
+/// surfaces a timeout. A misbehaving stdio child or a slow HTTP
+/// endpoint must not be able to hang the whole pipeline indefinitely.
+const MCP_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+/// Maximum time a single `tools/call` may run before the client
+/// surfaces a timeout. Mirrors [`MCP_HANDSHAKE_TIMEOUT_SECS`]; a
+/// per-tool override is intentionally out of scope for v0.1.
+const MCP_CALL_TIMEOUT_SECS: u64 = 30;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Config snapshots (private — rmcp types never leak from here)
@@ -157,13 +168,22 @@ impl McpClient for RmcpClient {
         };
 
         let peer = service.peer().clone();
-        let tools = peer
-            .list_all_tools()
-            .await
-            .map_err(|e| McpError::HandshakeFailed {
-                server: self.server.clone(),
-                source: Box::new(e),
-            })?;
+        let tools = tokio::time::timeout(
+            Duration::from_secs(MCP_HANDSHAKE_TIMEOUT_SECS),
+            peer.list_all_tools(),
+        )
+        .await
+        .map_err(|_| McpError::HandshakeFailed {
+            server: self.server.clone(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("list_tools timed out after {MCP_HANDSHAKE_TIMEOUT_SECS}s"),
+            )),
+        })?
+        .map_err(|e| McpError::HandshakeFailed {
+            server: self.server.clone(),
+            source: Box::new(e),
+        })?;
 
         let mcp_tools: Vec<McpTool> = tools
             .into_iter()
@@ -199,14 +219,24 @@ impl McpClient for RmcpClient {
             param = param.with_arguments(obj.clone());
         }
 
-        let result = peer
-            .call_tool(param)
-            .await
-            .map_err(|e| McpError::CallFailed {
-                server: self.server.clone(),
-                tool: tool.to_string(),
-                source: Box::new(e),
-            })?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
+            peer.call_tool(param),
+        )
+        .await
+        .map_err(|_| McpError::CallFailed {
+            server: self.server.clone(),
+            tool: tool.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("call_tool timed out after {MCP_CALL_TIMEOUT_SECS}s"),
+            )),
+        })?
+        .map_err(|e| McpError::CallFailed {
+            server: self.server.clone(),
+            tool: tool.to_string(),
+            source: Box::new(e),
+        })?;
 
         let ok = !result.is_error.unwrap_or(false);
         let content = result
@@ -233,9 +263,24 @@ impl McpClient for RmcpClient {
         if let Some(svc) = service {
             // cancel() consumes the service; a JoinError means the task
             // panicked. Treat as a crash but don't propagate — shutdown
-            // is best-effort.
-            if let Err(e) = svc.cancel().await {
-                tracing::warn!(server = %self.server, error = ?e, "mcp shutdown task panicked");
+            // is best-effort. The bounded timeout protects against a
+            // wedged child task that never returns from `cancel()`.
+            match tokio::time::timeout(
+                Duration::from_secs(MCP_HANDSHAKE_TIMEOUT_SECS),
+                svc.cancel(),
+            )
+            .await
+            {
+                Ok(Err(e)) => {
+                    tracing::warn!(server = %self.server, error = ?e, "mcp shutdown task panicked");
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        server = %self.server,
+                        "mcp shutdown timed out after {MCP_HANDSHAKE_TIMEOUT_SECS}s",
+                    );
+                },
+                Ok(Ok(_quit_reason)) => {},
             }
         }
         Ok(())
@@ -270,13 +315,22 @@ async fn spawn_stdio_client(
         source: Box::new(e),
     })?;
 
-    let service =
-        ().serve(transport)
-            .await
-            .map_err(|e| McpError::HandshakeFailed {
-                server: server_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let service = tokio::time::timeout(
+        Duration::from_secs(MCP_HANDSHAKE_TIMEOUT_SECS),
+        ().serve(transport),
+    )
+    .await
+    .map_err(|_| McpError::HandshakeFailed {
+        server: server_name.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("stdio handshake timed out after {MCP_HANDSHAKE_TIMEOUT_SECS}s"),
+        )),
+    })?
+    .map_err(|e| McpError::HandshakeFailed {
+        server: server_name.to_string(),
+        source: Box::new(e),
+    })?;
 
     Ok(service)
 }
@@ -320,12 +374,22 @@ async fn connect_http_client(
 
     let transport = build_http_transport(transport_cfg);
 
-    ().serve(transport)
-        .await
-        .map_err(|e| McpError::HandshakeFailed {
-            server: server_name.to_string(),
-            source: Box::new(e),
-        })
+    tokio::time::timeout(
+        Duration::from_secs(MCP_HANDSHAKE_TIMEOUT_SECS),
+        ().serve(transport),
+    )
+    .await
+    .map_err(|_| McpError::HandshakeFailed {
+        server: server_name.to_string(),
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("http handshake timed out after {MCP_HANDSHAKE_TIMEOUT_SECS}s"),
+        )),
+    })?
+    .map_err(|e| McpError::HandshakeFailed {
+        server: server_name.to_string(),
+        source: Box::new(e),
+    })
 }
 
 /// Convert the schema's `BTreeMap<String, String>` headers into rmcp's

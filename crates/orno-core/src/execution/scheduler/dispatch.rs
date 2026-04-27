@@ -191,6 +191,16 @@ impl Engine {
         redactor: &crate::events::Redactor,
     ) -> DispatchOutcome {
         let exit_code = resp.output.get("exit_code").and_then(Value::as_i64);
+        // `signal` is `Some(n)` exactly when the child was killed by
+        // a signal on Unix (see `node::shell` and `tool::bash`). The
+        // schema_version: 2 wire-format addition. `as_i64` is the
+        // safe path through `serde_json::Value::Number`; downcast to
+        // i32 once the value is known to fit.
+        let signal = resp
+            .output
+            .get("signal")
+            .and_then(Value::as_i64)
+            .and_then(|s| i32::try_from(s).ok());
         let stderr_tail = resp.output.get("stderr").and_then(Value::as_str).map(|s| {
             redactor
                 .redact(&truncate_tail(s, self.config.max_output_bytes))
@@ -213,6 +223,7 @@ impl Engine {
             node.id = %node.id,
             node.kind = kind,
             exit_code = exit_code.unwrap_or(-1),
+            signal = signal.unwrap_or(0),
             stderr_tail = %stderr_tail.as_deref().unwrap_or(""),
             stdout_tail = %stdout_tail,
             "node returned failure in payload",
@@ -221,6 +232,7 @@ impl Engine {
             ok: false,
             failure: Some(NodeFailure::NodePayloadFailure {
                 exit_code,
+                signal,
                 stderr_tail,
             }),
             output: Some(resp.output),

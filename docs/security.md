@@ -112,6 +112,7 @@ The full surface for secrets:
 5. **Argv scrubbing.** When a tool (notably `Bash`) takes a rendered argv that includes a secret, the secret is redacted from `tool_invoked.arguments` before emission.
 6. **Replay tape integrity.** Recorded tapes contain redacted bodies. Replaying a bundle does **not** re-fetch the original secret value; the model and tools see the redacted form. This is intentional — replay is for postmortems, not credential reuse.
 7. **No environment leakage.** Secrets are not injected into the host process environment. Tools that need a secret receive it via rendered template arguments.
+8. **Bundle bearer scrub.** When `--record-bundle` writes the embedded pipeline YAML, any literal MCP HTTP `auth.kind: bearer` token is replaced with `<REDACTED>` before the bundle is written. Tokens written as templates (`{{ secrets.X }}`) are preserved verbatim because they are placeholders, not the secret. This is defense-in-depth for the case where an operator writes a literal token directly into the YAML and later shares the bundle as a repro artifact.
 
 A secret that is never referenced in a template is loaded into memory but never rendered, never logged, and never recorded. It is harmless if unused — but unused secrets should be removed for hygiene.
 
@@ -119,11 +120,13 @@ A secret that is never referenced in a template is loaded into memory but never 
 
 Network-capable tools (`WebFetch`, MCP tools) consult `policy.allowed_domains` and `policy.blocked_domains` before issuing a request:
 
-- `allowed_domains` is a positive list. If non-empty, the request URL's host must match an entry. Empty `allowed_domains` means "no domain filter on the allow side" — the call proceeds unless blocked.
-- `blocked_domains` is a deny list. If the request URL's host matches an entry, the call is denied regardless of `allowed_domains`.
-- A denial fires `Event::DomainBlocked`, returns a denial string to the model, and continues the loop. The model can recover by trying a different URL or by reasoning about the failure.
+- The URL scheme must be `http` or `https`. Schemes such as `file://`, `ftp://`, and `data:` are denied at the policy gate before the handler runs, so a `WebFetch` call cannot be coerced into reading a local file by passing a `file://` URL.
+- If the URL host parses as a literal IP address, the gate denies addresses in the loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and link-local (`169.254.0.0/16`, `fe80::/10`) ranges. This is a defense against using an agent as an SSRF vector against the orno host's internal network. Hostname-based SSRF (a public name resolving to a private IP) is **not** blocked at this layer — see the DNS caveat below.
+- `allowed_domains` is a positive list. If non-empty, the request URL's host must match an entry by suffix: `example.com` matches `example.com` and `sub.example.com`. Empty `allowed_domains` means "no domain filter on the allow side" — the call proceeds unless blocked.
+- `blocked_domains` is a deny list. If the request URL's host matches an entry by the same suffix rule, the call is denied regardless of `allowed_domains`.
+- A denial fires `Event::ToolDenied`, returns a denial string to the model, and continues the loop. The model can recover by trying a different URL or by reasoning about the failure.
 
-Hostname matching is exact (no wildcard). Subdomain inclusion requires an explicit entry. IP-address hosts are matched literally; there is no DNS-resolution-time check, so an attacker who controls the DNS can in principle bypass the host check by pointing an allowed name at a forbidden IP. This is a known limitation; the mitigation is to combine domain filtering with network-level egress control.
+Subdomain inclusion is automatic via suffix matching. IP-address hosts are matched literally against the IP-range gate above. There is no DNS-resolution-time check, so an attacker who controls the DNS can in principle bypass the hostname check by pointing an allowed name at a forbidden IP. The IP gate catches the case where the model itself supplies a literal IP, but the DNS-rebinding case is a known limitation; the mitigation is to combine domain filtering with network-level egress control.
 
 ## Replay and security
 

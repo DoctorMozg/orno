@@ -64,8 +64,17 @@ pub enum NodeFailure {
     /// `EngineConfig.max_output_bytes`; the full payload is also
     /// recorded into the per-run `Context` under `node.<id>.*` so
     /// downstream templates can read the unbounded form.
+    ///
+    /// On Unix, a process killed by a signal reports
+    /// `signal = Some(n)` (the signal number, e.g. `9` for SIGKILL,
+    /// `15` for SIGTERM) and `exit_code = None`. A normal non-zero
+    /// exit reports `exit_code = Some(n)` and `signal = None`. On
+    /// non-Unix targets `signal` is always `None`. The field was
+    /// added in `schema_version: 2`; older readers that don't know
+    /// about it can still match on `exit_code`.
     NodePayloadFailure {
         exit_code: Option<i64>,
+        signal: Option<i32>,
         stderr_tail: Option<String>,
     },
     /// The agent exhausted `max_iterations` without reaching a `stop`
@@ -169,7 +178,61 @@ impl LlmFailure {
             },
         }
     }
+
+    /// Reconstruct an `LlmError` from a recorded `LlmFailure`. The
+    /// inverse of [`Self::from_llm_error`] used by `ReplayTransport` so
+    /// a tape entry that captured a failed call replays as the same
+    /// error class the live call produced. `provider` and `model` are
+    /// supplied by the caller from the originating request because the
+    /// on-the-wire form omits them — the parent `Event::LlmRequestFailed`
+    /// envelope carries the same context.
+    ///
+    /// `LlmFailure::Other` round-trips to `LlmError::Rejected` rather
+    /// than its original variant: `Other` is the catch-all for legacy
+    /// kinds (`NotImplemented`, `Rejected`) that the typed variant set
+    /// has not yet absorbed, so the inverse degrades to `Rejected` —
+    /// the closest-matching legacy variant — with the rendered chain
+    /// preserved as the message.
+    #[must_use]
+    pub fn to_llm_error(&self, provider: &str, model: &str) -> crate::error::LlmError {
+        use crate::error::LlmError;
+        match self {
+            Self::AuthFailed => LlmError::AuthFailed {
+                provider: provider.to_string(),
+            },
+            Self::RateLimited => LlmError::RateLimited {
+                provider: provider.to_string(),
+            },
+            Self::ModelNotFound => LlmError::ModelNotFound {
+                provider: provider.to_string(),
+                model: model.to_string(),
+            },
+            Self::ApiError {
+                status,
+                body_excerpt,
+            } => LlmError::ApiError {
+                provider: provider.to_string(),
+                status: *status,
+                body: body_excerpt.clone(),
+            },
+            Self::Transport { error } => {
+                LlmError::Transport(Box::new(ReplayedTransportError(error.clone())))
+            },
+            Self::ConfigError { message } => LlmError::ConfigError(message.clone()),
+            Self::ParseError { message } => LlmError::ParseError(message.clone()),
+            Self::ReplayMiss { key } => LlmError::ReplayMiss { key: key.clone() },
+            Self::Other { message } => LlmError::Rejected(message.clone()),
+        }
+    }
 }
+
+/// Newtype that satisfies `Box<dyn Error + Send + Sync>` for
+/// `LlmError::Transport`. Wraps the recorded error string from
+/// `LlmFailure::Transport` so a replayed transport failure surfaces
+/// through the same trait-object-shaped slot as a live one.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct ReplayedTransportError(String);
 
 #[cfg(test)]
 mod tests {
@@ -259,6 +322,101 @@ mod tests {
                 );
             },
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_trips_typed_variants_through_to_llm_error() {
+        // Replay reconstructs an `LlmError` from a recorded failure;
+        // the inverse must preserve the variant class so the agent
+        // loop sees the same error shape live and on replay.
+        type Case = (LlmFailure, fn(&LlmError) -> bool);
+        let cases: Vec<Case> = vec![
+            (
+                LlmFailure::AuthFailed,
+                |e| matches!(e, LlmError::AuthFailed { provider } if provider == "openai"),
+            ),
+            (
+                LlmFailure::RateLimited,
+                |e| matches!(e, LlmError::RateLimited { provider } if provider == "openai"),
+            ),
+            (LlmFailure::ModelNotFound, |e| {
+                matches!(e, LlmError::ModelNotFound { provider, model }
+                    if provider == "openai" && model == "gpt-x")
+            }),
+            (
+                LlmFailure::ApiError {
+                    status: 502,
+                    body_excerpt: "bad gateway".into(),
+                },
+                |e| {
+                    matches!(e, LlmError::ApiError { status, body, .. }
+                        if *status == 502 && body == "bad gateway")
+                },
+            ),
+            (
+                LlmFailure::ConfigError {
+                    message: "missing key".into(),
+                },
+                |e| matches!(e, LlmError::ConfigError(m) if m == "missing key"),
+            ),
+            (
+                LlmFailure::ParseError {
+                    message: "bad json".into(),
+                },
+                |e| matches!(e, LlmError::ParseError(m) if m == "bad json"),
+            ),
+            (
+                LlmFailure::ReplayMiss { key: "abc".into() },
+                |e| matches!(e, LlmError::ReplayMiss { key } if key == "abc"),
+            ),
+        ];
+        for (failure, check) in cases {
+            let err = failure.to_llm_error("openai", "gpt-x");
+            assert!(
+                check(&err),
+                "round-trip failed for {failure:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_variant_round_trips_with_message_preserved() {
+        // The boxed `Transport` source loses its concrete type on
+        // recording; replay must still carry the rendered cause through
+        // `Display` so downstream tracing sees the same message.
+        let failure = LlmFailure::Transport {
+            error: "connection reset by peer".into(),
+        };
+        let err = failure.to_llm_error("anthropic", "claude-x");
+        match err {
+            LlmError::Transport(source) => {
+                assert!(
+                    format!("{source}").contains("connection reset by peer"),
+                    "transport message lost on round-trip: {source}",
+                );
+            },
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_variant_round_trips_to_rejected_with_message_preserved() {
+        // Catch-all `Other` degrades to `Rejected` (the closest legacy
+        // variant) rather than disappearing; the rendered chain must
+        // survive so the cause is not silently dropped.
+        let failure = LlmFailure::Other {
+            message: "unrecognized failure mode".into(),
+        };
+        let err = failure.to_llm_error("openai", "gpt-x");
+        match err {
+            LlmError::Rejected(msg) => {
+                assert!(
+                    msg.contains("unrecognized failure mode"),
+                    "Other message lost: {msg}",
+                );
+            },
+            other => panic!("expected Rejected, got {other:?}"),
         }
     }
 }

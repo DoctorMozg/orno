@@ -101,48 +101,88 @@ impl LoopAgent {
                         )
                         .await);
                 }
-                // Gap 1 — domain gate. URL extracted from `url` arg;
-                // anything else (missing arg, non-string, unparsable)
-                // falls through to the handler which will produce its
-                // own error. Skipping the check on a missing URL is safe
-                // because the handler itself cannot reach the network
-                // without one.
-                if let Some(host) = tool_call
+                // Domain gate: URL extracted from `url` arg. Missing/unparsable
+                // URLs fall through to the handler which produces its own error —
+                // the handler cannot reach the network without a URL anyway.
+                if let Some(parsed) = tool_call
                     .fn_arguments
                     .get("url")
                     .and_then(Value::as_str)
                     .and_then(|u| reqwest::Url::parse(u).ok())
-                    .and_then(|parsed| parsed.host_str().map(str::to_string))
                 {
-                    // Suffix match: `d` matches host `h` if `h == d` or
-                    // `h` ends with `.d`. This closes the footgun where
-                    // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
-                    // through under naive equality, and applies the same
-                    // rule to the allowlist so operators can whitelist a
-                    // parent domain without enumerating every subdomain.
-                    let host_matches =
-                        |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
-                    if policy.blocked_domains.iter().any(host_matches) {
+                    // Deny non-HTTP(S) schemes to block file://, ftp://, data://.
+                    let scheme = parsed.scheme();
+                    if scheme != "http" && scheme != "https" {
                         return Ok(self
                             .deny(
                                 &inv,
                                 &tool_call.fn_name,
-                                format!("blocked_domains contains `{host}`"),
+                                format!(
+                                    "scheme `{scheme}` not permitted; \
+                                     only http and https are allowed"
+                                ),
                                 wire_to_yaml,
                             )
                             .await);
                     }
-                    if !policy.allowed_domains.is_empty()
-                        && !policy.allowed_domains.iter().any(host_matches)
-                    {
-                        return Ok(self
-                            .deny(
-                                &inv,
-                                &tool_call.fn_name,
-                                format!("allowed_domains does not contain `{host}`"),
-                                wire_to_yaml,
-                            )
-                            .await);
+                    if let Some(host) = parsed.host_str().map(str::to_string) {
+                        // Deny bare IPs in loopback/private/link-local ranges.
+                        // Hostnames that resolve to these addresses are a network-
+                        // boundary concern, not a policy concern.
+                        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                            let blocked = match ip {
+                                std::net::IpAddr::V4(v4) => {
+                                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                                },
+                                std::net::IpAddr::V6(v6) => {
+                                    v6.is_loopback()
+                                        // fe80::/10 link-local (no stable is_link_local API yet)
+                                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                                },
+                            };
+                            if blocked {
+                                return Ok(self
+                                    .deny(
+                                        &inv,
+                                        &tool_call.fn_name,
+                                        format!(
+                                            "IP `{ip}` is not routable \
+                                             (loopback / private / link-local)"
+                                        ),
+                                        wire_to_yaml,
+                                    )
+                                    .await);
+                            }
+                        }
+                        // Suffix match: `d` matches host `h` if `h == d` or
+                        // `h` ends with `.d`. This closes the footgun where
+                        // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
+                        // through under naive equality, and applies the same
+                        // rule to the allowlist.
+                        let host_matches =
+                            |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
+                        if policy.blocked_domains.iter().any(host_matches) {
+                            return Ok(self
+                                .deny(
+                                    &inv,
+                                    &tool_call.fn_name,
+                                    format!("blocked_domains contains `{host}`"),
+                                    wire_to_yaml,
+                                )
+                                .await);
+                        }
+                        if !policy.allowed_domains.is_empty()
+                            && !policy.allowed_domains.iter().any(host_matches)
+                        {
+                            return Ok(self
+                                .deny(
+                                    &inv,
+                                    &tool_call.fn_name,
+                                    format!("allowed_domains does not contain `{host}`"),
+                                    wire_to_yaml,
+                                )
+                                .await);
+                        }
                     }
                 }
             },

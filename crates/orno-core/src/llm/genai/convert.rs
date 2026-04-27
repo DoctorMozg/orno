@@ -34,6 +34,32 @@ fn resolve_auth(env_name: &str, secrets: &BTreeMap<String, String>) -> AuthData 
     }
 }
 
+/// Normalize an `OLLAMA_HOST` value (or fall back to the local default)
+/// into the URL form genai's Ollama adapter expects. Accepts:
+///
+/// - `None` → `http://localhost:11434/v1/`
+/// - `host:port` → prepends `http://` and appends `/v1/`
+/// - `http(s)://host:port` → appends `/v1/`
+/// - `http(s)://host:port/v1` → appends trailing `/`
+/// - `http(s)://host:port/v1/` → kept as-is
+///
+/// Trailing slashes are normalized so the endpoint is always a clean
+/// `…/v1/` URL regardless of how the user wrote the env var.
+fn ollama_endpoint(host: Option<&str>) -> String {
+    let raw = host.unwrap_or("http://localhost:11434");
+    let with_scheme = if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let trimmed = with_scheme.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/")
+    } else {
+        format!("{trimmed}/v1/")
+    }
+}
+
 /// Adapter-pinning resolver: every client holds a closure that fixes
 /// the `AdapterKind` (and, for openrouter, the endpoint + auth env)
 /// regardless of what genai's prefix detection would otherwise pick.
@@ -44,6 +70,12 @@ fn resolve_auth(env_name: &str, secrets: &BTreeMap<String, String>) -> AuthData 
 /// resolver has no reason to consult `std::env` at request time when
 /// the CLI already resolved the secret. `AuthData::clone()` returns
 /// a fresh owned value per call; the capture stays `Fn`, not `FnMut`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single dispatch table over the four supported providers; \
+              splitting per-provider helpers would obscure the side-by-side \
+              comparison that catches drift between adapter wirings"
+)]
 pub(super) fn build_client(
     provider: &str,
     secrets: &BTreeMap<String, String>,
@@ -77,17 +109,20 @@ pub(super) fn build_client(
                 ))
                 .build())
         },
-        "ollama" => Ok(Client::builder()
-            .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                    Ok(ServiceTarget {
-                        endpoint: Endpoint::from_static("http://localhost:11434/v1/"),
-                        auth: AuthData::None,
-                        model: ModelIden::new(AdapterKind::Ollama, st.model.model_name),
-                    })
-                },
-            ))
-            .build()),
+        "ollama" => {
+            let endpoint = ollama_endpoint(std::env::var("OLLAMA_HOST").ok().as_deref());
+            Ok(Client::builder()
+                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                        Ok(ServiceTarget {
+                            endpoint: Endpoint::from_owned(endpoint.clone()),
+                            auth: AuthData::None,
+                            model: ModelIden::new(AdapterKind::Ollama, st.model.model_name),
+                        })
+                    },
+                ))
+                .build())
+        },
         "openrouter" => {
             let auth = resolve_auth("OPENROUTER_API_KEY", secrets);
             Ok(Client::builder()
@@ -271,6 +306,57 @@ mod tests {
         secrets.insert("OPENROUTER_API_KEY".into(), "cli-val".into());
         assert!(build_client("openrouter", &secrets).is_ok());
         assert!(build_client("openrouter", &BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn ollama_endpoint_defaults_to_local_when_unset() {
+        assert_eq!(ollama_endpoint(None), "http://localhost:11434/v1/");
+    }
+
+    #[test]
+    fn ollama_endpoint_accepts_bare_host_and_prepends_http_and_v1_path() {
+        assert_eq!(
+            ollama_endpoint(Some("ollama.internal:11434")),
+            "http://ollama.internal:11434/v1/"
+        );
+    }
+
+    #[test]
+    fn ollama_endpoint_preserves_https_scheme_when_provided() {
+        assert_eq!(
+            ollama_endpoint(Some("https://ollama.example.com")),
+            "https://ollama.example.com/v1/"
+        );
+    }
+
+    #[test]
+    fn ollama_endpoint_normalizes_existing_v1_path_to_trailing_slash() {
+        assert_eq!(
+            ollama_endpoint(Some("http://ollama.local:11434/v1")),
+            "http://ollama.local:11434/v1/"
+        );
+    }
+
+    #[test]
+    fn ollama_endpoint_strips_redundant_trailing_slashes() {
+        assert_eq!(
+            ollama_endpoint(Some("http://ollama.local:11434/")),
+            "http://ollama.local:11434/v1/"
+        );
+        assert_eq!(
+            ollama_endpoint(Some("http://ollama.local:11434/v1/")),
+            "http://ollama.local:11434/v1/"
+        );
+    }
+
+    #[test]
+    fn build_client_ollama_succeeds_regardless_of_env_state() {
+        // build_client reads OLLAMA_HOST internally; the construction
+        // path must not error on either branch even when the env is
+        // unset. (We avoid mutating the process env here because
+        // `std::env::set_var` is forbidden by the workspace clippy
+        // policy.)
+        assert!(build_client("ollama", &BTreeMap::new()).is_ok());
     }
 
     #[test]

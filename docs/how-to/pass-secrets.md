@@ -136,6 +136,22 @@ If the secret is missing at request time, the LLM call fails with `LlmFailure::A
 - **Network egress.** Setting `allow_network: false` denies `WebFetch` and MCP, but a `Bash` invocation with `allow_mutations: true` can still reach the network. orno does not network-namespace tool subprocesses. For OS-level egress control, run inside a container.
 - **Side-channel inference.** Token-count fields and timing patterns are recorded verbatim. If your threat model includes side-channels, treat the bundle as sensitive and apply additional scrubbing before sharing.
 
+## Redaction limitations
+
+The redactor matches secret values as **literal byte sequences** in event strings. It scans every emitted event, log line, and tape entry for the exact UTF-8 of each declared secret and replaces matches with `***`. This is fast, allocation-free in the no-match case, and immune to most accidental leaks where a secret was rendered into a prompt or echoed by the model.
+
+A literal matcher does **not** see a secret that has been transformed before emission. The following forms bypass redaction because they no longer contain the original byte sequence:
+
+- **Base64-encoded.** A `Basic` HTTP auth header is `Authorization: Basic <base64(user:secret)>`. The base64 form is a different string from the secret; a tool that emits the base64 will leak it. Treat `secrets:` as the pre-encoding name and either declare both forms (`SECRET_RAW` and `SECRET_B64`) or perform the encoding inside a tool that does not echo its argv.
+- **URL-encoded.** A secret containing `=`, `+`, `/`, or non-ASCII bytes that is concatenated into a query string (e.g. `?token=abc%2B123`) will reach the event log as the percent-encoded form, which the redactor will not recognize.
+- **Hex-encoded or hashed.** A tool that hashes the secret (e.g. SHA-256 of an API key for HMAC signing) and emits the hash digest leaks the digest verbatim. The digest is not the secret, but it is a stable identifier and may be sensitive on its own.
+- **JSON-escaped with embedded quotes or backslashes.** A secret like `pass"word` round-trips through JSON as `"pass\"word"`, which the literal matcher will not catch when the haystack is a JSON string. (A redactor-aware emission path that JSON-escapes the redaction inputs as well would close this gap; today it is not implemented.)
+- **Split across event boundaries.** A secret whose bytes happen to straddle two separately-emitted events (e.g. a streamed LLM response chunked at an inopportune offset) is not reassembled; the redactor sees each event in isolation. orno emits LLM responses as a single envelope after the model finishes, so this rarely occurs in practice — but a bespoke streaming consumer that re-splits the bytes can re-introduce the gap.
+- **Empty-string secrets.** A `secrets:` entry whose value is empty is dropped at redactor construction time. An empty matcher would replace every zero-width position in every string, corrupting all output.
+- **Normalization mismatches.** The redactor compares bytes, not Unicode-normalized forms. A secret containing combining characters that the model normalizes differently (NFC vs. NFD) will not match.
+
+The mitigation in every case is the same: declare every form the secret can take in the `secrets:` list, or scrub the transformed form at the call site (e.g. an MCP server that base64-encodes `Authorization` should be invoked via the `auth.kind: bearer` block whose token field is redactor-aware, not via a manually templated header). When in doubt, treat any tape committed to a repository or shared with a third party as sensitive even after redaction.
+
 ## Recipe 1 — single LLM provider
 
 The minimum:

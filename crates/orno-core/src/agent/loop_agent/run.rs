@@ -6,11 +6,13 @@
 //! strictness dimensions and emits the full paired event stream.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use crate::agent::{Agent, AgentOutput, AgentRequest};
 use crate::error::AgentError;
@@ -19,6 +21,37 @@ use crate::llm::{LlmRequest, OrnoChatMessage, OrnoChatTool};
 use crate::tool::{StateHandle, ToolInvocation};
 
 use super::{LoopAgent, SUBAGENT_PREFIX};
+
+/// Default cap on the per-call tool output bytes appended to the
+/// conversation history. Mirrors the `AgentPolicy.max_tool_output_bytes`
+/// field — when the operator omits the policy field, this constant
+/// applies. Sized to comfortably hold a single Read of a moderate file
+/// or a `WebFetch` of a typical HTML page; a runaway tool that returns a
+/// gigabyte of output gets truncated to this cap before it reaches the
+/// LLM transport.
+const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Truncate a tool-result string to at most `cap` bytes (head-keep), and
+/// append a one-character ellipsis marker if truncation happened. Used
+/// before the result is pushed onto the conversation history so a single
+/// runaway tool call cannot drag the next LLM request past the
+/// provider's prompt-size ceiling. Splits on a UTF-8 char boundary so
+/// the marker concatenation is always safe.
+fn truncate_tool_output(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    // Walk back from `cap` to the previous UTF-8 boundary. `is_char_boundary(0)`
+    // is always true so the loop terminates.
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + '…'.len_utf8());
+    out.push_str(&s[..end]);
+    out.push('…');
+    out
+}
 
 /// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
 /// `None` when no `SetState` call landed — keeps the wire shape of
@@ -113,7 +146,14 @@ impl Agent for LoopAgent {
         // the model can reason over what it already did.
         let mut messages: Vec<OrnoChatMessage> = Vec::new();
         let mut tool_call_count: u32 = 0;
-        let mut total_tokens: u64 = 0;
+        // Per-call token counter. Replaces the previous `u64` so subagent
+        // tool calls can be handed an `Arc` pointer to bump on every
+        // child-loop LLM response — that keeps the parent's
+        // `policy.max_total_tokens` budget transitively covering child
+        // spend without each loop maintaining a private total. The
+        // `Arc<AtomicU64>` is shared via `ToolInvocation.token_budget_share`
+        // and via `AgentRequest.parent_token_counter` for nested children.
+        let token_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         for iteration in 0..req.policy.max_iterations {
             self.config
@@ -121,6 +161,12 @@ impl Agent for LoopAgent {
                 .record(Event::AgentIterationStarted {
                     run_id: run_id.to_string(),
                     node_id: node_id.to_string(),
+                    // Hard-coded because only `kind: agent` nodes
+                    // drive a `LoopAgent` iteration; if a future shell
+                    // executor learns to loop, this site lifts the
+                    // value from the caller. See ADR 0009 for why
+                    // there is no peer kind today.
+                    node_kind: "agent".to_string(),
                     iteration,
                 })
                 .await;
@@ -132,13 +178,17 @@ impl Agent for LoopAgent {
             let mut retried_parse_errors: HashSet<String> = HashSet::new();
 
             // Each request asks for the budget remaining AFTER previous
-            // iterations' usage. `total_tokens` is updated below from
+            // iterations' usage. `token_counter` is updated below from
             // the response's `Usage`; the saturating subtraction guards
-            // against the model overshooting the prior cap.
+            // against the model overshooting the prior cap. `Relaxed` is
+            // sufficient because the loop is single-tasked and the
+            // counter is only observed across `.await` points within the
+            // same task — there is no cross-thread race to order against.
             let max_tokens = if req.policy.max_total_tokens == 0 {
                 None
             } else {
-                let remaining = req.policy.max_total_tokens.saturating_sub(total_tokens);
+                let used = token_counter.load(Ordering::Relaxed);
+                let remaining = req.policy.max_total_tokens.saturating_sub(used);
                 (remaining > 0).then(|| u32::try_from(remaining).unwrap_or(u32::MAX))
             };
 
@@ -203,12 +253,38 @@ impl Agent for LoopAgent {
                 .await;
 
             if let Some(usage) = &response.usage {
-                total_tokens = total_tokens.saturating_add(u64::from(usage.total_tokens));
+                let delta = u64::from(usage.total_tokens);
+                token_counter.fetch_add(delta, Ordering::Relaxed);
+                // Bump the parent's counter in lockstep so a parent
+                // loop's `policy.max_total_tokens` budget transitively
+                // covers child subagent token spend. The chain is
+                // recursive: a grandchild loop's responses reach the
+                // grandparent through the parent's `parent_token_counter`
+                // hop on the next-up loop's iteration check.
+                if let Some(parent) = &req.parent_token_counter {
+                    parent.fetch_add(delta, Ordering::Relaxed);
+                }
+                let total_tokens = token_counter.load(Ordering::Relaxed);
                 if req.policy.max_total_tokens > 0 && total_tokens > req.policy.max_total_tokens {
                     return Err(AgentError::BudgetExceeded {
                         kind: BudgetKind::Tokens,
                     });
                 }
+            } else if req.policy.max_total_tokens > 0 {
+                // The provider returned no `usage` block. Token-budget
+                // enforcement is intrinsically per-response — without
+                // usage we cannot bump `total_tokens`, so the configured
+                // cap is effectively degraded for this response. Warn so
+                // the operator can spot transports/models that
+                // systematically omit usage and add a wrapper that
+                // estimates instead. The dimension contract still holds
+                // for any iteration where usage IS reported.
+                warn!(
+                    policy.max_total_tokens = req.policy.max_total_tokens,
+                    llm.provider = %req.provider,
+                    llm.model = %req.model,
+                    "provider returned no usage; token budget enforcement is degraded for this response",
+                );
             }
 
             // No tool calls → the model produced a final text answer.
@@ -223,7 +299,7 @@ impl Agent for LoopAgent {
                     finish_reason: response.finish_reason,
                     usage: response.usage,
                     iterations: iteration,
-                    total_tokens,
+                    total_tokens: token_counter.load(Ordering::Relaxed),
                     state,
                 });
             }
@@ -286,6 +362,7 @@ impl Agent for LoopAgent {
                             call_id: &tool_call.call_id,
                             depth: req.depth,
                             state_handle: Some(state_handle),
+                            token_budget_share: Some(Arc::clone(&token_counter)),
                         };
                         self.invoke_with_parse_retry(
                             handler,
@@ -309,6 +386,7 @@ impl Agent for LoopAgent {
                         call_id: &tool_call.call_id,
                         depth: req.depth,
                         state_handle: Some(state_handle),
+                        token_budget_share: Some(Arc::clone(&token_counter)),
                     };
                     self.invoke_with_parse_retry(
                         handler,
@@ -337,9 +415,20 @@ impl Agent for LoopAgent {
                     })
                     .await;
 
+                // Truncate the per-call tool output that flows back into
+                // the conversation history so a single runaway tool call
+                // cannot drag the next LLM request past the provider's
+                // prompt-size ceiling. The handler's wire-event
+                // `output_excerpt` above is already capped separately;
+                // this cap governs the conversation-history payload only.
+                let cap = req
+                    .policy
+                    .max_tool_output_bytes
+                    .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
+                let truncated = truncate_tool_output(&result_content, cap);
                 messages.push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
-                    content: result_content,
+                    content: truncated,
                 });
             }
         }

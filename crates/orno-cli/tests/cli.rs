@@ -136,13 +136,14 @@ nodes:
     command: "false"
 "#;
     let file = write_pipeline(yaml);
-    // The CLI process itself exits 0 even when the pipeline reports
-    // failure — pipeline `ok: false` is a stream-level signal, not a
-    // process-level one.
+    // After WU-2.4 the CLI exits non-zero whenever the run reports
+    // `ok: false`, so a downstream `orno run … && next-step` short-
+    // circuits without inspecting NDJSON. The stream-level `ok:false`
+    // assertions still hold.
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
         .assert()
-        .success();
+        .failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
         stdout.contains(r#""ok":false"#),
@@ -173,10 +174,11 @@ nodes:
     needs: [fail_node]
 "#;
     let file = write_pipeline(yaml);
+    // WU-2.4: any failed node propagates to a non-zero process exit.
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
         .assert()
-        .success();
+        .failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(
@@ -234,10 +236,12 @@ nodes:
     command: "{{ invalid syntax ]}"
 "#;
     let file = write_pipeline(yaml);
+    // WU-2.4: template render failure surfaces as a non-zero process
+    // exit (not just a stream-level `ok:false`).
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
         .assert()
-        .success();
+        .failure();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(
         stdout.contains(r#""type":"node_finished""#)
@@ -704,5 +708,76 @@ nodes:
     assert!(
         stdout.contains(r#""type":"run_finished""#) && stdout.contains(r#""ok":false"#),
         "expected run_finished ok:false: {stdout}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_sigint_exits_130_and_emits_run_finished() {
+    // WU-2.5: SIGINT must produce exit 130, a `RunFinished {ok:false,
+    // failed_nodes:["<interrupted>"]}` envelope on stdout, and no
+    // panic. `sleep 30` keeps the shell child alive long enough to be
+    // interrupted; the SIGINT is delivered via the platform `kill`
+    // binary so the test avoids a `nix` / `libc` dev-dep.
+    use std::io::Read as _;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::{Duration, Instant};
+
+    let yaml = r#"
+version: 1
+nodes:
+  - id: long_sleep
+    kind: shell
+    command: sleep
+    args: ["30"]
+"#;
+    let file = write_pipeline(yaml);
+    let bin = assert_cmd::cargo::cargo_bin("orno");
+    let mut child = StdCommand::new(&bin)
+        .args(["run", file.path().to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn orno");
+    let pid = child.id();
+    // 500ms gives the child time to install the signal handler and
+    // enter engine.run before SIGINT lands.
+    std::thread::sleep(Duration::from_millis(500));
+    let kill_status = StdCommand::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("invoke kill");
+    assert!(kill_status.success(), "kill -INT must succeed");
+
+    // 10s watchdog: ~5s MCP grace + slack. Anything above is a real bug.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exit_status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                drop(child.kill());
+                panic!("orno did not exit within 10s of SIGINT");
+            },
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut stdout = String::new();
+    child
+        .stdout
+        .as_mut()
+        .expect("piped stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+
+    assert_eq!(
+        exit_status.code(),
+        Some(130),
+        "expected exit 130 on SIGINT: stdout=\n{stdout}",
+    );
+    assert!(
+        stdout.contains(r#""type":"run_finished""#)
+            && stdout.contains(r#""ok":false"#)
+            && stdout.contains(r#""<interrupted>""#),
+        "expected run_finished+ok:false+<interrupted>: {stdout}",
     );
 }

@@ -21,9 +21,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use orno_core::agent::{Agent, LoopAgent, LoopAgentConfig};
-use orno_core::events::{EventSink, Redactor, StreamingSink};
+use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::recording::TapeEntry;
 use orno_core::llm::{LlmTransport, OrnoChatTool, ReplayTransport, read_bundle};
@@ -43,6 +43,11 @@ use orno_core::tool::{
 /// and response excerpt truncation so emitted events match the
 /// original recording's truncation policy.
 const REPLAY_BODY_EXCERPT_BYTES: usize = 2048;
+
+/// Sentinel inserted into `RunFinished.failed_nodes` on SIGINT.
+/// Same value as `commands::run::INTERRUPTED_FAILED_NODE` — keeps the
+/// stream-level signal identical across `run` and `replay`.
+const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
 
 #[expect(
     clippy::too_many_lines,
@@ -84,7 +89,10 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     let redactor = Arc::new(Redactor::default());
     let body_excerpt_max_bytes = REPLAY_BODY_EXCERPT_BYTES;
 
-    let sink: Arc<dyn EventSink> = Arc::new(StreamingSink::stdout());
+    // Mirrors `orno run`: keep a typed handle so the CLI can read
+    // the broken flag after `engine.run` returns.
+    let streaming_sink = Arc::new(StreamingSink::stdout());
+    let sink: Arc<dyn EventSink> = streaming_sink.clone();
     let run_id = new_run_id();
 
     let tool_entries = bundle.tool_entries;
@@ -112,7 +120,7 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
             tool_entries.clone(),
         )),
         Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(WebFetchHandler),
+            Arc::new(WebFetchHandler::default()),
             tool_entries.clone(),
         )),
         Arc::new(ReplayToolHandler::from_entries(
@@ -185,12 +193,23 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     });
 
     let agent: Arc<dyn Agent> = loop_agent;
+    let engine_config = EngineConfig::default();
     let mut registry = NodeRegistry::new();
-    registry.register("shell", Arc::new(ShellExecutor));
+    registry.register(
+        "shell",
+        Arc::new(ShellExecutor::with_config(
+            sink.clone(),
+            engine_config.max_node_output_bytes,
+        )),
+    );
     registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
     let registry = Arc::new(registry);
     let templates = Arc::new(TemplateEngine::new());
-    let engine = Engine::new(sink, registry, templates, EngineConfig::default());
+    // Clone the sink before transferring ownership into the engine so
+    // the SIGINT branch below can still emit a sentinel `RunFinished`
+    // envelope after the engine future is dropped.
+    let sink_for_signal = sink.clone();
+    let engine = Engine::new(sink, registry, templates, engine_config);
 
     // RunInputs is empty: rendered prompts already include the env /
     // secrets values they were captured with, so re-resolving here
@@ -199,7 +218,46 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     // pipelines with first-turn templates that read env, the original
     // rendered values still flow through the recorded `LlmRequest`,
     // not through a re-render against the live process.
-    engine.run(&run_id, &pipeline, RunInputs::default()).await?;
+    //
+    // SIGINT handling mirrors `orno run`: race the engine future
+    // against `ctrl_c`. Replay has no live tapes to flush and no MCP
+    // children to drain, so the SIGINT branch only emits a sentinel
+    // `RunFinished` and bubbles up `Interrupted`. `main` translates
+    // that sentinel into exit code 130 so a wrapping shell can tell
+    // operator cancellation apart from a normal tape-miss failure
+    // (which exits 1 via the `bail!` below).
+    let run_outcome = tokio::select! {
+        biased;
+        () = super::sigint_with_warning() => {
+            sink_for_signal.record(Event::RunFinished {
+                run_id: run_id.clone(),
+                ok: false,
+                failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
+                skipped_nodes: Vec::new(),
+            })
+            .await;
+            return Err(super::Interrupted.into());
+        }
+        res = engine.run(&run_id, &pipeline, RunInputs::default()) => res?,
+    };
+
+    if streaming_sink.is_broken() {
+        bail!("event stream write failed (downstream closed?); replay output is incomplete");
+    }
+
+    // A replay that mismatches the tape (LlmError::ReplayMiss,
+    // tool-tape miss, etc.) surfaces as a node failure and lands in
+    // `RunFinished.ok = false`. Mirror `orno run` so a CI step that
+    // gates on `orno replay --bundle …` failing actually exits non-zero.
+    if !run_outcome.ok {
+        let names = if run_outcome.failed_nodes.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            run_outcome.failed_nodes.join(", ")
+        };
+        bail!("replay failed: nodes [{names}] reported ok:false");
+    }
+
     Ok(())
 }
 
@@ -308,7 +366,10 @@ fn derive_server_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orno_core::llm::{LlmRequest, LlmResponse, OrnoChatTool, recording::TapeEntry};
+    use orno_core::llm::{
+        LlmRequest, LlmResponse, OrnoChatTool,
+        recording::{TapeEntry, TapeOutcome},
+    };
 
     fn tape_entry_with_tools(tools: Vec<OrnoChatTool>) -> TapeEntry {
         TapeEntry {
@@ -322,11 +383,13 @@ mod tests {
                 messages: vec![],
                 tools,
             },
-            res: LlmResponse {
-                content: "ok".into(),
-                finish_reason: Some("stop".into()),
-                usage: None,
-                tool_calls: vec![],
+            outcome: TapeOutcome::Ok {
+                res: LlmResponse {
+                    content: "ok".into(),
+                    finish_reason: Some("stop".into()),
+                    usage: None,
+                    tool_calls: vec![],
+                },
             },
         }
     }

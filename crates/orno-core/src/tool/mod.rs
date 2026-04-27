@@ -13,7 +13,9 @@ pub mod subagent;
 pub mod web_fetch;
 pub mod write;
 
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -62,7 +64,7 @@ pub enum ToolEffect {
 /// the shared sink. `SetStateHandler` uses `state_handle` to persist
 /// its writes without relying on global state. Builtin handlers that
 /// care about none of these typically ignore every field but `call_id`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ToolInvocation<'a> {
     /// Run identifier the parent agent is executing under (`run_<ULID>`).
     pub run_id: &'a str,
@@ -81,6 +83,16 @@ pub struct ToolInvocation<'a> {
     /// and the handler is dispatched through `LoopAgent`. `SetState`
     /// reaches for this; every other handler leaves it alone.
     pub state_handle: Option<StateHandle<'a>>,
+    /// Shared handle to the calling loop's per-call token counter.
+    /// `SubagentHandler` forwards this into its child `AgentRequest` as
+    /// `parent_token_counter` so the child loop bumps the parent's
+    /// counter on every LLM response — the parent's
+    /// `policy.max_total_tokens` budget transitively covers any
+    /// subagent loop spend. `None` when the handler is dispatched
+    /// outside a `LoopAgent` (unit tests, future direct-handler call
+    /// sites). Adding this field is why `ToolInvocation` is `Clone` but
+    /// no longer `Copy` — `Arc` is not trivially copyable.
+    pub token_budget_share: Option<Arc<AtomicU64>>,
 }
 
 /// Borrow-scoped pointer to a single node's `state` buffer. Held for
@@ -118,6 +130,7 @@ impl<'a> ToolInvocation<'a> {
             call_id,
             depth: 0,
             state_handle: None,
+            token_budget_share: None,
         }
     }
 }

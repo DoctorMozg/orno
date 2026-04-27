@@ -59,6 +59,15 @@ pub enum Command {
         #[arg(long = "stderr-tail-bytes", value_name = "BYTES")]
         stderr_tail_bytes: Option<usize>,
 
+        /// Cap on a `kind: shell` node's captured `stdout` or `stderr`,
+        /// per stream. A child that writes more on either stream has
+        /// the captured prefix retained and a `node_output_truncated`
+        /// envelope emitted; the child keeps running so it does not
+        /// block on a full pipe buffer. Default 8 MiB. Distinct from
+        /// `--stderr-tail-bytes` (which caps log-line excerpts only).
+        #[arg(long = "max-node-output-bytes", value_name = "BYTES")]
+        max_node_output_bytes: Option<usize>,
+
         /// Write all LLM request/response pairs to a tape file for later
         /// replay. Creates or truncates the file. Mutually exclusive with
         /// `--replay-tape`.

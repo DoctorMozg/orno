@@ -224,6 +224,7 @@ mod tests {
             call_id,
             depth: 0,
             state_handle: Some(StateHandle::new(buf)),
+            token_budget_share: None,
         }
     }
 
@@ -465,6 +466,7 @@ mod tests {
             call_id: "c1",
             depth: 0,
             state_handle: None,
+            token_budget_share: None,
         };
         let err = h
             .invoke(inv, json!({ "key": "plan", "value": 1 }))

@@ -6,6 +6,8 @@
 mod cli;
 mod commands;
 
+use std::process::ExitCode;
+
 use anyhow::Result;
 use clap::Parser;
 use time::format_description::well_known::Rfc3339;
@@ -13,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::UtcTime;
 
 use crate::cli::{Cli, Command};
+use crate::commands::{Interrupted, SIGINT_EXIT_CODE};
 
 /// Default cap on captured stderr in failure WARNs when `--verbose`
 /// is passed without an explicit `--stderr-tail-bytes`. Verbose mode
@@ -20,8 +23,16 @@ use crate::cli::{Cli, Command};
 /// surface; the higher cap matches the intent.
 const VERBOSE_DEFAULT_TAIL_BYTES: usize = 65_536;
 
+/// Default per-stream cap on a `kind: shell` node's captured stdout
+/// or stderr when the operator does not pass `--max-node-output-bytes`.
+/// Mirrors `EngineConfig::default().max_node_output_bytes`. Kept here
+/// so the CLI can distinguish "operator passed `0` to disable the cap"
+/// (still surfaced as `0` to the engine) from "operator omitted the
+/// flag" (use this default).
+const DEFAULT_MAX_NODE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let args = Cli::parse();
 
     // Verbose flag is read once here so tracing init and the engine
@@ -29,16 +40,24 @@ async fn main() -> Result<()> {
     let verbose = matches!(&args.command, Command::Run { verbose: true, .. });
     init_tracing(verbose);
 
-    let result = dispatch(args).await;
-    if let Err(err) = &result {
-        // `{:#}` walks the anyhow source chain on a single line. Without
-        // it, only the top-level message reaches stderr in release builds
-        // and the actual cause is invisible. The `Err` return from `main`
-        // would print `Debug` form, which is verbose but unredacted —
-        // this gives a tighter, deterministic line.
-        eprintln!("error: {err:#}");
+    match dispatch(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // SIGINT path: `run` / `replay` already emitted a sentinel
+            // `RunFinished { ok: false }` and (for `run`) drained MCP
+            // servers. Surface exit code 130 silently — printing
+            // "error: interrupted by SIGINT" would noise up CI logs
+            // for a user-initiated cancellation.
+            if err.downcast_ref::<Interrupted>().is_some() {
+                return ExitCode::from(SIGINT_EXIT_CODE);
+            }
+            // `{:#}` walks the anyhow source chain on a single line.
+            // Without it, only the top-level message reaches stderr in
+            // release builds and the actual cause is invisible.
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        },
     }
-    result
 }
 
 async fn dispatch(args: Cli) -> Result<()> {
@@ -50,6 +69,7 @@ async fn dispatch(args: Cli) -> Result<()> {
             secrets_file,
             verbose,
             stderr_tail_bytes,
+            max_node_output_bytes,
             record_tape,
             replay_tape,
             record_tool_tape,
@@ -66,6 +86,8 @@ async fn dispatch(args: Cli) -> Result<()> {
                 } else {
                     2048
                 }),
+                max_node_output_bytes: max_node_output_bytes
+                    .unwrap_or(DEFAULT_MAX_NODE_OUTPUT_BYTES),
                 record_tape,
                 replay_tape,
                 record_tool_tape,

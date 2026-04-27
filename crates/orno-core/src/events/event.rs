@@ -20,10 +20,18 @@ pub enum Event {
     NodeStarted {
         run_id: String,
         node_id: String,
+        /// Discriminator string mirroring `NodeKind`'s serde tag
+        /// (`"agent"` or `"shell"` today). Lets downstream consumers
+        /// filter on kind without re-reading the pipeline YAML. Added
+        /// in `schema_version: 2`.
+        node_kind: String,
     },
     NodeFinished {
         run_id: String,
         node_id: String,
+        /// Discriminator string mirroring `NodeKind`'s serde tag.
+        /// Added in `schema_version: 2`.
+        node_kind: String,
         ok: bool,
         /// Populated only when `ok: false`; encodes *why* the node
         /// failed so downstream tools (UIs, CI annotations, log
@@ -36,6 +44,10 @@ pub enum Event {
     NodeSkipped {
         run_id: String,
         node_id: String,
+        /// Discriminator string mirroring `NodeKind`'s serde tag for
+        /// the *skipped* node, not the upstream that failed. Added in
+        /// `schema_version: 2`.
+        node_kind: String,
         reason: SkipReason,
     },
     BudgetExceeded {
@@ -48,6 +60,12 @@ pub enum Event {
     AgentIterationStarted {
         run_id: String,
         node_id: String,
+        /// Always `"agent"` today (only `kind: agent` nodes drive a
+        /// `LoopAgent` iteration). Carried for symmetry with
+        /// `NodeStarted` / `NodeFinished` and to keep filters
+        /// uniform across the per-node and per-iteration envelopes.
+        /// Added in `schema_version: 2`.
+        node_kind: String,
         iteration: u32,
     },
     /// Emitted after each successful or denied tool call within an
@@ -246,5 +264,36 @@ pub enum Event {
         run_id: String,
         server: String,
         reason: String,
+    },
+    /// Emitted when a `kind: shell` node produced more bytes on
+    /// `stdout` or `stderr` than the engine's
+    /// `max_node_output_bytes` cap allows. The captured payload is
+    /// head-truncated to the cap and the child continues running so it
+    /// does not block on a full PIPE buffer; this envelope records
+    /// that the captured stream is incomplete. `stream` is `"stdout"`
+    /// or `"stderr"`. `captured_bytes` reports the number of bytes
+    /// the child actually wrote past the cap before exiting (so an
+    /// observer sees how badly the cap was exceeded). `cap_bytes`
+    /// echoes the engine's cap so a single envelope tells the full
+    /// story without cross-referencing the run config. Added in
+    /// `schema_version: 3`.
+    NodeOutputTruncated {
+        run_id: String,
+        node_id: String,
+        /// Discriminator string mirroring `NodeKind`'s serde tag.
+        /// Always `"shell"` today (only shell nodes capture
+        /// subprocess output); carried for symmetry with the rest of
+        /// the per-node envelopes.
+        node_kind: String,
+        /// `"stdout"` or `"stderr"`.
+        stream: String,
+        /// Total bytes the child wrote on this stream before exiting.
+        /// Always `>= cap_bytes` when this event fires.
+        captured_bytes: u64,
+        /// The cap that fired. Echoes
+        /// `EngineConfig.max_node_output_bytes` at the time of the
+        /// run so a downstream tool can render the breach without
+        /// re-reading the run config.
+        cap_bytes: u64,
     },
 }

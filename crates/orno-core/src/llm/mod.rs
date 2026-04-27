@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
 
-pub use bundle::{BundleContents, BundleEntry, BundleError, read_bundle, write_bundle};
+pub use bundle::{
+    BundleContents, BundleEntry, BundleError, CURRENT_BUNDLE_VERSION, read_bundle,
+    scrub_pipeline_secrets, write_bundle,
+};
 pub use dummy::DummyTransport;
 pub use dummy::ScriptedTransport;
 pub use genai::GenAiTransport;

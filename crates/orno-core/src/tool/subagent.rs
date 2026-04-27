@@ -194,6 +194,13 @@ impl ToolHandler for SubagentHandler {
             policy: self.child_config.policy.clone(),
             allowed_tools: self.child_config.allowed_tools.clone(),
             depth: child_depth,
+            // Hand the parent loop's local token counter to the child
+            // request so the child's per-LLM-response usage reaches the
+            // parent. `token_budget_share` is `Some` for any tool call
+            // dispatched through `LoopAgent`; it is `None` only for
+            // direct handler unit tests, which never construct a
+            // `SubagentHandler` to begin with.
+            parent_token_counter: inv.token_budget_share.clone(),
         };
 
         debug!(
@@ -265,6 +272,7 @@ mod tests {
             max_total_tokens: 1_000,
             max_tool_calls: 1,
             max_subagent_depth: 0,
+            max_tool_output_bytes: None,
             allow_mutations,
             allow_network,
             allow_context_writes: false,

@@ -37,8 +37,47 @@ fn arg_field_names(args: &Value) -> String {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct WebFetchHandler;
+/// HTTP GET handler with a shared `reqwest::Client` reused across calls.
+///
+/// The client is built once at construction time so every invocation
+/// reuses the same connection pool and TLS session cache. A per-call
+/// `timeout_secs` argument overrides the client's default timeout via
+/// `RequestBuilder::timeout` without rebuilding the client.
+#[derive(Debug, Clone)]
+pub struct WebFetchHandler {
+    client: reqwest::Client,
+    default_timeout: Duration,
+}
+
+impl WebFetchHandler {
+    /// Construct a handler with a single shared `reqwest::Client`.
+    ///
+    /// `default_timeout` is the timeout applied to a request that does
+    /// not supply its own `timeout_secs` argument; passing `None` falls
+    /// back to the built-in 30-second default.
+    #[must_use]
+    pub fn new(default_timeout: Option<Duration>) -> Self {
+        let default_timeout =
+            default_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+        // `reqwest::Client::builder().build()` only fails when TLS
+        // backend init fails, which is a startup-fatal misconfiguration;
+        // panic here is the same behavior as `Client::new()`.
+        let client = reqwest::Client::builder()
+            .timeout(default_timeout)
+            .build()
+            .expect("default reqwest client must build");
+        Self {
+            client,
+            default_timeout,
+        }
+    }
+}
+
+impl Default for WebFetchHandler {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 #[async_trait]
 impl ToolHandler for WebFetchHandler {
@@ -67,16 +106,11 @@ impl ToolHandler for WebFetchHandler {
                 message: format!("{e} (fields: {fields})"),
             })?;
 
-        let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|err| ToolError::Invocation {
-                name: "WebFetch".to_string(),
-                source: Box::new(err),
-            })?;
-        let response = client
+        let request_timeout = timeout_secs.map_or(self.default_timeout, Duration::from_secs);
+        let response = self
+            .client
             .get(&url)
+            .timeout(request_timeout)
             .send()
             .await
             .map_err(|err| ToolError::Invocation {
@@ -121,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_url_arg_returns_invalid_args() {
-        let handler = WebFetchHandler;
+        let handler = WebFetchHandler::default();
         let err = handler
             .invoke(ToolInvocation::for_test("call-1"), json!({}))
             .await
@@ -137,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_string_url_returns_invalid_args() {
-        let handler = WebFetchHandler;
+        let handler = WebFetchHandler::default();
         let err = handler
             .invoke(ToolInvocation::for_test("call-1"), json!({ "url": 42 }))
             .await
@@ -153,7 +187,7 @@ mod tests {
 
     #[test]
     fn schema_contains_expected_fields() {
-        let schema = WebFetchHandler.schema();
+        let schema = WebFetchHandler::default().schema();
 
         assert_eq!(
             schema["type"].as_str(),
@@ -200,9 +234,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_with_custom_default_timeout_is_retained() {
+        let handler = WebFetchHandler::new(Some(Duration::from_secs(7)));
+        assert_eq!(handler.default_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn new_with_none_falls_back_to_30_seconds() {
+        let handler = WebFetchHandler::new(None);
+        assert_eq!(
+            handler.default_timeout,
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+    }
+
     #[tokio::test]
     async fn invalid_url_returns_invocation_error() {
-        let handler = WebFetchHandler;
+        let handler = WebFetchHandler::default();
         let err = handler
             .invoke(
                 ToolInvocation::for_test("call-1"),
@@ -219,7 +268,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network — run with: cargo test -- --ignored"]
     async fn fetches_real_url() {
-        let handler = WebFetchHandler;
+        let handler = WebFetchHandler::default();
         let args = json!({ "url": "https://example.com" });
         let out = handler
             .invoke(ToolInvocation::for_test("call-1"), args)

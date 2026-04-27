@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## About orno
 
-Orno is a CI-native runner for **strict agentic loops** (Rust workspace) in pre-v0.1 skeleton state. Trait seams and module tree are in place; the agent loop, tool handlers, LLM transport wiring, MCP client, scheduler parallelism, budget enforcement, and record/replay are intentionally unimplemented.
+Orno is a CI-native runner for **strict agentic loops** (Rust workspace) in pre-v0.1 skeleton state. Trait seams and module tree are in place; the agent loop, tool handlers, LLM transport wiring, MCP client, scheduler parallelism, and record/replay are intentionally unimplemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
 
 "Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style, ADR 0006), not peer-to-peer messaging between agents.
 
@@ -62,7 +62,7 @@ If a gate fails on something unrelated to the current change (e.g. a newly-repor
 
 Two crates, enforced by ADR 0001:
 
-- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine, config, budget, telemetry. The binary's `clap` and `tokio` dependencies do NOT live here.
+- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine, config, telemetry. The binary's `clap` and `tokio` dependencies do NOT live here.
 - `crates/orno-cli/` — binary (`orno`). Subcommand dispatch, output formatting, clap derive. Depends on `orno-core` only.
 
 Do not split further without a concrete consumer or a build-parallelism justification.
@@ -91,7 +91,7 @@ Every `agent` node enforces these at runtime (ADR 0005). They are user-facing gu
 1. **Bounded iteration** — `max_iterations` mandatory; overrun → `IterationLimitExceeded` → terminate.
 2. **Bounded tool surface** — only explicitly-listed builtins + MCP tools are callable. Unknown tool → `UnknownToolCalled` → terminate.
 3. **Bounded effects** — `allow_mutations` + `allow_network` booleans plus `allowed_domains` / `blocked_domains`. Each tool has a declared effect class (ADR 0008 table).
-4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`. Breach → `BudgetExceeded { kind }` → terminate. Wall-clock is handled separately by the universal node-level `timeout:` attribute (ADR 0017) which emits `NodeTimedOut` and applies to every kind, not only agents.
+4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`, `max_tool_output_bytes`. Breach of the first two → `BudgetExceeded { kind }` → terminate. Per-call tool output that exceeds `max_tool_output_bytes` (default 256 KiB) is head-truncated with an ellipsis marker before it lands in the conversation history — the loop does not terminate, but the next LLM turn sees a bounded payload. Wall-clock is handled separately by the universal node-level `timeout:` attribute (ADR 0017) which emits `NodeTimedOut` and applies to every kind, not only agents. Token budget enforcement depends on the provider returning a `usage` block; when usage is omitted the loop emits a `tracing::warn` per response — the cap is intrinsically degraded for that response since there are no tokens to charge against the budget. `kind: shell` nodes have a separate per-stream cap, `EngineConfig.max_node_output_bytes` (default 8 MiB, exposed as `--max-node-output-bytes`), enforced by the `ShellExecutor` itself: stdout and stderr are streamed concurrently in 16 KiB chunks, the captured prefix is retained, the child keeps running so it does not block on a full pipe buffer, and an `Event::NodeOutputTruncated { stream, captured_bytes, cap_bytes }` is emitted per overflowed stream. Truncation walks back to the nearest UTF-8 lead byte so the captured slice stays valid UTF-8 even when the child wrote a multi-byte character across the boundary.
 5. **Bounded non-determinism** — every LLM request and tool call recorded; replay reproduces bit-for-bit.
 
 Parallel tool calls are executed **serially** in declaration order. Parallelism is a DAG-level concern, not an agent-internal one.

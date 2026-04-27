@@ -144,6 +144,16 @@ A replayable bundle is the simplest possible integration test for an agent pipel
 
 The bundle is checked in alongside the pipeline. A code change that breaks the pipeline (renames a tool, changes the agent's surface) breaks the replay test. A change that doesn't affect agent behavior (style, refactor) does not — the test passes.
 
+## Tape portability constraints
+
+A bundle is a deterministic record of one specific (provider × model × orno build) combination. It is **not** a portable transcript that can be replayed across tooling boundaries. Concretely:
+
+- **Per-provider.** The tool-tape key is `blake3(tool_name : call_id : args)`, and `call_id` values are emitted by the LLM provider. Anthropic and OpenAI use different ID formats for the same logical call, so an Anthropic-recorded bundle replayed against an OpenAI-configured pipeline will surface cascading `ReplayMiss` errors. Re-record per provider rather than swap.
+- **Per-orno-version.** Bundles carry a `format_version` field in the `bundle_header` line. Each bump of `CURRENT_BUNDLE_VERSION` indicates an incompatible change to the wire format or to the tape-key derivation; an older bundle replayed by a newer reader is rejected up front with `BundleError::IncompatibleVersion` rather than silently misinterpreting the contents. Re-record after upgrading orno across a format boundary.
+- **Pipeline-fingerprint sensitivity.** The LLM tape key hashes the canonical JSON form of the entire request, including the tool list, the system prompt, and any sampling parameters. Any change to the pipeline that alters those fields — adding a tool, editing the system prompt, switching to a different sampling temperature — invalidates every existing tape entry. The replay then surfaces `LlmFailure::ReplayMiss` on the first iteration that diverges.
+
+The format-version gate is intentional: it converts what would otherwise be a silent misinterpretation into a structured error the operator can act on. Treat the bundle as a per-pipeline, per-build artifact, and re-record after any of the boundaries above is crossed.
+
 ## What you've learned
 
 - `orno run --record-bundle <file>` captures a run into a bundle.
@@ -151,6 +161,7 @@ The bundle is checked in alongside the pipeline. A code change that breaks the p
 - Tape misses are hard errors, not soft fallbacks.
 - Replays differ from live runs only on `run_id` and timestamps.
 - Bundles are useful for postmortems, regression tests, and audit trails.
+- Bundles are per-provider, per-orno-version, and per-pipeline-fingerprint — re-record across any of those boundaries.
 
 ## Next steps
 

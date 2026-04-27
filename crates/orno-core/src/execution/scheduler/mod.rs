@@ -25,7 +25,7 @@ use crate::error::CoreError;
 use crate::events::{Event, EventSink};
 use crate::execution::context::Context;
 use crate::execution::walker::DagWalker;
-use crate::node::NodeRegistry;
+use crate::node::{NodeRegistry, kind_str};
 use crate::pipeline::Pipeline;
 use crate::pipeline::template::TemplateEngine;
 
@@ -48,6 +48,25 @@ pub struct RunInputs {
     pub secrets: BTreeMap<String, String>,
 }
 
+/// Run-level outcome surfaced to the caller after `Engine::run`
+/// completes successfully (i.e. setup did not fail). Mirrors the
+/// `RunFinished` envelope's payload so a CLI wrapper that does not
+/// also subscribe to the event stream can still convert a logical
+/// failure into a non-zero process exit. Setup failures still arrive
+/// as `Err(CoreError)`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RunOutcome {
+    /// `false` when at least one node finished with `ok: false`.
+    pub ok: bool,
+    /// Node ids that failed, in stream-emission order. Matches
+    /// `RunFinished.failed_nodes`.
+    pub failed_nodes: Vec<String>,
+    /// Node ids that the cascade skipped, in stream-emission order.
+    /// Matches `RunFinished.skipped_nodes`.
+    pub skipped_nodes: Vec<String>,
+}
+
 /// Tunables for diagnostic emission. Held by `Engine` and consulted
 /// at every failure site so verbosity is a single, tested knob rather
 /// than a forest of if-let guards.
@@ -57,11 +76,24 @@ pub struct EngineConfig {
     /// excerpts rather than truncated tails). Failure records are
     /// always emitted; this only controls detail.
     pub verbose: bool,
-    /// Cap on captured stderr (and similarly bounded payloads) in
-    /// failure WARNs. Output passed into `Context` and event payloads
-    /// is unaffected — this only bounds what the human-facing log
-    /// stream prints, since shell stderr is unbounded by definition.
+    /// Cap on diagnostic excerpts in failure WARNs and event-stream
+    /// excerpt fields (`LlmRequestStarted.prompt_excerpt`,
+    /// `McpToolCallSent.input_excerpt`, etc.). Default 2 KB — small
+    /// because excerpts are meant to fit in a log line. The captured
+    /// payload that flows into `Context` is bounded separately by
+    /// `max_node_output_bytes`.
     pub max_output_bytes: usize,
+    /// Cap on a `kind: shell` node's captured `stdout` or `stderr`,
+    /// per stream. The shell executor streams its child's pipes and
+    /// stops appending once a stream reaches this cap, then continues
+    /// draining the pipe to /dev/null so the child does not block on a
+    /// full PIPE buffer. When a stream is truncated, an
+    /// [`Event::NodeOutputTruncated`] envelope is emitted with the
+    /// `captured_bytes` total. Default 8 MiB — large enough for typical
+    /// build output, small enough to keep a single hostile node from
+    /// exhausting RAM. Distinct from `max_output_bytes` (which caps
+    /// log-line excerpts at 2 KB).
+    pub max_node_output_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -69,6 +101,7 @@ impl Default for EngineConfig {
         Self {
             verbose: false,
             max_output_bytes: 2048,
+            max_node_output_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -107,9 +140,12 @@ impl Engine {
     /// `NodeStarted` → `NodeFinished` → `NodeSkipped…` → `RunFinished`
     /// envelopes through the sink.
     ///
-    /// Returns `Ok(())` even when nodes fail — **per-run success is a
-    /// stream-level signal** carried by `RunFinished.ok`, never a
-    /// process-level error. `Err(CoreError)` is reserved for setup
+    /// Returns `Ok(RunOutcome)` whenever the engine finishes the
+    /// dispatch loop — regardless of whether any node succeeded.
+    /// `RunOutcome.ok` is `false` exactly when at least one node
+    /// finished with `ok: false`; CLI callers convert that into a
+    /// non-zero process exit so `orno run | …` behaves like the rest
+    /// of the unix toolchain. `Err(CoreError)` is reserved for setup
     /// failures that prevent the run from starting at all (invalid
     /// graph, walker construction error).
     #[expect(
@@ -122,7 +158,7 @@ impl Engine {
         run_id: &str,
         pipeline: &Pipeline,
         inputs: RunInputs,
-    ) -> Result<(), CoreError> {
+    ) -> Result<RunOutcome, CoreError> {
         // Own `run_id` once so every `Event::*` ctor can `clone()` from
         // this local instead of hitting `&str::to_string()` on the
         // parameter at every emission site. Shadows the borrowed name so
@@ -150,6 +186,16 @@ impl Engine {
             // the span.
             tracing::warn!(error = %err, "walker construction failed");
         })?;
+        // id → discriminator string ("agent" / "shell"). Used by the
+        // skip-cascade path which only knows the skipped node's id, not
+        // its kind. The map is built once because skip cascade can
+        // surface many ids back-to-back and a per-skip linear scan over
+        // `pipeline.nodes` would be quadratic on wide DAGs.
+        let kind_by_id: BTreeMap<String, &'static str> = pipeline
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), kind_str(&n.kind)))
+            .collect();
         let mut context = Context::new(pipeline.vars.clone(), inputs.env, inputs.secrets);
         let mut run_ok = true;
         // `RunFinished` aggregates. Both vectors capture
@@ -163,10 +209,12 @@ impl Engine {
         let mut skipped_nodes: Vec<String> = Vec::new();
 
         while let Some(node) = walker.next_ready() {
+            let node_kind = kind_str(&node.kind).to_string();
             self.sink
                 .record(Event::NodeStarted {
                     run_id: run_id.clone(),
                     node_id: node.id.clone(),
+                    node_kind: node_kind.clone(),
                 })
                 .await;
 
@@ -202,6 +250,7 @@ impl Engine {
                 .record(Event::NodeFinished {
                     run_id: run_id.clone(),
                     node_id: node_id.clone(),
+                    node_kind: node_kind.clone(),
                     ok: node_ok,
                     failure,
                 })
@@ -210,16 +259,37 @@ impl Engine {
             let newly_skipped = walker.complete(&node_id, node_ok);
 
             for (skipped_id, reason) in newly_skipped {
+                // The skipped node's kind, not the failed upstream's.
+                // Fall back to "shell" only as a defensive default —
+                // every id surfaced by the walker exists in
+                // `pipeline.nodes`, so the lookup never misses in
+                // practice.
+                let skipped_kind = kind_by_id
+                    .get(&skipped_id)
+                    .copied()
+                    .unwrap_or("shell")
+                    .to_string();
                 skipped_nodes.push(skipped_id.clone());
                 self.sink
                     .record(Event::NodeSkipped {
                         run_id: run_id.clone(),
                         node_id: skipped_id,
+                        node_kind: skipped_kind,
                         reason,
                     })
                     .await;
             }
         }
+
+        // Clone the aggregates so the wire envelope and the returned
+        // `RunOutcome` carry the same stream-emission ordering. The
+        // event consumer sees the full payload; the CLI consumer sees
+        // a process-exit signal that agrees with it bit-for-bit.
+        let outcome = RunOutcome {
+            ok: run_ok,
+            failed_nodes: failed_nodes.clone(),
+            skipped_nodes: skipped_nodes.clone(),
+        };
 
         self.sink
             .record(Event::RunFinished {
@@ -230,7 +300,7 @@ impl Engine {
             })
             .await;
 
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -378,7 +448,7 @@ mod tests {
         ]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -436,7 +506,7 @@ mod tests {
         ]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -489,7 +559,7 @@ mod tests {
         ]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -540,7 +610,7 @@ mod tests {
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -564,9 +634,11 @@ mod tests {
         match failure {
             NodeFailure::NodePayloadFailure {
                 exit_code,
+                signal,
                 stderr_tail,
             } => {
                 assert_eq!(exit_code, Some(7), "exit_code must round-trip on the wire");
+                assert_eq!(signal, None, "normal non-zero exit must report signal=None");
                 let tail = stderr_tail.expect("stderr_tail must be present when stderr ran");
                 assert!(
                     tail.contains("visible-cause"),
@@ -608,7 +680,7 @@ mod tests {
         ]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -660,7 +732,7 @@ mod tests {
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink, registry, templates, EngineConfig::default());
@@ -754,7 +826,7 @@ mod tests {
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
@@ -831,7 +903,7 @@ mod tests {
         }]);
         let sink = Arc::new(InMemorySink::new());
         let mut reg = NodeRegistry::new();
-        reg.register("shell", Arc::new(ShellExecutor));
+        reg.register("shell", Arc::new(ShellExecutor::default()));
         let registry = Arc::new(reg);
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());

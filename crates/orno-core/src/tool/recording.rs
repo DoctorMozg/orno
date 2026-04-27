@@ -22,6 +22,8 @@ use serde_json::Value;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+use crate::events::Redactor;
+use crate::util::canonical_json;
 
 /// One entry persisted to or loaded from the tool tape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,7 @@ pub struct RecordingToolHandler {
     inner: Arc<dyn ToolHandler>,
     tape: Arc<Mutex<BufWriter<File>>>,
     path: PathBuf,
+    redactor: Arc<Redactor>,
 }
 
 impl std::fmt::Debug for RecordingToolHandler {
@@ -59,6 +62,7 @@ impl RecordingToolHandler {
     pub fn create(
         inner: Arc<dyn ToolHandler>,
         path: impl Into<PathBuf>,
+        redactor: Arc<Redactor>,
     ) -> Result<Self, std::io::Error> {
         let path = path.into();
         let file = OpenOptions::new()
@@ -70,6 +74,7 @@ impl RecordingToolHandler {
             inner,
             tape: Arc::new(Mutex::new(BufWriter::new(file))),
             path,
+            redactor,
         })
     }
 
@@ -80,8 +85,14 @@ impl RecordingToolHandler {
         inner: Arc<dyn ToolHandler>,
         tape: Arc<Mutex<BufWriter<File>>>,
         path: PathBuf,
+        redactor: Arc<Redactor>,
     ) -> Self {
-        Self { inner, tape, path }
+        Self {
+            inner,
+            tape,
+            path,
+            redactor,
+        }
     }
 
     #[must_use]
@@ -117,7 +128,10 @@ impl ToolHandler for RecordingToolHandler {
 
         let entry = ToolTapeEntry {
             key,
-            content: result.as_ref().ok().cloned(),
+            content: result
+                .as_ref()
+                .ok()
+                .map(|s| self.redactor.redact(s).into_owned()),
             error: result.as_ref().err().map(ToString::to_string),
         };
         let line = serde_json::to_string(&entry)
@@ -247,13 +261,20 @@ impl ToolHandler for ReplayToolHandler {
 
 // ─── Key derivation ──────────────────────────────────────────────────────────
 
+/// Tool-tape key = `blake3( tool_name + ":" + call_id + ":" + canonical_json(args) )`.
+///
+/// `canonical_json` sorts every nested JSON object's keys alphabetically,
+/// pinning the hash input to the args' content rather than to the
+/// insertion order of whatever produced them. This shields tapes from
+/// silent invalidation when a `schemars` (or other serde-Value) minor
+/// bump shifts key order in tool arguments.
+///
+/// `call_id` is provider-issued (Anthropic and `OpenAI` emit different
+/// IDs for the same logical call) so cross-provider tool-tape replay is
+/// intentionally unsupported. Document this constraint to operators in
+/// `docs/tutorials/record-replay.md`.
 fn tool_tape_key(tool_name: &str, call_id: &str, args: &Value) -> String {
-    let raw = format!(
-        "{}:{}:{}",
-        tool_name,
-        call_id,
-        serde_json::to_string(args).unwrap_or_default()
-    );
+    let raw = format!("{tool_name}:{call_id}:{}", canonical_json(args));
     blake3::hash(raw.as_bytes()).to_hex().to_string()
 }
 
@@ -264,6 +285,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::events::Redactor;
     use crate::tool::ToolInvocation;
 
     // Minimal stub that always returns a fixed string.
@@ -333,7 +355,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
-        let rec = RecordingToolHandler::create(Arc::new(EchoHandler), &path).unwrap();
+        let rec = RecordingToolHandler::create(
+            Arc::new(EchoHandler),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
         let args = json!({"x": 1});
         let result = rec
             .invoke(ToolInvocation::for_test("c1"), args.clone())
@@ -355,7 +382,12 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
-        let rec = RecordingToolHandler::create(Arc::new(AlwaysErrHandler), &path).unwrap();
+        let rec = RecordingToolHandler::create(
+            Arc::new(AlwaysErrHandler),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
         rec.invoke(ToolInvocation::for_test("c2"), json!({}))
             .await
             .unwrap_err();
@@ -376,7 +408,12 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         // Write a tape with call_id "c1"
-        let rec = RecordingToolHandler::create(Arc::new(EchoHandler), &path).unwrap();
+        let rec = RecordingToolHandler::create(
+            Arc::new(EchoHandler),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
         rec.invoke(ToolInvocation::for_test("c1"), json!({"x": 1}))
             .await
             .unwrap();
@@ -402,7 +439,12 @@ mod tests {
         let path = PathBuf::from("/dev/full");
         let file = OpenOptions::new().write(true).open(&path).unwrap();
         let tape = Arc::new(Mutex::new(BufWriter::with_capacity(0, file)));
-        let rec = RecordingToolHandler::with_shared_tape(Arc::new(EchoHandler), tape, path);
+        let rec = RecordingToolHandler::with_shared_tape(
+            Arc::new(EchoHandler),
+            tape,
+            path,
+            Arc::new(Redactor::default()),
+        );
 
         let err = rec
             .invoke(ToolInvocation::for_test("c1"), json!({"x": 1}))
@@ -413,6 +455,39 @@ mod tests {
             matches!(err, ToolError::Invocation { ref name, .. } if name == "Echo"),
             "expected Invocation error from tape-write failure, got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn secret_not_written_to_tape() {
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        let mut secrets = BTreeMap::new();
+        secrets.insert("token".to_string(), "bearer-secret-xyz".to_string());
+        let rec = RecordingToolHandler::create(
+            Arc::new(EchoHandler),
+            &path,
+            Arc::new(Redactor::new(&secrets)),
+        )
+        .unwrap();
+
+        // EchoHandler returns args.to_string() — so the secret in args flows to output.
+        rec.invoke(
+            ToolInvocation::for_test("c1"),
+            json!({"data": "bearer-secret-xyz"}),
+        )
+        .await
+        .unwrap();
+        rec.flush().unwrap();
+        drop(rec);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("bearer-secret-xyz"),
+            "secret must not appear in tape",
+        );
+        assert!(contents.contains("***"), "redacted placeholder must appear");
     }
 
     #[tokio::test]

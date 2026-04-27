@@ -254,6 +254,7 @@ mod tests {
                 max_total_tokens: 10_000,
                 max_tool_calls: 20,
                 max_subagent_depth: 1,
+                max_tool_output_bytes: None,
                 allow_mutations: false,
                 allow_network: false,
                 allow_context_writes: false,

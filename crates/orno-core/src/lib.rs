@@ -12,7 +12,6 @@
 #![allow(clippy::unnecessary_literal_bound)] // dynamic ToolHandler::name() lifetime bound
 
 pub mod agent;
-pub mod budget;
 pub mod config;
 pub mod error;
 pub mod events;
@@ -24,6 +23,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod telemetry;
 pub mod tool;
+pub mod util;
 
 pub use error::{AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, ToolError};
 

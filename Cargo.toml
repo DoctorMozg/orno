@@ -68,10 +68,13 @@ time = { version = "0.3", default-features = false, features = [
 # time-ordered. Default features are already minimal.
 ulid = "1"
 
-# LLM transport. Pinned exactly — pre-1.0 API churn is expected
-# between betas. genai has no `[features]` table, so the workspace-
+# LLM transport. Pinned to a single beta lineage (`0.6.0-beta.17`)
+# rather than `=` so `cargo update -p genai` can pick up a newer
+# beta point release without a Cargo.toml edit; cargo's SemVer
+# pre-release rules keep this requirement narrow (same `0.6.0-beta`
+# stream only). genai has no `[features]` table, so the workspace-
 # wide `default-features = false` discipline does not apply.
-genai = "=0.6.0-beta.17"
+genai = "0.6.0-beta.17"
 
 # HTTP client for WebFetchHandler. Pinned to the same major
 # that genai pulls transitively. Only `rustls` is enabled (reqwest 0.13
