@@ -440,3 +440,145 @@ impl LoopAgent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_network_url, is_blocked_ipv4, is_blocked_ipv6};
+    use serde_json::json;
+
+    fn v4(s: &str) -> std::net::Ipv4Addr {
+        s.parse()
+            .unwrap_or_else(|e| panic!("invalid ipv4 `{s}`: {e}"))
+    }
+
+    fn v6(s: &str) -> std::net::Ipv6Addr {
+        s.parse()
+            .unwrap_or_else(|e| panic!("invalid ipv6 `{s}`: {e}"))
+    }
+
+    #[test]
+    fn ipv4_loopback_range_is_blocked() {
+        // The full /8 must be denied — `is_loopback` may only cover 127.0.0.1
+        // on some platforms, so the implementation also checks the first
+        // octet directly.
+        assert!(is_blocked_ipv4(v4("127.0.0.1")));
+        assert!(is_blocked_ipv4(v4("127.255.255.254")));
+        assert!(is_blocked_ipv4(v4("127.0.0.0")));
+    }
+
+    #[test]
+    fn ipv4_rfc1918_private_ranges_are_blocked() {
+        // RFC 1918: 10/8, 172.16/12, 192.168/16.
+        assert!(is_blocked_ipv4(v4("10.0.0.1")));
+        assert!(is_blocked_ipv4(v4("172.16.0.1")));
+        assert!(is_blocked_ipv4(v4("172.31.255.255")));
+        assert!(is_blocked_ipv4(v4("192.168.0.1")));
+    }
+
+    #[test]
+    fn ipv4_cgnat_range_is_blocked() {
+        // RFC 6598: 100.64.0.0/10. `is_private` does NOT cover this range.
+        assert!(is_blocked_ipv4(v4("100.64.0.1")));
+        assert!(is_blocked_ipv4(v4("100.127.255.255")));
+    }
+
+    #[test]
+    fn ipv4_link_local_range_is_blocked() {
+        // 169.254.0.0/16 — covers the cloud metadata IP at 169.254.169.254.
+        assert!(is_blocked_ipv4(v4("169.254.0.1")));
+        assert!(is_blocked_ipv4(v4("169.254.255.255")));
+    }
+
+    #[test]
+    fn ipv4_documentation_ranges_are_blocked() {
+        // RFC 5737: 192.0.2/24, 198.51.100/24, 203.0.113/24.
+        assert!(is_blocked_ipv4(v4("192.0.2.1")));
+        assert!(is_blocked_ipv4(v4("198.51.100.1")));
+        assert!(is_blocked_ipv4(v4("203.0.113.1")));
+    }
+
+    #[test]
+    fn ipv4_public_addresses_are_not_blocked() {
+        // Real-world public IPs that must continue to be reachable when the
+        // operator has allowed network access.
+        assert!(!is_blocked_ipv4(v4("8.8.8.8")));
+        assert!(!is_blocked_ipv4(v4("1.1.1.1")));
+        assert!(!is_blocked_ipv4(v4("93.184.216.34")));
+    }
+
+    #[test]
+    fn ipv6_loopback_is_blocked() {
+        assert!(is_blocked_ipv6(v6("::1")));
+    }
+
+    #[test]
+    fn ipv6_link_local_range_is_blocked() {
+        // fe80::/10.
+        assert!(is_blocked_ipv6(v6("fe80::1")));
+        assert!(is_blocked_ipv6(v6("fe80::ffff:ffff:ffff:ffff")));
+    }
+
+    #[test]
+    fn ipv6_unique_local_range_is_blocked() {
+        // fc00::/7 — both fc and fd prefixes must be denied.
+        assert!(is_blocked_ipv6(v6("fc00::1")));
+        assert!(is_blocked_ipv6(v6("fd00::1")));
+        assert!(is_blocked_ipv6(v6("fdff:ffff:ffff:ffff::1")));
+    }
+
+    #[test]
+    fn ipv6_v4_mapped_loopback_is_blocked() {
+        // ::ffff:127.0.0.1 is loopback re-encoded; the embedded v4 check
+        // must still reject it.
+        assert!(is_blocked_ipv6(v6("::ffff:127.0.0.1")));
+    }
+
+    #[test]
+    fn ipv6_v4_mapped_private_is_blocked() {
+        assert!(is_blocked_ipv6(v6("::ffff:192.168.1.1")));
+    }
+
+    #[test]
+    fn ipv6_public_addresses_are_not_blocked() {
+        assert!(!is_blocked_ipv6(v6("2001:4860:4860::8888")));
+        assert!(!is_blocked_ipv6(v6("2606:4700:4700::1111")));
+    }
+
+    #[test]
+    fn extract_network_url_finds_endpoint_key() {
+        let args = json!({ "endpoint": "https://api.example.com/data" });
+        let url = extract_network_url(&args).expect("conventional `endpoint` key must resolve");
+        assert_eq!(url.as_str(), "https://api.example.com/data");
+    }
+
+    #[test]
+    fn extract_network_url_finds_target_key() {
+        let args = json!({ "target": "http://example.com/path" });
+        let url = extract_network_url(&args).expect("conventional `target` key must resolve");
+        assert_eq!(url.as_str(), "http://example.com/path");
+    }
+
+    #[test]
+    fn extract_network_url_falls_back_to_unknown_key_with_url_value() {
+        // The fallback scan must catch a URL declared under any key —
+        // otherwise a tool that uses an unconventional argument name would
+        // bypass the policy gate entirely.
+        let args = json!({ "my_url": "https://api.example.com/data" });
+        let url = extract_network_url(&args).expect("fallback scan must catch unknown key");
+        assert_eq!(url.as_str(), "https://api.example.com/data");
+    }
+
+    #[test]
+    fn extract_network_url_returns_none_when_object_has_no_url() {
+        let args = json!({ "name": "foo", "count": 42, "flag": true });
+        assert!(extract_network_url(&args).is_none());
+    }
+
+    #[test]
+    fn extract_network_url_returns_none_for_non_object_args() {
+        // Strings, numbers, and other primitives must not crash the scan —
+        // they simply have no URL to extract.
+        assert!(extract_network_url(&json!("just a string")).is_none());
+        assert!(extract_network_url(&json!(42)).is_none());
+    }
+}

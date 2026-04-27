@@ -9,22 +9,41 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn max_total_tokens_zero_sends_no_cap() {
-    // When max_total_tokens is 0 (the default), the impl must NOT send
-    // max_tokens: Some(0) to the transport. DummyTransport always succeeds; if
-    // the impl panicked or sent Some(0) the test would need a real provider to
-    // observe the bad behavior — but at minimum we verify the path completes
-    // without error.
-    use crate::llm::DummyTransport;
-
+    // When max_total_tokens is 0 (the "no cap" sentinel), the impl must NOT
+    // send `max_tokens: Some(0)` on the wire — that would tell the provider
+    // to refuse to emit any output. The conversion in `run.rs` collapses the
+    // zero sentinel to `None`. Asserting the recorded `max_tokens` proves the
+    // intent rather than relying on a transport that happens to ignore the
+    // field.
     let sink = Arc::new(InMemorySink::new());
-    let agent = LoopAgent::with_defaults(Arc::new(DummyTransport), sink);
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        ScriptedTransport::text_response("done"),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: Vec::new(),
+    });
+
     let mut req = request();
+    req.policy.max_iterations = 1;
     req.policy.max_total_tokens = 0;
 
     agent
         .run("run_test", "n", req)
         .await
         .expect("zero max_total_tokens must not error");
+
+    let seen = transport.max_tokens_seen();
+    assert_eq!(seen.len(), 1, "transport must observe exactly one request");
+    assert_eq!(
+        seen[0], None,
+        "max_total_tokens=0 must convert to max_tokens=None on the wire, got {:?}",
+        seen[0],
+    );
 }
 
 #[tokio::test]

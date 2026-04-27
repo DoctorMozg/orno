@@ -734,3 +734,164 @@ async fn private_ip_denied() {
         "reason should name the IP: {reason:?}",
     );
 }
+
+#[tokio::test]
+async fn mutations_and_network_tool_denied_when_mutations_false() {
+    // `MutationsAndNetwork` is the effect class for Bash and any tool that
+    // both mutates state and opens network sockets. The gate must deny when
+    // EITHER underlying flag is off — here `allow_mutations=false` blocks
+    // even when network is allowed. Denial is non-terminal: the loop feeds
+    // the denial string back as a `ToolResult` and the model continues.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(EchoTool::new(
+        ToolEffect::MutationsAndNetwork,
+        "should not run",
+    ));
+
+    let transport = ScriptedTransport::new(vec![
+        ScriptedTransport::tool_call_response("c1", "EchoTool", serde_json::json!({})),
+        ScriptedTransport::text_response("acknowledged mutation denial"),
+    ]);
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(transport),
+        sink: sink.clone(),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.allow_mutations = false;
+    req.policy.allow_network = true;
+    req.allowed_tools = vec!["EchoTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("MutationsAndNetwork denial must feed back, not terminate");
+
+    let events = sink.snapshot();
+    let reason = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::ToolDenied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("ToolDenied must fire when mutations are disallowed");
+    assert!(
+        reason.contains("allow_mutations=false"),
+        "reason must name the mutations gate: {reason:?}",
+    );
+}
+
+#[tokio::test]
+async fn mutations_and_network_tool_denied_when_network_false() {
+    // Mirror of the prior test on the second underlying flag. With
+    // `allow_mutations=true` and `allow_network=false`, the same combined
+    // effect must still be denied — neither half can be satisfied alone.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(EchoTool::new(
+        ToolEffect::MutationsAndNetwork,
+        "should not run",
+    ));
+
+    let transport = ScriptedTransport::new(vec![
+        ScriptedTransport::tool_call_response("c1", "EchoTool", serde_json::json!({})),
+        ScriptedTransport::text_response("acknowledged network denial"),
+    ]);
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(transport),
+        sink: sink.clone(),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.allow_mutations = true;
+    req.policy.allow_network = false;
+    req.allowed_tools = vec!["EchoTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("MutationsAndNetwork denial must feed back, not terminate");
+
+    let events = sink.snapshot();
+    let reason = events
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::ToolDenied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("ToolDenied must fire when network is disallowed");
+    assert!(
+        reason.contains("allow_network=false"),
+        "reason must name the network gate: {reason:?}",
+    );
+}
+
+#[tokio::test]
+async fn mutations_and_network_tool_allowed_when_both_true() {
+    // Positive control: when both underlying flags are on, the combined
+    // effect must pass through to the handler and produce a real tool
+    // result. `MutationsAndNetwork` is not subject to the URL/domain gate
+    // (it covers shells that open arbitrary connections orno cannot
+    // intercept), so no `ToolDenied` event must fire.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(EchoTool::new(ToolEffect::MutationsAndNetwork, "ran ok"));
+
+    let transport = ScriptedTransport::new(vec![
+        ScriptedTransport::tool_call_response("c1", "EchoTool", serde_json::json!({})),
+        ScriptedTransport::text_response("done"),
+    ]);
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(transport),
+        sink: sink.clone(),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.allow_mutations = true;
+    req.policy.allow_network = true;
+    req.allowed_tools = vec!["EchoTool".into()];
+
+    let out = agent
+        .run("run_test", "n", req)
+        .await
+        .expect("both flags on must allow the tool to execute");
+
+    assert!(
+        out.content.contains("done"),
+        "loop must terminate on the final text response: {:?}",
+        out.content,
+    );
+
+    let events = sink.snapshot();
+    let denied = events.iter().find_map(|e| match &e.event {
+        Event::ToolDenied { reason, .. } => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(
+        denied.is_none(),
+        "ToolDenied must NOT fire when both gates are open: {denied:?}",
+    );
+    let recorded = events
+        .iter()
+        .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+        .expect("ToolCallRecorded must fire for an allowed call");
+    if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+        assert!(
+            output_excerpt.contains("ran ok"),
+            "recorded output must carry the handler's payload: {output_excerpt:?}",
+        );
+    }
+}
