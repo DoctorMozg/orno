@@ -1,5 +1,16 @@
 # orno
 
+<p align="center">
+  <img src="docs/images/title.jpg" alt="orno" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/DoctorMozg/orno/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DoctorMozg/orno/ci.yml?branch=master&label=CI&logo=github" alt="CI" /></a>
+  <a href="https://github.com/DoctorMozg/orno/releases"><img src="https://img.shields.io/github/v/release/DoctorMozg/orno?include_prereleases&sort=semver&logo=github&label=release" alt="Release" /></a>
+  <a href="https://github.com/DoctorMozg/orno/blob/master/LICENSE"><img src="https://img.shields.io/github/license/DoctorMozg/orno?color=blue" alt="License: AGPL-3.0" /></a>
+  <img src="https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust" alt="Rust 1.95+" />
+</p>
+
 CI-native runner for strict agentic loops.
 
 orno runs LLM agents under a runtime-enforced contract: bounded iteration, bounded tool surface, bounded effects, bounded resources, bounded non-determinism. Every decision is emitted on a versioned event log, and every run can be replayed byte-for-byte without spending tokens.
@@ -52,12 +63,39 @@ Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly
 
 ## Quickstart
 
-### Installation
+### Install
+
+Install the latest release binary for your platform:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/master/install.sh | bash
+```
+
+The script downloads `orno` from GitHub Releases into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin` or pin a version with `ORNO_VERSION=v0.1.0`.
+
+Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
+
+### Use as a GitHub Action
+
+Run an orno pipeline from a workflow without managing the binary yourself:
+
+```yaml
+- uses: DoctorMozg/orno@v0.1.0
+  with:
+    pipeline: examples/hello/pipeline.yaml
+    command: run                # run | plan | validate | replay (default: run)
+    secrets-file: .env.secrets  # optional
+    args: --record-bundle run.ndjson  # optional, forwarded to orno
+```
+
+Pin to a tagged release (`@v0.1.0`) for reproducibility, or to the major tag (`@v1`) to receive non-breaking patches automatically. The action installs orno into the runner's tool cache and runs your pipeline; outputs are NDJSON on stdout and tracing JSON on stderr, just like a local invocation.
+
+### Build from source
 
 Build from source against the workspace's pinned toolchain (MSRV 1.95):
 
 ```bash
-git clone https://github.com/<owner>/orno.git
+git clone https://github.com/DoctorMozg/orno.git
 cd orno
 cargo build --release -p orno-cli
 ./target/release/orno --help
@@ -146,7 +184,7 @@ Browsable, runnable example pipelines live in [`examples/`](examples/README.md),
 
 ## Changelog
 
-See [`CHANGELOG.md`](CHANGELOG.md) for notable changes between releases. The pre-v0.1 development log lives there until the first tagged release ships.
+See [`CHANGELOG.md`](CHANGELOG.md) for notable changes between releases.
 
 ## License
 

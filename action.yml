@@ -1,0 +1,62 @@
+name: 'orno'
+description: 'Run an orno pipeline under runtime-enforced agent contracts (bounded iteration, tools, effects, resources, replay).'
+author: 'DoctorMozg'
+
+branding:
+  icon: 'play'
+  color: 'blue'
+
+inputs:
+  pipeline:
+    description: 'Path to the pipeline YAML file.'
+    required: true
+  command:
+    description: 'orno subcommand: run | plan | validate | replay.'
+    required: false
+    default: 'run'
+  version:
+    description: 'orno version to install (e.g. v0.1.0). Omit for the latest GitHub Release.'
+    required: false
+  secrets-file:
+    description: 'Path to a .env.secrets file forwarded as --secrets-file.'
+    required: false
+  args:
+    description: 'Extra arguments appended to the orno invocation (e.g. --record-bundle run.ndjson).'
+    required: false
+
+runs:
+  using: composite
+  steps:
+    - name: Install orno
+      shell: bash
+      env:
+        ORNO_VERSION: ${{ inputs.version }}
+        ORNO_INSTALL_DIR: ${{ runner.tool_cache }}/orno
+      run: |
+        set -euo pipefail
+        mkdir -p "$ORNO_INSTALL_DIR"
+        REF="${ORNO_VERSION:-master}"
+        curl --proto '=https' --tlsv1.2 -fsSL \
+          "https://raw.githubusercontent.com/DoctorMozg/orno/${REF}/install.sh" | bash
+        echo "$ORNO_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Verify orno
+      shell: bash
+      run: orno --version
+
+    - name: Run orno
+      shell: bash
+      env:
+        ORNO_PIPELINE: ${{ inputs.pipeline }}
+        ORNO_COMMAND: ${{ inputs.command }}
+        ORNO_SECRETS_FILE: ${{ inputs.secrets-file }}
+        ORNO_EXTRA_ARGS: ${{ inputs.args }}
+      run: |
+        set -euo pipefail
+        secrets_flag=()
+        if [ -n "$ORNO_SECRETS_FILE" ]; then
+          secrets_flag=(--secrets-file "$ORNO_SECRETS_FILE")
+        fi
+        # ORNO_EXTRA_ARGS is intentionally unquoted so users can pass multiple flags.
+        # shellcheck disable=SC2086
+        orno "$ORNO_COMMAND" "$ORNO_PIPELINE" "${secrets_flag[@]}" $ORNO_EXTRA_ARGS

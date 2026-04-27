@@ -51,7 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      # TODO(phase-2): enable strict rustdoc once doc comments are in place
+      # TODO: enable strict rustdoc once doc comments are in place
       # env:
       #   RUSTDOCFLAGS: "-D rustdoc::all -A rustdoc::private-doc-tests"
       - run: cargo doc --workspace --all-features --no-deps
@@ -78,6 +78,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.45.1
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ludeeus/action-shellcheck@2.0.0
+        env:
+          SHELLCHECK_OPTS: -e SC1091 -s bash
+        with:
+          additional_files: install.sh
+          scandir: '__NONE__'
+          severity: warning
 
   test:
     name: test
@@ -149,3 +162,23 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: cargo build --workspace --release --locked
+
+  install-smoke:
+    name: install-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build release binary
+        run: cargo build --release -p orno-cli --locked
+      - name: Smoke-test --version
+        run: ./target/release/orno --version
+      - name: Smoke-test schema
+        run: ./target/release/orno schema > /tmp/pipeline.schema.json
+      - name: Smoke-test validate
+        run: ./target/release/orno validate examples/hello/pipeline.yaml
+      - name: Smoke-test plan
+        run: ./target/release/orno plan examples/hello/pipeline.yaml
