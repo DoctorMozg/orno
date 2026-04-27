@@ -5,14 +5,16 @@
 //! filename — rendering prompts that then break tool-call JSON downstream.
 //!
 //! Compiled templates are cached by content-addressable name so the same
-//! source string is parsed only once for the lifetime of the engine. The
-//! cache key is a blake3 hash of the source, which is collision-free in
-//! practice; the same hex string is reused as the `MiniJinja` template
-//! name so a cache hit is a direct `get_template` lookup.
+//! source string is parsed only once. The cache is LRU-bounded at 128
+//! entries so a long-lived engine (e.g. in a multi-pipeline process) cannot
+//! accumulate unbounded compiled state. The cache key is a blake3 hash of
+//! the source; the same hex string is the `MiniJinja` template name so a
+//! cache hit is a direct `get_template` lookup.
 
-use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
+use lru::LruCache;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
 
 use crate::error::PipelineError;
@@ -24,16 +26,22 @@ use crate::error::PipelineError;
 /// larger than any legitimate prompt template.
 const MAX_TEMPLATE_SOURCE_BYTES: usize = 64 * 1024;
 
+/// Maximum number of distinct compiled templates retained in the LRU cache.
+/// 128 covers any realistic single-process pipeline library; entries evicted
+/// past this bound are re-compiled on next use (a parse cost, not a
+/// correctness issue).
+const TEMPLATE_CACHE_CAPACITY: usize = 128;
+
 pub struct TemplateEngine {
     inner: Mutex<Inner>,
 }
 
 struct Inner {
     env: Environment<'static>,
-    /// Hashes of every source string already compiled and registered
-    /// under its hex template name in `env`. The set acts as a "have we
-    /// added this?" gate so the same source is never re-parsed.
-    cached: HashSet<blake3::Hash>,
+    /// LRU map from blake3 hash → hex template name. When the cache is at
+    /// capacity, the least-recently-used entry is evicted and its compiled
+    /// template removed from `env` so memory is bounded.
+    cache: LruCache<blake3::Hash, String>,
 }
 
 impl TemplateEngine {
@@ -45,10 +53,12 @@ impl TemplateEngine {
         // as hard render errors, not silent empty strings. Strict
         // undefined applies uniformly across every namespace.
         env.set_undefined_behavior(UndefinedBehavior::Strict);
+        let capacity = NonZeroUsize::new(TEMPLATE_CACHE_CAPACITY)
+            .expect("TEMPLATE_CACHE_CAPACITY is a non-zero constant");
         Self {
             inner: Mutex::new(Inner {
                 env,
-                cached: HashSet::new(),
+                cache: LruCache::new(capacity),
             }),
         }
     }
@@ -67,22 +77,39 @@ impl TemplateEngine {
         }
 
         let hash = blake3::hash(source.as_bytes());
-        let template_name = hash.to_hex().to_string();
 
+        // Poison recovery matches `InMemorySink` / `StreamingSink` — a
+        // panicking task on a sibling render must not starve subsequent
+        // template renders. The cache state is set-and-test, so a partial
+        // mutation across a panic is bounded: at worst, a hash gets
+        // inserted without its template registered (re-insert is
+        // idempotent) or vice versa (the next `add_template_owned`
+        // returns the same source, then `get_template` succeeds).
         let mut inner = self
             .inner
             .lock()
-            .expect("template engine mutex poisoned by panicking caller");
-        if !inner.cached.contains(&hash) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let template_name = if let Some(existing) = inner.cache.get(&hash) {
+            existing.clone()
+        } else {
+            let hex = hash.to_hex().to_string();
             inner
                 .env
-                .add_template_owned(template_name.clone(), source.to_string())
+                .add_template_owned(hex.clone(), source.to_string())
                 .map_err(|source| PipelineError::Template {
                     name: name.to_string(),
                     source,
                 })?;
-            inner.cached.insert(hash);
-        }
+            // `LruCache::put` returns the evicted value when the cache is at
+            // capacity. Remove the corresponding compiled template from the
+            // environment so memory stays bounded.
+            if let Some(evicted_name) = inner.cache.put(hash, hex.clone()) {
+                inner.env.remove_template(&evicted_name);
+            }
+            hex
+        };
+
         let tmpl =
             inner
                 .env
@@ -131,7 +158,7 @@ mod tests {
         // After 50 calls the cache must hold exactly one entry — proves
         // the second-and-onwards renders did not re-parse.
         let inner = engine.inner.lock().expect("mutex");
-        assert_eq!(inner.cached.len(), 1);
+        assert_eq!(inner.cache.len(), 1);
     }
 
     #[test]
@@ -145,7 +172,7 @@ mod tests {
             .expect("renders");
         engine.render("c", "literal", &json!({})).expect("renders");
         let inner = engine.inner.lock().expect("mutex");
-        assert_eq!(inner.cached.len(), 3);
+        assert_eq!(inner.cache.len(), 3);
     }
 
     #[test]

@@ -53,6 +53,56 @@ fn truncate_tool_output(s: &str, cap: usize) -> String {
     out
 }
 
+/// Approximate byte cost of a single conversation message. Used by the
+/// history-cap check so the loop does not need to serialize the full
+/// history on every push. Content strings dominate; the small fixed
+/// overhead per variant is intentionally ignored to keep the estimate
+/// cheap and consistent across variants.
+fn estimated_message_bytes(msg: &OrnoChatMessage) -> usize {
+    #[expect(
+        unreachable_patterns,
+        reason = "OrnoChatMessage is #[non_exhaustive]; the catch-all handles future variants"
+    )]
+    match msg {
+        OrnoChatMessage::User { content } | OrnoChatMessage::Assistant { content } => content.len(),
+        OrnoChatMessage::ToolCalls { calls } => calls
+            .iter()
+            .map(|c| c.fn_name.len() + c.fn_arguments.to_string().len())
+            .sum(),
+        OrnoChatMessage::ToolResult { call_id, content } => call_id.len() + content.len(),
+        // Non-exhaustive guard: new variants default to 0 so the cap
+        // degrades gracefully rather than failing to compile.
+        _ => 0,
+    }
+}
+
+/// Enforce the `policy.max_message_history_bytes` soft cap on the
+/// conversation history vector. When the total estimated byte size
+/// exceeds the cap, evicts the oldest messages until the total is
+/// below the cap, always keeping at least the two most recent messages
+/// so the model sees at least one request-response pair.
+fn enforce_message_history_cap(messages: &mut Vec<OrnoChatMessage>, cap: usize) {
+    let total: usize = messages.iter().map(estimated_message_bytes).sum();
+    if total <= cap {
+        return;
+    }
+    // Evict from the front, keeping at least 2 entries.
+    while messages.len() > 2 {
+        let remaining: usize = messages.iter().map(estimated_message_bytes).sum();
+        if remaining <= cap {
+            break;
+        }
+        messages.remove(0);
+    }
+    // Emit the warning once per truncation event, after eviction, so
+    // the log shows the post-truncation byte total.
+    let current_bytes: usize = messages.iter().map(estimated_message_bytes).sum();
+    warn!(
+        cap_bytes = cap,
+        current_bytes, "message history truncated to stay within cap",
+    );
+}
+
 /// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
 /// `None` when no `SetState` call landed — keeps the wire shape of
 /// `nodes.<id>` unchanged for pipelines that never opt into the feature.
@@ -88,6 +138,24 @@ impl Agent for LoopAgent {
         if req.policy.max_iterations == 0 {
             return Err(AgentError::InvalidPolicy(
                 "max_iterations must be >= 1".to_string(),
+            ));
+        }
+
+        // Filesystem-tool root check: if the agent opted into any of
+        // the path-aware builtins, `policy.roots` must be non-empty.
+        // Without a root the path-jail check is a no-op and a tool
+        // call could read or overwrite anywhere on the host. Failing
+        // closed at `run()` start surfaces the misconfiguration before
+        // any LLM turn fires.
+        let uses_file_tool = req
+            .allowed_tools
+            .iter()
+            .any(|t| ["Read", "Write", "Edit"].contains(&t.as_str()));
+        if uses_file_tool && req.policy.roots.is_empty() {
+            return Err(AgentError::InvalidPolicy(
+                "policy.roots must be non-empty when allowed_tools contains \
+                 any of [Read, Write, Edit]"
+                    .to_string(),
             ));
         }
 
@@ -193,10 +261,10 @@ impl Agent for LoopAgent {
             };
 
             let llm_req = LlmRequest {
-                provider: req.provider.clone(),
-                model: req.model.clone(),
-                prompt: req.initial_prompt.clone(),
-                system: req.system.clone(),
+                provider: req.provider.to_string(),
+                model: req.model.to_string(),
+                prompt: req.initial_prompt.to_string(),
+                system: req.system.as_deref().map(str::to_string),
                 temperature: None,
                 max_tokens,
                 messages: messages.clone(),
@@ -208,8 +276,8 @@ impl Agent for LoopAgent {
                 .record(Event::LlmRequestStarted {
                     run_id: run_id.to_string(),
                     node_id: node_id.to_string(),
-                    provider: req.provider.clone(),
-                    model: req.model.clone(),
+                    provider: req.provider.to_string(),
+                    model: req.model.to_string(),
                     prompt_excerpt: prompt_excerpt.clone(),
                     system_excerpt: system_excerpt.clone(),
                 })
@@ -225,8 +293,8 @@ impl Agent for LoopAgent {
                         .record(Event::LlmRequestFailed {
                             run_id: run_id.to_string(),
                             node_id: node_id.to_string(),
-                            provider: req.provider.clone(),
-                            model: req.model.clone(),
+                            provider: req.provider.to_string(),
+                            model: req.model.to_string(),
                             failure,
                         })
                         .await;
@@ -309,6 +377,9 @@ impl Agent for LoopAgent {
             messages.push(OrnoChatMessage::ToolCalls {
                 calls: response.tool_calls.clone(),
             });
+            if let Some(cap) = req.policy.max_message_history_bytes {
+                enforce_message_history_cap(&mut messages, cap);
+            }
 
             for tool_call in &response.tool_calls {
                 tool_call_count = tool_call_count.saturating_add(1);
@@ -363,6 +434,7 @@ impl Agent for LoopAgent {
                             depth: req.depth,
                             state_handle: Some(state_handle),
                             token_budget_share: Some(Arc::clone(&token_counter)),
+                            roots: &req.policy.roots,
                         };
                         self.invoke_with_parse_retry(
                             handler,
@@ -387,6 +459,7 @@ impl Agent for LoopAgent {
                         depth: req.depth,
                         state_handle: Some(state_handle),
                         token_budget_share: Some(Arc::clone(&token_counter)),
+                        roots: &req.policy.roots,
                     };
                     self.invoke_with_parse_retry(
                         handler,
@@ -426,10 +499,21 @@ impl Agent for LoopAgent {
                     .max_tool_output_bytes
                     .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
                 let truncated = truncate_tool_output(&result_content, cap);
+                // Redact `secrets.*` leaves before the result enters the
+                // conversation history. The handler may have read a
+                // secret-bearing file or echoed an env var, and the
+                // history is replayed verbatim on the next LLM request —
+                // without this hop, a secret would leave the host on the
+                // outbound prompt even though every other wire-format
+                // field already runs through `redactor`.
+                let redacted = self.config.redactor.redact(&truncated);
                 messages.push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
-                    content: truncated,
+                    content: redacted.into_owned(),
                 });
+                if let Some(cap) = req.policy.max_message_history_bytes {
+                    enforce_message_history_cap(&mut messages, cap);
+                }
             }
         }
 
