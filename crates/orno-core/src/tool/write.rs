@@ -1,11 +1,15 @@
 //! `Write` tool — write a file. Requires `allow_mutations`.
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
+use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -44,9 +48,14 @@ impl ToolHandler for WriteHandler {
                 message: e.to_string(),
             })?;
 
-        // Create parent dirs so writes to nested paths (e.g. `tmp/out/file.txt`)
-        // succeed without the caller pre-creating the hierarchy.
-        if let Some(parent) = std::path::Path::new(&path).parent()
+        // When the agent declared a root, the jail check requires the
+        // parent directory to exist for not-yet-existing targets — so
+        // create parent dirs first, then jail. The `create_dir_all`
+        // call is itself bounded by the original requested path's
+        // structure; if a path manages to escape the root, the jail
+        // check still rejects after the parent exists.
+        let requested = PathBuf::from(&path);
+        if let Some(parent) = requested.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Invocation {
@@ -55,14 +64,43 @@ impl ToolHandler for WriteHandler {
             })?;
         }
 
-        std::fs::write(&path, &content).map_err(|e| ToolError::Invocation {
+        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
+            jail_path(root, &path)?
+        } else {
+            requested
+        };
+
+        // Atomic write: stage in a sibling temp file and rename onto
+        // the target. Avoids leaving a half-written file on a crash and
+        // closes the read-after-truncate window where another reader
+        // can observe the file as empty between the truncate and the
+        // final flush.
+        let parent_dir = resolved.parent().unwrap_or_else(|| Path::new("."));
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| ToolError::Invocation {
+                name: "Write".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.as_file_mut()
+            .write_all(content.as_bytes())
+            .map_err(|e| ToolError::Invocation {
+                name: "Write".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.as_file()
+            .sync_all()
+            .map_err(|e| ToolError::Invocation {
+                name: "Write".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.persist(&resolved).map_err(|e| ToolError::Invocation {
             name: "Write".to_string(),
-            source: Box::new(e),
+            source: Box::new(e.error),
         })?;
 
         let bytes = content.len();
-        debug!(file.path = %path, file.bytes = bytes, call_id = %inv.call_id, "wrote file");
-        Ok(format!("Wrote {bytes} bytes to {path}"))
+        debug!(file.path = %resolved.display(), file.bytes = bytes, call_id = %inv.call_id, "wrote file");
+        Ok(format!("Wrote {bytes} bytes to {}", resolved.display()))
     }
 }
 

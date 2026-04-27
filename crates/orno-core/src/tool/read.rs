@@ -1,12 +1,26 @@
 //! `Read` tool — read a file's contents. Read-only effect.
 
+use std::fmt::Write as _;
+use std::io::Read as _;
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+
+/// Hard cap on bytes returned by a single `Read`. Larger files are
+/// truncated to this size with a marker so a runaway tool call cannot
+/// drag the next LLM request through the provider's prompt-size
+/// ceiling. Distinct from the policy-level
+/// `AgentPolicy.max_tool_output_bytes` (which truncates on the way back
+/// into conversation history); this cap fires at the source so the
+/// handler never holds the full file in memory.
+const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -32,14 +46,46 @@ impl ToolHandler for ReadHandler {
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }
-    async fn invoke(&self, _inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
+    async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let ReadArgs { path } =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
                 name: "Read".to_string(),
                 message: e.to_string(),
             })?;
 
-        std::fs::read_to_string(&path).map_err(|err| ToolError::Invocation {
+        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
+            jail_path(root, &path)?
+        } else {
+            PathBuf::from(&path)
+        };
+
+        let metadata = std::fs::metadata(&resolved).map_err(|e| ToolError::Invocation {
+            name: "Read".to_string(),
+            source: Box::new(e),
+        })?;
+
+        if metadata.len() > MAX_READ_BYTES {
+            // Stream-read only the cap so a giant file does not pin
+            // 10 MiB plus the rest in RSS while we copy.
+            let cap = usize::try_from(MAX_READ_BYTES).expect("MAX_READ_BYTES=10MiB fits in usize");
+            let mut buf = Vec::with_capacity(cap);
+            std::fs::File::open(&resolved)
+                .and_then(|f| f.take(MAX_READ_BYTES).read_to_end(&mut buf).map(|_| ()))
+                .map_err(|e| ToolError::Invocation {
+                    name: "Read".to_string(),
+                    source: Box::new(e),
+                })?;
+            let mut content = String::from_utf8_lossy(&buf).into_owned();
+            let _ = write!(
+                content,
+                "\n[truncated: file is {} bytes, showing first {} bytes]",
+                metadata.len(),
+                MAX_READ_BYTES,
+            );
+            return Ok(content);
+        }
+
+        std::fs::read_to_string(&resolved).map_err(|err| ToolError::Invocation {
             name: "Read".to_string(),
             source: Box::new(err),
         })

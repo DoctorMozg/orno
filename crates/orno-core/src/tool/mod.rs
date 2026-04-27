@@ -6,6 +6,7 @@
 pub mod bash;
 pub mod edit;
 pub mod mcp_handler;
+mod path_guard;
 pub mod read;
 pub mod record;
 pub mod replay;
@@ -14,6 +15,7 @@ pub mod subagent;
 pub mod web_fetch;
 pub mod write;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -95,6 +97,13 @@ pub struct ToolInvocation<'a> {
     /// sites). Adding this field is why `ToolInvocation` is `Clone` but
     /// no longer `Copy` — `Arc` is not trivially copyable.
     pub token_budget_share: Option<Arc<AtomicU64>>,
+    /// Filesystem roots the file builtins (`Read` / `Write` / `Edit`)
+    /// are jailed to. Borrowed from the agent's `AgentPolicy.roots`.
+    /// Empty when the calling agent did not declare any root or when
+    /// the handler is dispatched outside a `LoopAgent` (unit tests).
+    /// File handlers reject paths that escape `roots[0]`; non-file
+    /// handlers ignore this field entirely.
+    pub roots: &'a [PathBuf],
 }
 
 /// Borrow-scoped pointer to a single node's `state` buffer. Held for
@@ -133,6 +142,7 @@ impl<'a> ToolInvocation<'a> {
             depth: 0,
             state_handle: None,
             token_budget_share: None,
+            roots: &[],
         }
     }
 }

@@ -1,12 +1,16 @@
 //! `Edit` tool — replace a unique substring in a file.
 //! Requires `allow_mutations`.
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
+use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -50,7 +54,13 @@ impl ToolHandler for EditHandler {
             message: e.to_string(),
         })?;
 
-        let original = std::fs::read_to_string(&path).map_err(|e| ToolError::Invocation {
+        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
+            jail_path(root, &path)?
+        } else {
+            PathBuf::from(&path)
+        };
+
+        let original = std::fs::read_to_string(&resolved).map_err(|e| ToolError::Invocation {
             name: "Edit".to_string(),
             source: Box::new(e),
         })?;
@@ -59,26 +69,53 @@ impl ToolHandler for EditHandler {
         if occurrences == 0 {
             return Err(ToolError::InvalidArgs {
                 name: "Edit".to_string(),
-                message: format!("old_string not found in {path}"),
+                message: format!("old_string not found in {}", resolved.display()),
             });
         }
         if occurrences > 1 {
             return Err(ToolError::InvalidArgs {
                 name: "Edit".to_string(),
                 message: format!(
-                    "old_string is not unique in {path}: found {occurrences} occurrences"
+                    "old_string is not unique in {}: found {occurrences} occurrences",
+                    resolved.display(),
                 ),
             });
         }
 
         let updated = original.replacen(&old_string, &new_string, 1);
-        std::fs::write(&path, &updated).map_err(|e| ToolError::Invocation {
+
+        // Atomic write: stage in a sibling temp file and rename onto
+        // the target. Same rationale as `Write` — avoids a half-written
+        // file on a crash and prevents another reader from observing
+        // an empty file mid-write.
+        let parent_dir = resolved.parent().unwrap_or_else(|| Path::new("."));
+        let mut temp =
+            tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| ToolError::Invocation {
+                name: "Edit".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.as_file_mut()
+            .write_all(updated.as_bytes())
+            .map_err(|e| ToolError::Invocation {
+                name: "Edit".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.as_file()
+            .sync_all()
+            .map_err(|e| ToolError::Invocation {
+                name: "Edit".to_string(),
+                source: Box::new(e),
+            })?;
+        temp.persist(&resolved).map_err(|e| ToolError::Invocation {
             name: "Edit".to_string(),
-            source: Box::new(e),
+            source: Box::new(e.error),
         })?;
 
-        debug!(file.path = %path, call_id = %inv.call_id, "edited file");
-        Ok(format!("Edited {path} (replaced 1 occurrence)"))
+        debug!(file.path = %resolved.display(), call_id = %inv.call_id, "edited file");
+        Ok(format!(
+            "Edited {} (replaced 1 occurrence)",
+            resolved.display(),
+        ))
     }
 }
 
