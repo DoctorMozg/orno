@@ -262,6 +262,146 @@ async fn tool_output_truncated_in_conversation_history() {
     );
 }
 
+/// Build a tool-call response that targets `LongOutputTool` with a given
+/// call id. Shared by the message-history cap tests so each test stays
+/// focused on its own assertions rather than the response shape boilerplate.
+fn long_tool_call_response(call_id: &str) -> LlmResponse {
+    LlmResponse {
+        content: String::new(),
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+        tool_calls: vec![OrnoChatToolCall {
+            call_id: call_id.into(),
+            fn_name: "LongOutputTool".into(),
+            fn_arguments: serde_json::json!({}),
+        }],
+    }
+}
+
+fn final_text_response() -> LlmResponse {
+    LlmResponse {
+        content: "done".into(),
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn message_history_cap_truncates_oldest_messages() {
+    // Bounded resources, history dimension: with `max_message_history_bytes`
+    // set very small relative to each tool result, the loop must evict the
+    // oldest messages so the history stays bounded across iterations. The
+    // cap keeps at least the two most recent messages so the model still
+    // sees one tool-call/tool-result pair. With a 500-byte cap and 600-byte
+    // tool outputs, every request after the first must carry exactly two
+    // messages — the most recent ToolCalls and ToolResult.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(600));
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        long_tool_call_response("c1"),
+        long_tool_call_response("c2"),
+        long_tool_call_response("c3"),
+        long_tool_call_response("c4"),
+        final_text_response(),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 5;
+    req.policy.max_tool_calls = 4;
+    req.policy.max_message_history_bytes = Some(500);
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must complete despite huge tool outputs");
+
+    let observed = transport.messages_seen();
+    assert_eq!(observed.len(), 5, "transport must observe five requests");
+    assert!(
+        observed[0].is_empty(),
+        "first request must carry no history"
+    );
+
+    // From the second request onward the cap saturates to two most-recent
+    // messages: one ToolCalls turn followed by its paired ToolResult.
+    for (i, msgs) in observed.iter().enumerate().skip(1) {
+        assert_eq!(
+            msgs.len(),
+            2,
+            "request {i} must carry two messages, got {}",
+            msgs.len()
+        );
+        assert!(
+            matches!(msgs[0], OrnoChatMessage::ToolCalls { .. }),
+            "request {i} message[0] must be the ToolCalls turn",
+        );
+        match &msgs[1] {
+            OrnoChatMessage::ToolResult { call_id, .. } => {
+                assert_eq!(
+                    call_id,
+                    &format!("c{i}"),
+                    "request {i} must hold the most recent ToolResult"
+                );
+            },
+            other => panic!("request {i} message[1] must be a ToolResult, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn message_history_cap_disabled_lets_history_grow() {
+    // Companion to the cap test: when the policy field is `None` the loop
+    // must NOT enforce any cap, so every prior tool-call/tool-result pair
+    // remains visible to the model. Confirms the cap branch is opt-in and
+    // the "two messages only" claim above isn't a default behavior.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(600));
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        long_tool_call_response("c1"),
+        long_tool_call_response("c2"),
+        final_text_response(),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 5;
+    req.policy.max_tool_calls = 3;
+    req.policy.max_message_history_bytes = None;
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must complete");
+
+    let observed = transport.messages_seen();
+    assert_eq!(observed.len(), 3, "transport must observe three requests");
+    // Without a cap the history accumulates: two prior ToolCalls + two
+    // prior ToolResults arrive on the third request.
+    assert_eq!(
+        observed[2].len(),
+        4,
+        "history must accumulate without a cap"
+    );
+}
+
 #[tokio::test]
 async fn tool_output_under_cap_passes_through_unchanged() {
     // Companion to the regression above: when the tool result fits within the

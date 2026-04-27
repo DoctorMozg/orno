@@ -154,3 +154,108 @@ impl Clone for Redactor {
         Self::from_values(self.values.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn redactor_with(secrets: &[(&str, &str)]) -> Redactor {
+        let map: BTreeMap<String, String> = secrets
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        Redactor::new(&map)
+    }
+
+    #[test]
+    fn noop_when_no_secrets() {
+        // Default redactor holds no patterns; redaction must short-circuit
+        // on the borrowed path so callers pay no allocation cost.
+        let r = Redactor::default();
+        let result = r.redact("");
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert!(r.is_noop());
+    }
+
+    #[test]
+    fn single_secret_replaced() {
+        // Smoke test for the common path: one registered secret, one
+        // occurrence in the haystack, replaced with the canonical marker.
+        let r = redactor_with(&[("api_key", "supersecret")]);
+        let out = r.redact("token=supersecret end").into_owned();
+        assert_eq!(out, "token=*** end");
+    }
+
+    #[test]
+    fn multiple_secrets_replaced_in_one_pass() {
+        // The Aho-Corasick automaton catches every registered secret in a
+        // single linear scan. Three distinct secrets must each be replaced
+        // independently when they all appear in the same haystack.
+        let r = redactor_with(&[("a", "alpha"), ("b", "bravo"), ("c", "charlie")]);
+        let out = r.redact("alpha then bravo then charlie done").into_owned();
+        assert_eq!(out, "*** then *** then *** done");
+    }
+
+    #[test]
+    fn longer_secret_wins_over_substring() {
+        // `MatchKind::LeftmostLongest` semantics: when two registered secrets
+        // overlap at the same start position, the longer one must be the
+        // single match. Otherwise the shorter substring would slice the
+        // longer secret in half and emit two adjacent markers.
+        let r = redactor_with(&[("short", "api"), ("long", "api_key_secret")]);
+        let out = r.redact("see api_key_secret here").into_owned();
+        assert_eq!(out, "see *** here");
+        assert_eq!(out.matches("***").count(), 1);
+    }
+
+    #[test]
+    fn secret_not_in_string_returns_borrowed() {
+        // When the haystack does not contain any registered secret the
+        // redactor must return `Cow::Borrowed`. Allocating a fresh String
+        // for every clean payload would defeat the no-op fast path.
+        let r = redactor_with(&[("k", "supersecret")]);
+        let result = r.redact("nothing sensitive here");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn json_redaction_redacts_string_leaves() {
+        // Recursive JSON walk: only string leaves are rewritten. Numbers,
+        // booleans, and nulls cannot carry a secret by themselves so they
+        // must pass through bit-for-bit.
+        let r = redactor_with(&[("k", "topsecret")]);
+        let value = json!({
+            "field": "leak topsecret here",
+            "count": 42,
+            "flag": true,
+            "missing": null,
+        });
+        let out = r.redact_json(&value);
+        assert_eq!(out["field"], json!("leak *** here"));
+        assert_eq!(out["count"], json!(42));
+        assert_eq!(out["flag"], json!(true));
+        assert_eq!(out["missing"], json!(null));
+    }
+
+    #[test]
+    fn empty_secret_value_not_registered() {
+        // Empty-valued secrets would match every zero-width position in
+        // the haystack — strictly worse than no redaction. The constructor
+        // must drop them so the resulting redactor is a no-op.
+        let r = redactor_with(&[("blank", "")]);
+        assert!(r.is_noop());
+    }
+
+    #[test]
+    fn clone_produces_equivalent_redactor() {
+        // `Clone` rebuilds the automaton from the retained pattern list
+        // rather than relying on `AhoCorasick`'s own `Clone`. The cloned
+        // redactor must redact identically — same patterns, same output.
+        let r = redactor_with(&[("k", "abracadabra")]);
+        let clone = r.clone();
+        let input = "say abracadabra now";
+        assert_eq!(r.redact(input), clone.redact(input));
+        assert_eq!(clone.redact(input).into_owned(), "say *** now");
+    }
+}
