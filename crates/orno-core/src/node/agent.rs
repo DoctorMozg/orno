@@ -83,10 +83,10 @@ impl NodeExecutor for AgentExecutor {
 
         let agent_req = AgentRequest {
             agent_name: agent,
-            initial_prompt,
-            system,
-            provider,
-            model,
+            initial_prompt: Arc::from(initial_prompt),
+            system: system.map(Arc::from),
+            provider: Arc::from(provider),
+            model: Arc::from(model),
             policy,
             allowed_tools,
             // Root `kind: agent` nodes always enter at depth 0. A
@@ -206,6 +206,8 @@ mod tests {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             on_parse_error: OnParseError::Fail,
+            roots: Vec::new(),
+            max_message_history_bytes: None,
         }
     }
 

@@ -294,4 +294,12 @@ pub enum ToolError {
     /// feature that the caller declared but has not been implemented.
     #[error("tool `{name}` not implemented yet: {feature}")]
     NotImplemented { name: String, feature: String },
+
+    /// Tool access was denied by a runtime safety check inside the
+    /// handler — distinct from `LoopAgent`'s effect-based policy gate
+    /// (which produces a `ToolResult` denial string and never
+    /// terminates the loop). Returned, e.g., by the file-handler
+    /// root-jail when the requested path escapes the configured roots.
+    #[error("tool access denied: {reason}")]
+    Denied { reason: String },
 }
