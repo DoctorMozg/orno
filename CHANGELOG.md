@@ -5,7 +5,7 @@ All notable changes to orno are recorded here. The format follows
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once the first tagged release ships.
 
-## Unreleased
+## 0.1.1 - 2026-04-28
 
 ### Breaking changes
 
