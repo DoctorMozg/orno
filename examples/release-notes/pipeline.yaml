@@ -85,6 +85,8 @@ agents:
       max_subagent_depth: 0
       allow_mutations: true
       allow_network: false
+      roots:
+        - "."
       on_parse_error: fail
 
 nodes:

@@ -92,6 +92,8 @@ agents:
         - api.github.com
         - github.com
         - raw.githubusercontent.com
+      roots:
+        - "."
       on_parse_error: retry_once
 
   contributor_vibes:

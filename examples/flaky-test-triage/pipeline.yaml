@@ -83,6 +83,8 @@ agents:
         - docs.python.org
         - doc.rust-lang.org
       blocked_domains: []
+      roots:
+        - "/workspace"
       on_parse_error: retry_once
 
 nodes:
