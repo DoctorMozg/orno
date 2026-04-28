@@ -352,9 +352,24 @@ mod tests {
     // tests. Kept inside `mod tests` so they remain a strictly test-only
     // surface — production code only uses the `tracing` macro crate,
     // not `tracing-subscriber`.
+    //
+    // The capture surface uses a *single* globally-installed subscriber
+    // that writes every WARN+ event into a shared `Arc<Mutex<Vec<u8>>>`,
+    // and a `TRACE_CAPTURE_LOCK` mutex that serializes the tests that
+    // read it. Earlier this used `tracing::subscriber::set_default` per
+    // test, which sets a thread-local default — fine in theory, fragile
+    // in practice: under heavy CI load the captured buffer would come
+    // back empty because tracing's lookup order interacted poorly with
+    // tokio's `current_thread` runtime when sibling tests scheduled
+    // their own subscribers across worker threads. The global +
+    // serialization combo eliminates the thread-local race entirely.
     use std::io::Write;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use tracing_subscriber::fmt::MakeWriter;
+
+    static TRACE_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static TRACE_BUFFER: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    static TRACE_INIT: OnceLock<()> = OnceLock::new();
 
     #[derive(Clone)]
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
@@ -377,17 +392,30 @@ mod tests {
         }
     }
 
-    /// Build a JSON tracing subscriber whose output is captured in
-    /// `buf`. Caller installs it via `set_default`; the returned guard
-    /// must outlive the work-under-test. Per-thread default propagates
-    /// to async tasks only on `current_thread` runtimes — every test
-    /// using this helper marks `flavor = "current_thread"`.
-    fn capture_subscriber(buf: &Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send + Sync {
-        tracing_subscriber::fmt()
-            .with_writer(BufferWriter(buf.clone()))
-            .with_max_level(tracing::Level::WARN)
-            .json()
-            .finish()
+    /// Install the global JSON-capturing tracing subscriber on first
+    /// call, return the shared buffer on every call. Caller MUST hold
+    /// `TRACE_CAPTURE_LOCK` for the duration of its capture window —
+    /// otherwise concurrent capture tests will see each other's events.
+    /// The buffer is cleared on every entry so each test starts clean.
+    fn install_global_capture() -> Arc<Mutex<Vec<u8>>> {
+        let buf = TRACE_BUFFER
+            .get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+            .clone();
+        TRACE_INIT.get_or_init(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(BufferWriter(buf.clone()))
+                .with_max_level(tracing::Level::WARN)
+                .json()
+                .finish();
+            // `set_global_default` is the only sound way to share one
+            // subscriber across every test thread without per-thread
+            // races. It can only be called once per process, hence the
+            // `OnceLock`.
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("global tracing subscriber installed exactly once");
+        });
+        buf.lock().expect("buffer mutex").clear();
+        buf
     }
 
     fn capture_drain(buf: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -721,13 +749,20 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "TRACE_CAPTURE_LOCK guards a `()`; it serializes capture tests so the shared global tracing buffer is read by exactly one test at a time. Holding across `.await` is safe on the `current_thread` runtime — there is no other task that could contend for the same lock."
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn shell_nonzero_exit_emits_warn_with_exit_code_and_stderr_tail() {
+        use crate::node::shell::ShellExecutor;
         // The bug autopsy case: a shell that runs and exits non-zero
         // used to drop its stderr/exit_code into the void. After the
         // fix, dispatch_node emits a structured WARN with both fields
         // visible to log pipelines.
-        use crate::node::shell::ShellExecutor;
+        let _capture_lock = TRACE_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let pipeline = pipeline_of(vec![Node {
             id: "loud_fail".to_string(),
@@ -749,16 +784,13 @@ mod tests {
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink, registry, templates, EngineConfig::default());
 
-        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = capture_subscriber(&buf);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let buf = install_global_capture();
 
         engine
             .run("run_test", &pipeline, RunInputs::default())
             .await
             .expect("engine::run returns Ok even when a node fails");
 
-        drop(guard);
         let logs = capture_drain(&buf);
 
         assert!(
@@ -775,12 +807,19 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "TRACE_CAPTURE_LOCK guards a `()`; it serializes capture tests so the shared global tracing buffer is read by exactly one test at a time. Holding across `.await` is safe on the `current_thread` runtime — there is no other task that could contend for the same lock."
+    )]
     #[tokio::test(flavor = "current_thread")]
     async fn walker_construction_failure_emits_warn_before_propagating() {
         // A cyclic graph never gets a node started — so the per-node
         // failure path can't surface it. Engine::run must emit a WARN
         // before propagating the InvalidGraph error so log pipelines
         // see the cause without parsing the CLI's stderr error chain.
+        let _capture_lock = TRACE_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pipeline = pipeline_of(vec![
             shell_node("a", "true", &["b"]),
             shell_node("b", "true", &["a"]),
@@ -790,16 +829,13 @@ mod tests {
         let templates = Arc::new(TemplateEngine::new());
         let engine = Engine::new(sink, registry, templates, EngineConfig::default());
 
-        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = capture_subscriber(&buf);
-        let guard = tracing::subscriber::set_default(subscriber);
+        let buf = install_global_capture();
 
         let err = engine
             .run("run_test", &pipeline, RunInputs::default())
             .await
             .expect_err("cycle must surface as Err");
 
-        drop(guard);
         let logs = capture_drain(&buf);
 
         assert!(
