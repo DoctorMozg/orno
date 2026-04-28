@@ -162,7 +162,7 @@ pub(super) fn build_loop_agent(args: BuildLoopAgentArgs<'_>) -> Arc<LoopAgent> {
         body_excerpt_max_bytes,
     } = args;
     Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
-        let mut tools = builtin_tools.clone();
+        let mut tools = builtin_tools;
         for (name, cfg) in &pipeline.agents {
             tools.push(Arc::new(SubagentHandler::new(
                 format!("subagent.{name}"),
