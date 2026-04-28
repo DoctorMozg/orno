@@ -196,7 +196,19 @@ impl Engine {
             .iter()
             .map(|n| (n.id.clone(), kind_str(&n.kind)))
             .collect();
-        let mut context = Context::new(pipeline.vars.clone(), inputs.env, inputs.secrets);
+        // Pre-render `vars` against `{ env, secrets }` so a pattern like
+        // `vars.tag: "{{ env.TAG }}"` resolves once at engine entry.
+        // MiniJinja's per-template render is a single pass, so without
+        // this step the literal `{{ env.TAG }}` would land in
+        // `vars.tag` and downstream `{{ vars.tag }}` references would
+        // substitute the unrendered template source verbatim.
+        let rendered_vars = crate::pipeline::template::render_pipeline_vars(
+            &self.templates,
+            &pipeline.vars,
+            &inputs.env,
+            &inputs.secrets,
+        )?;
+        let mut context = Context::new(rendered_vars, inputs.env, inputs.secrets);
         let mut run_ok = true;
         // `RunFinished` aggregates. Both vectors capture
         // node ids in causal order — the same order the per-node
@@ -928,5 +940,118 @@ mod tests {
             })
             .expect("NodeFinished present");
         assert!(ok, "node with timeout=None must succeed");
+    }
+
+    #[tokio::test]
+    async fn pipeline_vars_are_rendered_against_env_before_node_dispatch() {
+        // End-to-end guard for the var-pre-render pass that the
+        // release-notes / pr-review / flaky-test-triage examples depend
+        // on. Without it, a shell node referencing `{{ vars.X }}` —
+        // where `vars.X` was authored as `"{{ env.X }}"` — would receive
+        // the literal six-token template source instead of the env
+        // value. The test runs a real `ShellExecutor` with `printf` so
+        // the captured stdout proves the value made the round trip.
+        use crate::node::shell::ShellExecutor;
+        use crate::pipeline::schema::ShellNode;
+
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "tag".to_string(),
+            serde_json::json!("{{ env.RELEASE_TAG }}"),
+        );
+        let mut pipeline = pipeline_of(vec![Node {
+            id: "echo_tag".to_string(),
+            kind: NodeKind::Shell(ShellNode {
+                command: "printf".to_string(),
+                args: vec!["%s".to_string(), "{{ vars.tag }}".to_string()],
+                stdin: None,
+            }),
+            needs: Vec::new(),
+            timeout: None,
+        }]);
+        pipeline.vars = vars;
+
+        let sink = Arc::new(InMemorySink::new());
+        let mut reg = NodeRegistry::new();
+        reg.register("shell", Arc::new(ShellExecutor::default()));
+        let registry = Arc::new(reg);
+        let templates = Arc::new(TemplateEngine::new());
+        let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
+
+        let mut env = BTreeMap::new();
+        env.insert("RELEASE_TAG".to_string(), "v0.1.1".to_string());
+        let inputs = RunInputs {
+            env,
+            secrets: BTreeMap::new(),
+        };
+
+        let outcome = engine
+            .run("run_test", &pipeline, inputs)
+            .await
+            .expect("engine::run succeeds");
+        assert!(outcome.ok, "node must succeed: {outcome:?}");
+
+        // The shell executor returns its captured stdout as the node
+        // output payload. Read it back through the InMemorySink and
+        // confirm the env value made the round trip.
+        let envelopes = sink.snapshot();
+        let finished = envelopes
+            .iter()
+            .find(|e| matches!(&e.event, Event::NodeFinished { node_id, .. } if node_id == "echo_tag"))
+            .expect("NodeFinished present");
+        match &finished.event {
+            Event::NodeFinished { ok, failure, .. } => {
+                assert!(ok, "node must finish ok, got failure={failure:?}");
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_env_in_pipeline_var_surfaces_template_error() {
+        // The render pass is strict-undefined: a `vars.X: "{{ env.MISSING }}"`
+        // with no `env.MISSING` declared must fail the run before the
+        // first node fires, with a `PipelineError::Template` carrying
+        // the offending var name. The early failure is preferable to a
+        // mid-DAG render error because the user gets a single, scoped
+        // diagnostic instead of a cascade.
+        use crate::node::shell::ShellExecutor;
+        use crate::pipeline::schema::ShellNode;
+
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "tag".to_string(),
+            serde_json::json!("{{ env.NOT_DECLARED }}"),
+        );
+        let mut pipeline = pipeline_of(vec![Node {
+            id: "noop".to_string(),
+            kind: NodeKind::Shell(ShellNode {
+                command: "true".to_string(),
+                args: Vec::new(),
+                stdin: None,
+            }),
+            needs: Vec::new(),
+            timeout: None,
+        }]);
+        pipeline.vars = vars;
+
+        let sink = Arc::new(InMemorySink::new());
+        let mut reg = NodeRegistry::new();
+        reg.register("shell", Arc::new(ShellExecutor::default()));
+        let registry = Arc::new(reg);
+        let templates = Arc::new(TemplateEngine::new());
+        let engine = Engine::new(sink.clone(), registry, templates, EngineConfig::default());
+
+        let err = engine
+            .run("run_test", &pipeline, RunInputs::default())
+            .await
+            .expect_err("run must fail when a var references a missing env");
+
+        match err {
+            CoreError::Pipeline(crate::error::PipelineError::Template { name, .. }) => {
+                assert_eq!(name, "vars.tag", "error must name the offending var");
+            },
+            other => panic!("expected PipelineError::Template, got {other:?}"),
+        }
     }
 }
