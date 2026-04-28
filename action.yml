@@ -15,7 +15,7 @@ inputs:
     required: false
     default: 'run'
   version:
-    description: 'orno version to install (e.g. v0.1.0). Omit for the latest GitHub Release.'
+    description: 'orno version to install (e.g. v0.1.1). Omit for the latest GitHub Release.'
     required: false
   secrets-file:
     description: 'Path to a .env.secrets file forwarded as --secrets-file.'

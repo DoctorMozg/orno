@@ -71,7 +71,7 @@ Install the latest release binary for your platform:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/master/install.sh | bash
 ```
 
-The script downloads `orno` from GitHub Releases into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin` or pin a version with `ORNO_VERSION=v0.1.0`.
+The script downloads `orno` from GitHub Releases into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin` or pin a version with `ORNO_VERSION=v0.1.1`.
 
 Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
 
@@ -80,7 +80,7 @@ Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-p
 Run an orno pipeline from a workflow without managing the binary yourself:
 
 ```yaml
-- uses: DoctorMozg/orno@v0.1.0
+- uses: DoctorMozg/orno@v0.1.1
   with:
     pipeline: examples/hello/pipeline.yaml
     command: run                # run | plan | validate | replay (default: run)
@@ -88,7 +88,7 @@ Run an orno pipeline from a workflow without managing the binary yourself:
     args: --record-bundle run.ndjson  # optional, forwarded to orno
 ```
 
-Pin to a tagged release (`@v0.1.0`) for reproducibility, or to the major tag (`@v1`) to receive non-breaking patches automatically. The action installs orno into the runner's tool cache and runs your pipeline; outputs are NDJSON on stdout and tracing JSON on stderr, just like a local invocation.
+Pin to a tagged release (`@v0.1.1`) for reproducibility, or to the major tag (`@v1`) to receive non-breaking patches automatically. The action installs orno into the runner's tool cache and runs your pipeline; outputs are NDJSON on stdout and tracing JSON on stderr, just like a local invocation.
 
 ### Build from source
 
