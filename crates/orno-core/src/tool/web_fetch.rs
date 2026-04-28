@@ -41,7 +41,7 @@ struct WebFetchArgs {
 /// messages.
 fn arg_field_names(args: &Value) -> String {
     args.as_object()
-        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+        .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>().join(", "))
         .unwrap_or_default()
 }
 
@@ -138,7 +138,7 @@ impl ToolHandler for WebFetchHandler {
             })?;
 
         let request_timeout = timeout_secs.map_or(self.default_timeout, Duration::from_secs);
-        let response = self
+        let mut response = self
             .client
             .get(&url)
             .timeout(request_timeout)
@@ -163,7 +163,6 @@ impl ToolHandler for WebFetchHandler {
         // early and bounds RSS.
         let mut buf = Vec::with_capacity(MAX_BODY_BYTES.min(65_536));
         let mut truncated = false;
-        let mut response = response;
         loop {
             match response
                 .chunk()

@@ -125,13 +125,10 @@ pub(super) fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
     // one when saving a file as UTF-8; leaving it in front of the first
     // line would make the first key parse as `\u{FEFF}KEY`, which the
     // engine then routes to the wrong env entry.
-    let contents = contents
-        .strip_prefix('\u{FEFF}')
-        .unwrap_or(&contents)
-        .to_string();
+    let stripped = contents.strip_prefix('\u{FEFF}').unwrap_or(&contents);
 
     let mut out = Vec::new();
-    for (lineno, raw) in contents.lines().enumerate() {
+    for (lineno, raw) in stripped.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;

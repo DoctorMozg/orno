@@ -15,7 +15,7 @@ CI-native runner for strict agentic loops.
 
 orno runs LLM agents under a runtime-enforced contract: bounded iteration, bounded tool surface, bounded effects, bounded resources, bounded non-determinism. Every decision is emitted on a versioned event log, and every run can be replayed byte-for-byte without spending tokens.
 
-## Hero surface
+## Features
 
 ### `orno plan` — preview before spend
 
