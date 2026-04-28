@@ -42,6 +42,15 @@ once the first tagged release ships.
 - WebFetch body now streamed in chunks up to 1 MiB cap; previously `response.bytes().await`
   allocated the full body before truncation, allowing a malicious server to OOM the process.
 
+### Bug fixes
+
+- Pipeline `vars` are now pre-rendered against the `{ env, secrets }` namespace at engine
+  entry, so a pattern like `vars.tag: "{{ env.RELEASE_TAG }}"` resolves to the env value
+  before any node is dispatched. Previously the literal template source was substituted
+  verbatim by the single-pass downstream renderer, breaking shell args of the form
+  `["{{ vars.prev }}..{{ vars.curr }}"]`. Cross-var references (`vars.b: "{{ vars.a }}"`)
+  remain unsupported in v0.1.x — the render context exposes only `env` and `secrets`.
+
 ### Other changes
 
 - `AgentPolicy.max_message_history_bytes` (default 4 MiB) bounds per-agent conversation history;

@@ -29,6 +29,27 @@ vars:
   max_age_days: 7
 ```
 
+### Var rendering against env and secrets
+
+String values inside `vars` are themselves templated — they are rendered once at engine
+entry against the `{ env, secrets }` namespace before any node is dispatched, so a value
+of the form `"{{ env.RELEASE_TAG }}"` resolves to the env binding rather than carrying
+the literal template source through to downstream nodes:
+
+```yaml
+vars:
+  tag: "{{ env.RELEASE_TAG }}"        # → resolves to env.RELEASE_TAG at run start
+  range: "{{ env.PREV }}..{{ env.CUR }}"
+```
+
+Numbers, booleans, and nulls pass through unchanged. Arrays and objects recurse, so
+`vars.commits: ["{{ env.SHA }}"]` and `vars.opts: { tag: "{{ env.TAG }}" }` both expand
+element-by-element.
+
+Cross-var references (`vars.b: "{{ vars.a }}"`) are intentionally **not** supported in
+v0.1.x — the rendering context exposes only `env` and `secrets`. A `{{ vars.x }}` lookup
+inside another `vars` entry will fail with `PipelineError::Template { name: "vars.b", … }`.
+
 ## Environment and secrets
 
 Pipelines reference two external-value namespaces from templates — `env.*` for visible inputs and `secrets.*` for redacted credentials. See [env-vars.md](env-vars.md) for the runtime-boundary surface.
