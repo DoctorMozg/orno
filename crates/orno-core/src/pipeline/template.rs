@@ -11,11 +11,13 @@
 //! the source; the same hex string is the `MiniJinja` template name so a
 //! cache hit is a direct `get_template` lookup.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use lru::LruCache;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
+use serde_json::{Value, json};
 
 use crate::error::PipelineError;
 
@@ -63,12 +65,7 @@ impl TemplateEngine {
         }
     }
 
-    pub fn render(
-        &self,
-        name: &str,
-        source: &str,
-        ctx: &serde_json::Value,
-    ) -> Result<String, PipelineError> {
+    pub fn render(&self, name: &str, source: &str, ctx: &Value) -> Result<String, PipelineError> {
         if source.len() > MAX_TEMPLATE_SOURCE_BYTES {
             return Err(PipelineError::Validation(format!(
                 "template `{name}` source exceeds {MAX_TEMPLATE_SOURCE_BYTES} bytes ({} bytes)",
@@ -130,6 +127,73 @@ impl Default for TemplateEngine {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Render every string value inside a pipeline's `vars` map against the
+/// `{ env, secrets }` namespace. Numbers, booleans, and nulls pass
+/// through unchanged; arrays and objects recurse so a shape like
+/// `vars.commits: ["{{ env.SHA }}"]` expands element-by-element.
+///
+/// Cross-var references are intentionally not supported in v0.1.x — the
+/// rendering context exposes only `env` and `secrets`, so a user cannot
+/// write `vars.b: "{{ vars.a }}"` and expect a value. Allowing it would
+/// require fixed-point iteration with cycle detection; defer until a
+/// real pipeline asks for it.
+///
+/// Errors:
+/// - `PipelineError::Template` if any string fails to render (missing
+///   `env.X`, malformed Jinja, oversize source).
+pub fn render_pipeline_vars(
+    tmpl: &TemplateEngine,
+    vars: &BTreeMap<String, Value>,
+    env: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Value>, PipelineError> {
+    let ctx = json!({ "env": env, "secrets": secrets });
+    let mut out = BTreeMap::new();
+    for (key, value) in vars {
+        out.insert(
+            key.clone(),
+            render_value(tmpl, &format!("vars.{key}"), value, &ctx)?,
+        );
+    }
+    Ok(out)
+}
+
+fn render_value(
+    tmpl: &TemplateEngine,
+    name: &str,
+    value: &Value,
+    ctx: &Value,
+) -> Result<Value, PipelineError> {
+    match value {
+        Value::String(s) if looks_templated(s) => Ok(Value::String(tmpl.render(name, s, ctx)?)),
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, item) in arr.iter().enumerate() {
+                out.push(render_value(tmpl, &format!("{name}[{i}]"), item, ctx)?);
+            }
+            Ok(Value::Array(out))
+        },
+        Value::Object(obj) => {
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (k, v) in obj {
+                out.insert(
+                    k.clone(),
+                    render_value(tmpl, &format!("{name}.{k}"), v, ctx)?,
+                );
+            }
+            Ok(Value::Object(out))
+        },
+        other => Ok(other.clone()),
+    }
+}
+
+/// Cheap pre-check — skip the render call when the source obviously
+/// has no template tags. MiniJinja parses literal strings cleanly, so
+/// this is purely a perf hint, not a correctness gate.
+fn looks_templated(s: &str) -> bool {
+    s.contains("{{") || s.contains("{%")
 }
 
 #[cfg(test)]
@@ -322,5 +386,146 @@ mod tests {
             .render("evictee", evictee_source, &json!({ "value": "beta" }))
             .expect("re-render after eviction must succeed");
         assert_eq!(rerendered, "evictee beta");
+    }
+
+    fn vars_from(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    fn env_from(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn render_pipeline_vars_expands_env_into_string_var() {
+        // The release-notes / pr-review / flaky-test-triage examples all
+        // pivot env vars into `vars.X` to give downstream nodes a stable
+        // template handle. Without pre-rendering, the literal source
+        // would land in `vars.X` and a downstream `{{ vars.X }}` would
+        // substitute it verbatim, breaking shell args / prompts.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[
+            ("prev_tag", json!("{{ env.PREV_TAG }}")),
+            ("curr_tag", json!("{{ env.CURR_TAG }}")),
+        ]);
+        let env = env_from(&[("PREV_TAG", "v0.1.0"), ("CURR_TAG", "v0.1.1")]);
+        let secrets = BTreeMap::new();
+
+        let out = render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("render must succeed");
+
+        assert_eq!(out["prev_tag"], json!("v0.1.0"));
+        assert_eq!(out["curr_tag"], json!("v0.1.1"));
+    }
+
+    #[test]
+    fn render_pipeline_vars_passes_through_non_string_scalars() {
+        // Numbers, booleans, and nulls must round-trip unchanged. The
+        // helper only rewrites strings; touching the others would force
+        // YAML authors to quote every numeric var.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[
+            ("n", json!(42)),
+            ("flag", json!(true)),
+            ("nothing", Value::Null),
+            ("plain", json!("literal")),
+        ]);
+        let env = BTreeMap::new();
+        let secrets = BTreeMap::new();
+
+        let out = render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("render must succeed");
+
+        assert_eq!(out["n"], json!(42));
+        assert_eq!(out["flag"], json!(true));
+        assert_eq!(out["nothing"], Value::Null);
+        assert_eq!(out["plain"], json!("literal"));
+    }
+
+    #[test]
+    fn render_pipeline_vars_recurses_into_arrays_and_objects() {
+        // A composite var like `commits: ["{{ env.A }}", "{{ env.B }}"]`
+        // is the natural shape for "fan a list of env-derived ids out
+        // to a downstream node"; the renderer must dive in.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[
+            ("list", json!(["{{ env.A }}", "literal", "{{ env.B }}"])),
+            (
+                "map",
+                json!({ "outer": "{{ env.A }}", "inner": { "k": "{{ env.B }}" } }),
+            ),
+        ]);
+        let env = env_from(&[("A", "alpha"), ("B", "beta")]);
+        let secrets = BTreeMap::new();
+
+        let out = render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("render must succeed");
+
+        assert_eq!(out["list"], json!(["alpha", "literal", "beta"]));
+        assert_eq!(
+            out["map"],
+            json!({ "outer": "alpha", "inner": { "k": "beta" } })
+        );
+    }
+
+    #[test]
+    fn render_pipeline_vars_propagates_template_error_with_var_name() {
+        // A missing `env.X` must surface as a Template error tagged with
+        // the offending var path so the user can find the broken value
+        // without grep. The exact name stays in the error so a
+        // multi-var pipeline does not blame the wrong key.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[("broken", json!("{{ env.MISSING }}"))]);
+        let env = BTreeMap::new();
+        let secrets = BTreeMap::new();
+
+        let err = render_pipeline_vars(&tmpl, &vars, &env, &secrets)
+            .expect_err("missing env reference must error");
+
+        match err {
+            PipelineError::Template { name, .. } => {
+                assert_eq!(name, "vars.broken", "error must name the offending var");
+            },
+            other => panic!("expected PipelineError::Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_pipeline_vars_does_not_expose_vars_to_itself() {
+        // Cross-var references are intentionally unsupported in v0.1.x.
+        // A user who writes `vars.b: "{{ vars.a }}"` must see a hard
+        // template-render error rather than a silent empty string —
+        // strict undefined behavior is what makes that a real signal
+        // instead of a footgun.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[("a", json!("alpha")), ("b", json!("{{ vars.a }}"))]);
+        let env = BTreeMap::new();
+        let secrets = BTreeMap::new();
+
+        let err = render_pipeline_vars(&tmpl, &vars, &env, &secrets)
+            .expect_err("cross-var reference must not resolve");
+        match err {
+            PipelineError::Template { name, .. } => assert_eq!(name, "vars.b"),
+            other => panic!("expected PipelineError::Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_pipeline_vars_supports_secrets_in_strings() {
+        // Symmetry with env: a `vars.token: "{{ secrets.GH_TOKEN }}"`
+        // shape is reasonable when the downstream consumer expects a
+        // pre-templated string. The redactor on the event stream still
+        // scrubs the value before emission.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[("token", json!("{{ secrets.MY_TOKEN }}"))]);
+        let env = BTreeMap::new();
+        let secrets = env_from(&[("MY_TOKEN", "redacted-fake-value")]);
+
+        let out = render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("render must succeed");
+
+        assert_eq!(out["token"], json!("redacted-fake-value"));
     }
 }
