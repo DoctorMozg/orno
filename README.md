@@ -11,41 +11,14 @@
   <img src="https://img.shields.io/badge/rust-1.95%2B-orange?logo=rust" alt="Rust 1.95+" />
 </p>
 
-CI-native runner for strict agentic loops.
+One bad prompt and an agent loop in CI will burn a weekend of tokens, hit endpoints it had no business reaching, and leave you nothing to audit afterwards. orno wraps the loop in a runtime contract you declare in YAML — iterations, tool surface, effects, resources — and stops the agent the moment it tries to step outside.
 
-orno runs LLM agents under a runtime-enforced contract: bounded iteration, bounded tool surface, bounded effects, bounded resources, bounded non-determinism. Every decision is emitted on a versioned event log, and every run can be replayed byte-for-byte without spending tokens.
+## Why orno
 
-## Features
-
-### `orno plan` — preview before spend
-
-Static analysis of a pipeline. No LLM calls, no tool execution, no network. Emits one `plan_node` line per node followed by a single `plan_summary` line as NDJSON on stdout. Exit code is `0` iff the pipeline loads, validates, and is spendable.
-
-```console
-$ orno plan examples/hello/pipeline.yaml
-{"type":"plan_node","node_id":"greet","kind":"agent","depends_on":[],"timeout_secs":null,"agent_name":"greeter","model":"openai/gpt-5","provider":"openrouter","tools":[],"max_iterations":1,"max_total_tokens":1000,"max_tool_calls":0,"allow_mutations":false,"allow_network":false,"allowed_domains":[],"blocked_domains":[]}
-{"type":"plan_summary","total_nodes":1,"agent_nodes":1,"shell_nodes":0,"agents_used":["greeter"],"max_iterations_total":1,"max_tokens_total":1000,"max_tool_calls_total":0,"mcp_servers":[],"dag_is_valid":true}
-```
-
-Treat it as `terraform plan` for an agent pipeline: a reviewer audits the worst-case ceiling — tokens, tool calls, declared effects, MCP dependencies — before any spend is authorized.
-
-### `orno replay` — replay without tokens
-
-Given a bundle file recorded by a prior run, orno re-executes the pipeline from the recorded LLM and tool tapes. No live LLM calls, no network, no MCP server spawning — every external interaction is served from the bundle. Outputs, exit code, and event log are reproduced bit-for-bit.
-
-Record a bundle:
-
-```bash
-orno run examples/hello/pipeline.yaml --record-bundle run.ndjson
-```
-
-Replay it:
-
-```bash
-orno replay run.ndjson
-```
-
-A tape miss during replay is a hard error, not a fallback to the live API.
+- **The contract lives in YAML.** Set the ceiling once; orno enforces it at runtime. Nothing to wire up in code, no policy library to keep in sync, and no place to quietly disable the limits.
+- **One binary, one YAML file.** No server. No database. No scheduler to babysit. Drop the binary on a runner and call it.
+- **Two streams, no parser.** NDJSON events on stdout, tracing JSON on stderr. Pipe stdout into `jq`, Splunk, or Datadog as-is; the streams never cross.
+- **GitHub Action you pin like any other.** `DoctorMozg/orno@v0.1.1` in the workflow, secrets file alongside, done.
 
 ## The five strictness dimensions
 
@@ -65,34 +38,34 @@ Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly
 
 ### Install
 
-Install the latest release binary for your platform:
+Grab the latest release binary for your platform:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/master/install.sh | bash
 ```
 
-The script downloads `orno` from GitHub Releases into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin` or pin a version with `ORNO_VERSION=v0.1.1`.
+The script pulls `orno` from GitHub Releases and drops it into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin`, or pin a version with `ORNO_VERSION=v0.1.1`.
 
 Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
 
 ### Use as a GitHub Action
 
-Run an orno pipeline from a workflow without managing the binary yourself:
+Run an orno pipeline from a workflow without bringing your own binary:
 
 ```yaml
 - uses: DoctorMozg/orno@v0.1.1
   with:
     pipeline: examples/hello/pipeline.yaml
-    command: run                # run | plan | validate | replay (default: run)
+    command: run                # run | plan | validate (default: run)
     secrets-file: .env.secrets  # optional
     args: --record-bundle run.ndjson  # optional, forwarded to orno
 ```
 
-Pin to a tagged release (`@v0.1.1`) for reproducibility, or to the major tag (`@v1`) to receive non-breaking patches automatically. The action installs orno into the runner's tool cache and runs your pipeline; outputs are NDJSON on stdout and tracing JSON on stderr, just like a local invocation.
+Pin to a tagged release (`@v0.1.1`) when you want the run reproducible; pin to the major tag (`@v1`) if you'd rather take non-breaking patches as they ship. The action installs orno into the runner's tool cache and runs the pipeline. Stdout is NDJSON and stderr is tracing JSON, the same shape you'd see invoking it locally.
 
 ### Build from source
 
-Build from source against the workspace's pinned toolchain (MSRV 1.95):
+Build against the workspace's pinned toolchain (MSRV 1.95):
 
 ```bash
 git clone https://github.com/DoctorMozg/orno.git
@@ -103,10 +76,9 @@ cargo build --release -p orno-cli
 
 ### Run an example
 
-`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter. To run it without an API key, set the dummy transport — it returns a deterministic canned response:
+`examples/hello/pipeline.yaml` calls a real LLM through OpenRouter. If you don't have an API key handy, point it at the dummy transport. It returns a deterministic canned response and skips the network entirely:
 
 ```bash
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- plan examples/hello/pipeline.yaml
 ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
@@ -149,24 +121,20 @@ nodes:
 
 ## Pipeline YAML shape
 
-A pipeline declares `vars`, named `agents`, optional `mcp_servers`, and a list of `nodes` forming a DAG. Two node kinds:
+A pipeline declares `vars`, named `agents`, optional `mcp_servers`, and a list of `nodes` that form a DAG. There are two node kinds. `kind: agent` runs the strict loop against a named agent; downstream nodes read its final assistant message as `nodes.<id>.output`. `kind: shell` is a deterministic subprocess: its output splits into `nodes.<id>.stdout`, `.stderr`, and `.exit_code`, and nothing about it goes through agent policy.
 
-- `kind: agent` — runs the strict loop against a named agent. Final assistant message is readable from downstream nodes as `nodes.<id>.output`.
-- `kind: shell` — deterministic subprocess. Output is split into `nodes.<id>.stdout`, `.stderr`, and `.exit_code`. Not subject to agent policy.
-
-Templates use MiniJinja with three namespaces: `vars.*`, `env.*` (opt-in pipeline inputs), and `secrets.*` (redacted credentials). See [`docs/reference/pipeline-yaml.md`](docs/reference/pipeline-yaml.md) for the full grammar, and the per-example folders under `examples/` for functionality-heavy samples.
+Templates are MiniJinja. They see three namespaces: `vars.*` for declared variables, `env.*` for explicitly opted-in pipeline inputs, and `secrets.*` for credentials that get redacted in logs. The full grammar lives in [`docs/reference/pipeline-yaml.md`](docs/reference/pipeline-yaml.md), and each folder under `examples/` walks through one piece of functionality.
 
 ## Commands
 
 - **`orno run <pipeline.yaml>`** — execute a pipeline. NDJSON events to stdout, tracing JSON to stderr.
   Key flags: `-e KEY=VAL`, `--env-file`, `--secrets-file`, `-v` / `--verbose`, `--stderr-tail-bytes`, `--record-bundle`, `--record-tape`, `--replay-tape`, `--record-tool-tape`, `--replay-tool-tape`.
 - **`orno validate <pipeline.yaml>`** — load and validate the full policy surface (tool names, agent and MCP references, budget fields).
-- **`orno plan <pipeline.yaml>`** — static preview. Emits `plan_node` and `plan_summary` records as NDJSON. No LLM or network.
-- **`orno replay <bundle.ndjson>`** — replay a bundle written by `orno run --record-bundle`. No live LLM calls, no network.
+- **`orno plan <pipeline.yaml>`** — static preview. No LLM or network. Emits `plan_node` and `plan_summary` NDJSON.
 - **`orno schema`** — print the pipeline JSON Schema to stdout. Used to regenerate `schemas/pipeline.schema.json`.
 - **`orno completions <shell>`** — emit shell completions (bash, zsh, fish, elvish, powershell).
 
-`orno run` separates streams: NDJSON event envelopes go to stdout (downstream tools), tracing JSON goes to stderr (log pipelines). Both timestamps are RFC 3339 UTC, so the two streams join on wall clock. Exit `0` on success; non-zero on pipeline load failure or any node failure.
+`orno run` keeps the streams apart: NDJSON event envelopes go to stdout, tracing JSON to stderr. Both carry RFC 3339 UTC timestamps, so joining the two on wall clock is a one-liner. Exit code is `0` on success, non-zero if the pipeline failed to load or any node failed.
 
 ## Documentation
 
