@@ -1,4 +1,4 @@
-name: 'orno'
+name: 'orno-pipeline'
 description: 'Run an orno pipeline under runtime-enforced agent contracts (bounded iteration, tools, effects, resources, replay).'
 author: 'DoctorMozg'
 
