@@ -5,6 +5,45 @@ All notable changes to orno are recorded here. The format follows
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once the first tagged release ships.
 
+## Unreleased
+
+### Bug fixes
+
+- Regenerated `schemas/pipeline.schema.json` to include `roots`,
+  `max_message_history_bytes`, and `max_tool_output_bytes` on `AgentPolicy`.
+  These three fields landed in 0.1.1 but the regenerated schema was not
+  committed, so IDE yaml-language-server users saw stale autocomplete
+  for one release.
+
+### Other changes
+
+- CI `install-smoke` now enforces a schema drift gate (`orno schema`
+  must match the checked-in `schemas/pipeline.schema.json`) and validates
+  every `examples/*/pipeline.yaml` rather than only `hello`.
+- New CI `dogfood` job runs `examples/hello/pipeline.yaml` end-to-end
+  through the binary using `ORNO_TEST_LLM_TRANSPORT=dummy`, asserting a
+  `run_finished` event with `ok: true`. Closes the gap between
+  "validates" and "actually runs" for the user-facing `orno run` path.
+- Replay-bundle golden test (`crates/orno-cli/tests/replay_goldens.rs`)
+  pins `orno replay tests/bundles/hello.ndjson` to an `insta` YAML
+  snapshot of the redacted event stream. The committed bundle is the
+  immutable input; a snapshot diff signals one of three drifts that
+  the existing fresh-record-every-test integration tests cannot catch:
+  bundle reader/writer format change, `EventEnvelope` shape change, or
+  engine ordering drift. Regenerate via `cargo insta accept` only after
+  confirming the diff is intentional.
+- New `examples/self-review/` pipeline (rubric + YAML + README) plus a
+  `dogfood-self-review` CI workflow that runs orno against every internal
+  PR. The reviewer agent is single-shot Claude Sonnet 4.5 via OpenRouter,
+  Read-only, with mutations and network denied at the policy level and
+  `roots` jailed to the PR-head checkout. Two-checkout pattern (trusted
+  master + PR head) prevents a malicious PR from rewriting either the
+  pipeline YAML or the rubric; the orno binary itself is installed from
+  the pinned `DoctorMozg/orno@v0.1.1` release tag, never built from the
+  PR commit. Forks are excluded by an explicit `if:` guard. The verdict
+  step parses `VERDICT: PASS` / `VERDICT: FAIL` from the produced
+  `.orno-self-review.md` and gates the PR check accordingly.
+
 ## 0.1.1 - 2026-04-28
 
 ### Breaking changes

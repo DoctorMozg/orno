@@ -148,6 +148,16 @@
           "format": "uint32",
           "minimum": 0
         },
+        "max_message_history_bytes": {
+          "description": "Soft cap on the approximate byte size of the accumulated\nconversation history (sum of content lengths across all\n`OrnoChatMessage` variants). When the history exceeds this\nthreshold after a push, the loop evicts the oldest messages\nuntil the history is back under the cap, always retaining the\ntwo most recent messages so the model sees at least one\nrequest-response round.\n\n`None` disables the cap (not recommended for long-running agents).\nThe default (4 MiB) is generous enough for normal tool-call loops\nand tight enough to prevent multi-gigabyte prompt payloads.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": 4194304,
+          "minimum": 0
+        },
         "max_subagent_depth": {
           "type": "integer",
           "format": "uint32",
@@ -158,6 +168,16 @@
           "format": "uint32",
           "minimum": 0
         },
+        "max_tool_output_bytes": {
+          "description": "Cap on per-call tool output (in bytes) appended to the\nconversation history that the next LLM turn sees. A handler may\nlegally return any size; the loop truncates the head bytes that\nfit and appends an ellipsis marker before pushing the\n`ToolResult` message. `None` keeps the built-in default (256 KiB)\n— large enough for typical Read / `WebFetch` results, small enough\nto bound conversation growth on a runaway tool. Set to a small\nvalue in tests to make the truncation observable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
         "max_total_tokens": {
           "type": "integer",
           "format": "uint64",
@@ -165,6 +185,14 @@
         },
         "on_parse_error": {
           "$ref": "#/$defs/OnParseError"
+        },
+        "roots": {
+          "description": "Filesystem roots the `Read` / `Write` / `Edit` builtins are\njailed to. When the agent's `allowed_tools` list contains any\nof those names, this list must be non-empty — `LoopAgent`\nrejects with `AgentError::InvalidPolicy` at run start.\nCurrently only `roots[0]` is consulted; multi-root agents are\na v0.2+ extension.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [

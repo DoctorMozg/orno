@@ -1,0 +1,176 @@
+# yaml-language-server: $schema=../../schemas/pipeline.schema.json
+# Self-review pipeline. Loads a trusted review rubric, collects the PR diff
+# against `origin/master`, asks one bounded agent to produce a markdown
+# review, persists the verdict, and posts it as a PR comment.
+#
+# Trust model
+# -----------
+# This pipeline.yaml MUST be loaded from a trusted checkout (e.g. master),
+# never from the PR head being reviewed. The accompanying workflow
+# `.github/workflows/dogfood-self-review.yml` does this with a two-checkout
+# pattern: a trusted master clone holds the pipeline + guidelines, and a
+# separate PR-head clone holds the code under review. The orno binary itself
+# is installed from a pinned action version (`DoctorMozg/orno-pipeline@v...`),
+# never built from the PR commit, so a malicious PR cannot patch the runtime
+# to escalate the policy.
+#
+# The agent's tool surface is `Read` only, with mutations and network denied
+# at the policy level and `roots` jailed to the PR-head checkout. Even if a
+# PR rewrites the files at `roots`, the agent cannot exfiltrate secrets — the
+# secrets namespace is rendered only into templates that explicitly reference
+# `{{ secrets.* }}`, and this trusted YAML never does.
+#
+# Inputs (env, set by the workflow)
+# ---------------------------------
+#   PR_NUMBER     — pull-request number being reviewed
+#   PR_REPO       — absolute path to the PR-head checkout (`roots` for Read)
+#   TRUSTED_ROOT  — absolute path to the trusted-master checkout
+#   GH_REPO       — owner/name string for `gh pr comment --repo`
+#   GH_TOKEN      — set on the workflow step's `env:` block; inherited by the
+#                   `gh` shell child via the standard process-env model. Not
+#                   declared in `secrets:` because gh reads it directly from
+#                   env, not from a template.
+#
+# Secrets (via `--secrets-file`)
+# ------------------------------
+#   OPENROUTER_API_KEY — provider key auto-discovered by the LLM transport.
+
+version: 1
+
+secrets:
+  - OPENROUTER_API_KEY
+
+vars:
+  pr_number: "{{ env.PR_NUMBER }}"
+  pr_repo: "{{ env.PR_REPO }}"
+  trusted_root: "{{ env.TRUSTED_ROOT }}"
+  gh_repo: "{{ env.GH_REPO }}"
+  base_ref: origin/master
+  guidelines_path: "{{ env.TRUSTED_ROOT }}/examples/self-review/guidelines.md"
+  verdict_path: "{{ env.PR_REPO }}/.orno-self-review.md"
+
+pass_env:
+  - PR_NUMBER
+  - PR_REPO
+  - TRUSTED_ROOT
+  - GH_REPO
+
+agents:
+  reviewer:
+    model: anthropic/claude-sonnet-4.5
+    provider: openrouter
+    system: |
+      You are a senior code reviewer. The user message contains the rubric
+      you must follow, the list of changed files, and the unified diff.
+      Apply the rubric, write the markdown report, and end with a single
+      `VERDICT: PASS` or `VERDICT: FAIL` line — nothing after it.
+
+      You may call `Read` on any file under the repository root to confirm
+      a finding (e.g. read 30 lines around a flagged hunk). Never browse
+      beyond what the diff touches. Network and filesystem mutations are
+      denied at the policy level — your tool surface is `Read` only.
+
+      Be concise. Skip files with no issues. Do not invent context the
+      diff does not show.
+    allowed_tools:
+      - Read
+    policy:
+      max_iterations: 30
+      max_total_tokens: 200000
+      max_tool_calls: 60
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      roots:
+        - "{{ vars.pr_repo }}"
+      on_parse_error: retry_once
+
+nodes:
+  - id: load_guidelines
+    # Trusted-master copy of the rubric. The PR cannot tamper with this path
+    # because the trusted checkout is materialized by the workflow, not by
+    # the PR commit.
+    kind: shell
+    command: cat
+    args:
+      - "{{ vars.guidelines_path }}"
+
+  - id: collect_diff
+    kind: shell
+    command: git
+    args:
+      - "-C"
+      - "{{ vars.pr_repo }}"
+      - "diff"
+      - "--unified=3"
+      - "{{ vars.base_ref }}...HEAD"
+
+  - id: collect_files
+    kind: shell
+    command: git
+    args:
+      - "-C"
+      - "{{ vars.pr_repo }}"
+      - "diff"
+      - "--name-status"
+      - "{{ vars.base_ref }}...HEAD"
+
+  - id: review
+    kind: agent
+    agent: reviewer
+    needs: [load_guidelines, collect_diff, collect_files]
+    initial_prompt: |
+      ## Review rubric (FOLLOW EXACTLY)
+
+      {{ nodes.load_guidelines.stdout }}
+
+      ## Files changed
+
+      ```text
+      {{ nodes.collect_files.stdout }}
+      ```
+
+      ## Diff
+
+      ```diff
+      {{ nodes.collect_diff.stdout }}
+      ```
+
+      ## Repository root
+
+      Use `Read` with paths under `{{ vars.pr_repo }}` for any file you want
+      to inspect beyond the diff hunks. The repo root is your jail; the
+      trusted-rubric path is outside it and not readable.
+
+      Now produce the markdown review per the rubric. Reply with the report
+      as your final assistant message — no extra text. The last line must be
+      `VERDICT: PASS` or `VERDICT: FAIL`.
+
+  - id: save_verdict
+    # Persist the review to a file under the PR head so the workflow can
+    # parse the verdict line. `cat > path` runs through `sh -c` so the
+    # redirect happens; the agent's output is delivered via `stdin:` so no
+    # shell expansion runs over LLM-produced content.
+    kind: shell
+    needs: [review]
+    command: sh
+    args:
+      - "-c"
+      - "cat > {{ vars.verdict_path }}"
+    stdin: "{{ nodes.review.output }}"
+
+  - id: post_comment
+    # `gh pr comment` reads GH_TOKEN from the inherited process env — the
+    # workflow's `env:` block on the orno-pipeline step puts the token there
+    # and the engine does not strip env when spawning shell children.
+    kind: shell
+    needs: [save_verdict]
+    command: gh
+    args:
+      - "pr"
+      - "comment"
+      - "{{ vars.pr_number }}"
+      - "--repo"
+      - "{{ vars.gh_repo }}"
+      - "--body-file"
+      - "{{ vars.verdict_path }}"
