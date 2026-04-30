@@ -1,0 +1,126 @@
+name: dogfood-self-review
+
+# Runs the orno `examples/self-review` pipeline against every internal pull
+# request — orno reviewing its own diffs.
+#
+# Trust model — read before changing anything in this file.
+# --------------------------------------------------------
+#   1. The pipeline.yaml and rubric come from a TRUSTED-MASTER checkout, not
+#      from the PR head. A malicious PR therefore cannot rewrite the YAML to
+#      grant Bash, allow_mutations, or escalate the policy.
+#   2. The orno binary is installed by `DoctorMozg/orno@v<pinned>` — never
+#      built from the PR commit. A malicious PR cannot patch BashHandler /
+#      WebFetchHandler / SecretsResolver to leak credentials.
+#   3. Forks are skipped by the `if:` guard. GitHub does not expose secrets
+#      to forked PRs, so without the guard the run would fail at LLM
+#      auth time anyway; the explicit guard makes the boundary obvious and
+#      shows up as `Skipped` in the PR check list rather than `Failed`.
+#   4. The reviewer agent has Read-only access scoped to the PR-head
+#      checkout. Mutations and network are denied at the policy level.
+#   5. `OPENROUTER_API_KEY` is delivered via `--secrets-file` so the value
+#      lives only inside orno's secret store, gets redacted from every
+#      event, and never reaches a tool's environment. `GH_TOKEN` is in the
+#      step env (not the secrets file) because `gh pr comment` reads it via
+#      env-inheritance from the shell child orno spawns.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  self-review:
+    name: self-review
+    # Skip fork PRs: secrets are not exposed to forked-pull-request runs,
+    # so the OpenRouter key would be empty and the run would fail anyway.
+    # The explicit guard short-circuits to `Skipped` instead of `Failed`.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout trusted master (pipeline + rubric)
+        uses: actions/checkout@v6
+        with:
+          ref: master
+          path: trusted-master
+
+      - name: Checkout PR head (under review)
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          path: pr-head
+
+      - name: Resolve origin/master in PR head
+        # `fetch-depth: 0` already brings full history, but the remote
+        # tracking ref has to exist for `git diff origin/master...HEAD`
+        # to resolve when checkout sets HEAD to the PR commit.
+        working-directory: pr-head
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master:refs/remotes/origin/master
+
+      - name: Write secrets file
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          # umask 077 ensures the file is created with mode 600 — the
+          # secrets file is process-private to orno on this runner.
+          umask 077
+          printf 'OPENROUTER_API_KEY=%s\n' "$OPENROUTER_API_KEY" \
+            > "${RUNNER_TEMP}/orno-secrets.env"
+
+      - name: Run self-review
+        # Pinned to a released tag — never `@master`. Building orno from a
+        # PR commit would let a malicious PR patch the runtime to bypass
+        # bounded-effects enforcement. The pinned tag isolates the supply
+        # chain from PR content.
+        uses: DoctorMozg/orno@v0.1.1
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_REPO: ${{ github.workspace }}/pr-head
+          TRUSTED_ROOT: ${{ github.workspace }}/trusted-master
+          GH_REPO: ${{ github.repository }}
+          # gh pr comment reads GH_TOKEN from the inherited process env;
+          # orno does not strip env when spawning shell children, so the
+          # `post_comment` shell node sees this token automatically.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          version: v0.1.1
+          pipeline: trusted-master/examples/self-review/pipeline.yaml
+          secrets-file: ${{ runner.temp }}/orno-secrets.env
+
+      - name: Enforce verdict
+        # The reviewer agent ends its report with `VERDICT: PASS` or
+        # `VERDICT: FAIL`. FAIL marks this check failing so the PR cannot
+        # merge until the author addresses findings (or pushes a commit
+        # that earns a PASS).
+        run: |
+          set -euo pipefail
+          verdict_file="${{ github.workspace }}/pr-head/.orno-self-review.md"
+          if [ ! -f "$verdict_file" ]; then
+            echo "::error::self-review verdict file not produced"
+            exit 1
+          fi
+          last_line=$(tail -n1 "$verdict_file")
+          case "$last_line" in
+            "VERDICT: PASS")
+              echo "self-review: PASS"
+              ;;
+            "VERDICT: FAIL")
+              echo "::error::self-review: FAIL — see PR comment for findings"
+              exit 1
+              ;;
+            *)
+              echo "::error::self-review: malformed verdict line: $last_line"
+              exit 1
+              ;;
+          esac
+
+      - name: Cleanup secrets file
+        if: always()
+        run: rm -f "${RUNNER_TEMP}/orno-secrets.env"

@@ -180,9 +180,46 @@ jobs:
         run: cargo build --release -p orno-cli --locked
       - name: Smoke-test --version
         run: ./target/release/orno --version
-      - name: Smoke-test schema
-        run: ./target/release/orno schema > /tmp/pipeline.schema.json
-      - name: Smoke-test validate
-        run: ./target/release/orno validate examples/hello/pipeline.yaml
+      - name: Schema drift gate
+        # Generated schema must match the checked-in copy. Drift here means
+        # someone added a pipeline-shape field without running
+        # `cargo run -p orno-cli -- schema > schemas/pipeline.schema.json`,
+        # which leaves IDE yaml-language-server users with stale autocomplete.
+        run: |
+          ./target/release/orno schema > /tmp/pipeline.schema.json
+          diff -u schemas/pipeline.schema.json /tmp/pipeline.schema.json
+      - name: Validate every example
+        run: |
+          set -euo pipefail
+          for ex in examples/*/pipeline.yaml; do
+            echo "::group::validate $ex"
+            ./target/release/orno validate "$ex"
+            echo "::endgroup::"
+          done
       - name: Smoke-test plan
         run: ./target/release/orno plan examples/hello/pipeline.yaml
+
+  dogfood:
+    name: dogfood
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Build CLI with test-transport feature
+        # `test-transport` arms the `ORNO_TEST_LLM_TRANSPORT` escape hatch
+        # so a real `orno run` can complete without a live API key. Stock
+        # `cargo install` builds omit the feature, so this binary is
+        # CI-only and never ships to users.
+        run: cargo build -p orno-cli --features test-transport --locked
+      - name: Run hello pipeline against the dummy transport
+        env:
+          ORNO_TEST_LLM_TRANSPORT: dummy
+        run: |
+          set -euo pipefail
+          out=$(./target/debug/orno run examples/hello/pipeline.yaml)
+          test -n "$out"
+          echo "$out" | tail -1 \
+            | jq -e '.event.type == "run_finished" and .event.ok == true' >/dev/null
