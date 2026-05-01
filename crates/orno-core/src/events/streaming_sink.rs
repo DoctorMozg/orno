@@ -100,6 +100,11 @@ impl EventSink for StreamingSink {
                     seq = tentative_seq,
                     "failed to serialize event envelope; seq not advanced",
                 );
+                // Latch the broken flag so the CLI can detect that an
+                // event was silently dropped. Without this, `is_broken`
+                // would report a clean run even though the NDJSON stream
+                // is missing an envelope.
+                self.broken.store(true, Ordering::Relaxed);
                 return;
             },
         };

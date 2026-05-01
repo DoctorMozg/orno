@@ -89,6 +89,12 @@ fn extract_network_url(args: &Value) -> Option<reqwest::Url> {
     None
 }
 
+/// Maximum time allowed for a single DNS resolution. After this deadline the
+/// policy gate treats the host as unresolvable and denies the request. The
+/// blocking resolver thread continues in the background — it cannot be
+/// cancelled — but the tokio runtime is no longer blocked waiting for it.
+const DNS_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Resolve `host` via blocking DNS in a worker thread and return the
 /// list of resolved addresses. `lookup_host` is unavailable without
 /// the `tokio/net` feature, so we offload `std::net::ToSocketAddrs`
@@ -100,11 +106,14 @@ async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
         target
             .to_socket_addrs()
             .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
-    .await;
-    match join {
-        Ok(res) => res,
-        Err(e) => Err(std::io::Error::other(e)),
+    });
+    match tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, join).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(join_err)) => Err(std::io::Error::other(join_err)),
+        Err(_elapsed) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("DNS resolution timed out after {DNS_RESOLUTION_TIMEOUT:?}"),
+        )),
     }
 }
 

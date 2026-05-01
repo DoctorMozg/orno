@@ -48,27 +48,26 @@ impl ToolHandler for WriteHandler {
                 message: e.to_string(),
             })?;
 
-        // When the agent declared a root, the jail check requires the
-        // parent directory to exist for not-yet-existing targets — so
-        // create parent dirs first, then jail. The `create_dir_all`
-        // call is itself bounded by the original requested path's
-        // structure; if a path manages to escape the root, the jail
-        // check still rejects after the parent exists.
-        let requested = PathBuf::from(&path);
-        if let Some(parent) = requested.parent()
+        // Jail FIRST, then create parent dirs of the resolved (jailed)
+        // path. Creating directories before the jail check would let an
+        // LLM with `allow_mutations` mkdir anywhere the process can,
+        // even if the subsequent write is rejected — a containment
+        // violation independent of the actual file content (F1).
+        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
+            jail_path(root, &path)?
+        } else {
+            PathBuf::from(&path)
+        };
+
+        if let Some(parent) = resolved.parent()
             && !parent.as_os_str().is_empty()
+            && !parent.exists()
         {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Invocation {
                 name: "Write".to_string(),
                 source: Box::new(e),
             })?;
         }
-
-        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
-        } else {
-            requested
-        };
 
         // Atomic write: stage in a sibling temp file and rename onto
         // the target. Avoids leaving a half-written file on a crash and
@@ -216,5 +215,58 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(written, "deep");
+    }
+
+    #[tokio::test]
+    async fn write_jail_does_not_create_dirs_outside_root() {
+        // F1 regression: `create_dir_all` must NOT fire on the raw path before
+        // jail_path runs. An LLM attempting to write outside the root must get
+        // `Denied` WITHOUT any side-effects (no dirs created outside root).
+        let root = TempDir::new().expect("create root");
+        let outside = TempDir::new().expect("create outside");
+        // Target is under `outside` dir, which is outside `root`
+        let evil_path = outside.path().join("injected").join("evil.txt");
+        let roots = vec![root.path().to_path_buf()];
+        let handler = WriteHandler;
+
+        let err = handler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": evil_path.to_str().unwrap(), "content": "evil" }),
+            )
+            .await
+            .expect_err("write outside root must fail");
+
+        // Jail must fire BEFORE any mkdir
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "expected Denied, got {err:?}",
+        );
+        // No side-effects: the injected/ dir must NOT have been created
+        assert!(
+            !outside.path().join("injected").exists(),
+            "create_dir_all must not have run before the jail check",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_creates_nested_dirs_inside_root() {
+        // When the path is inside the root but parent dirs don't exist,
+        // write must create them after the jail check succeeds.
+        let root = TempDir::new().expect("create root");
+        let nested = root.path().join("a").join("b").join("c").join("file.txt");
+        let roots = vec![root.path().to_path_buf()];
+        let handler = WriteHandler;
+
+        handler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": nested.to_str().unwrap(), "content": "ok" }),
+            )
+            .await
+            .expect("nested write inside root must succeed");
+
+        let written = std::fs::read_to_string(&nested).expect("read back");
+        assert_eq!(written, "ok");
     }
 }

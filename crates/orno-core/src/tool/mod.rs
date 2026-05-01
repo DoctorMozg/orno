@@ -145,6 +145,21 @@ impl<'a> ToolInvocation<'a> {
             roots: &[],
         }
     }
+
+    /// Variant of `for_test` for handler tests that need to exercise
+    /// the filesystem root-jail. Borrows a caller-owned `roots` slice
+    /// so the test can build it from `tempfile::TempDir` paths.
+    pub(crate) fn for_test_with_roots(call_id: &'a str, roots: &'a [PathBuf]) -> Self {
+        Self {
+            run_id: "run_test",
+            node_id: "n",
+            call_id,
+            depth: 0,
+            state_handle: None,
+            token_budget_share: None,
+            roots,
+        }
+    }
 }
 
 /// Every agent-callable tool implements this trait. The trait is object-safe

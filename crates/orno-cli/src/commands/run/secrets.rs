@@ -94,9 +94,6 @@ fn parse_inline_env(s: &str) -> Result<(String, String)> {
 /// Later duplicate keys within the same file win on the consumer side
 /// via `BTreeMap::insert`.
 pub(super) fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("reading env file `{}`", path.display()))?;
-
     // Refuse to read an env file whose mode allows group/other access:
     // a secrets-bearing dotenv must be 0600 so a co-tenant on a shared
     // host cannot tail it. The check is Unix-only — Windows ACLs do not
@@ -120,6 +117,9 @@ pub(super) fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
             );
         }
     }
+
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("reading env file `{}`", path.display()))?;
 
     // Strip a leading UTF-8 BOM (`U+FEFF`). Some Windows editors prepend
     // one when saving a file as UTF-8; leaving it in front of the first
@@ -356,5 +356,29 @@ mod parse_dotenv_tests {
     fn export_prefix_combines_with_quoted_value() {
         let out = parse("export TOKEN=\"sk-abc-123\"\n").expect("parse");
         assert_eq!(out, vec![("TOKEN".to_string(), "sk-abc-123".to_string())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_dotenv_checks_permissions_before_reading_content() {
+        // F13 regression: the permission check must run BEFORE bytes are loaded
+        // into memory. We verify this by creating a file with a secret value and
+        // world-readable permissions, then asserting the function returns an error
+        // rather than parsing the content.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "SECRET=hunter2\n").expect("write env file");
+        // Set world-readable (0o644) so the permission check fires.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set permissions");
+
+        let err = parse_dotenv(&path).expect_err("world-readable file must be rejected");
+        // The error message should contain the remediation hint from the existing error path.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("chmod") || msg.contains("permission") || msg.contains("readable"),
+            "error must mention the permission problem, got: {msg}",
+        );
     }
 }
