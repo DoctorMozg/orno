@@ -44,8 +44,8 @@ runs:
           REF="$GITHUB_ACTION_REF"
           echo "::warning::ORNO_VERSION not set; using caller-pinned ref: $REF"
         else
-          REF="master"
-          echo "::warning::ORNO_VERSION and GITHUB_ACTION_REF both empty; falling back to master (insecure)"
+          echo "::error::ORNO_VERSION and GITHUB_ACTION_REF are both unset. Pin a version with 'version: vX.Y.Z' or use 'uses: DoctorMozg/orno@vX.Y.Z'."
+          exit 1
         fi
         curl --proto '=https' --tlsv1.2 -fsSL \
           "https://raw.githubusercontent.com/DoctorMozg/orno/${REF}/install.sh" | bash

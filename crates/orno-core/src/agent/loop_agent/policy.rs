@@ -360,20 +360,25 @@ impl LoopAgent {
                         )
                         .await);
                 }
-                // Bash is not subject to the domain gate — it opens arbitrary
-                // network connections that orno cannot intercept. Surface this
-                // asymmetry so operators who set allowed_domains know it does
-                // not restrict Bash.
-                if policy.allow_network && !policy.allowed_domains.is_empty() {
-                    tracing::warn!(
-                        "Bash tool is allowed network access; allowed_domains \
-                         enforcement does not apply to shell commands — \
-                         consider allow_network=false to prevent egress from Bash",
-                    );
+                // Bash cannot be constrained by allowed_domains — it opens
+                // arbitrary network connections that orno cannot intercept.
+                // When the operator has set an allowlist they expect it to
+                // enforce egress; silently skipping that constraint would give
+                // a false sense of confinement. Refuse Bash when any allowlist
+                // is configured so the failure is explicit (F20).
+                if !policy.allowed_domains.is_empty() {
+                    return Ok(self
+                        .deny(
+                            &inv,
+                            &tool_call.fn_name,
+                            "Bash cannot enforce allowed_domains; refuse Bash \
+                             invocation when a domain allowlist is set — \
+                             remove allowed_domains or disable Bash in allowed_tools"
+                                .into(),
+                            wire_to_yaml,
+                        )
+                        .await);
                 }
-                // Intentionally NOT subject to the domain gate —
-                // MutationsAndNetwork is Bash, which does not surface
-                // a URL in its arguments.
             },
             ToolEffect::ContextSelf => {
                 if !policy.allow_context_writes {

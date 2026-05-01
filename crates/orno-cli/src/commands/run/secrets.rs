@@ -53,6 +53,14 @@ pub(super) fn resolve_inputs(pipeline: &Pipeline, flags: &RunFlags) -> Result<Ru
 
     for file in &flags.secrets_files {
         for (k, v) in parse_dotenv(file)? {
+            if !declared_secrets.contains(k.as_str()) {
+                bail!(
+                    "`--secrets-file` `{}` contains key `{k}` which is not declared \
+                     in the pipeline `secrets:` block; add `{k}` to `secrets:` \
+                     or remove it from the secrets file",
+                    file.display(),
+                );
+            }
             secrets.insert(k, v);
         }
     }
@@ -379,6 +387,80 @@ mod parse_dotenv_tests {
         assert!(
             msg.contains("chmod") || msg.contains("permission") || msg.contains("readable"),
             "error must mention the permission problem, got: {msg}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_inputs_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Build a minimal `Pipeline` declaring exactly the given secret names.
+    /// `nodes` is empty — `resolve_inputs` only reads `pass_env` and
+    /// `secrets`, so the DAG content is irrelevant here.
+    fn pipeline_with_secrets(names: &[&str]) -> Pipeline {
+        Pipeline {
+            version: 1,
+            vars: BTreeMap::new(),
+            pass_env: Vec::new(),
+            secrets: names.iter().map(|s| (*s).to_string()).collect(),
+            agents: BTreeMap::new(),
+            mcp_servers: BTreeMap::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Write `body` to a fresh `NamedTempFile`. `tempfile` creates files
+    /// with mode 0600 on Unix, which `parse_dotenv` requires.
+    fn write_secrets_file(body: &str) -> NamedTempFile {
+        let mut tmp = NamedTempFile::new().expect("temp file");
+        tmp.write_all(body.as_bytes()).expect("write");
+        tmp
+    }
+
+    #[test]
+    fn secrets_file_undeclared_key_bails() {
+        // `EXTRA` is not in `secrets:`; `--secrets-file` carrying it must
+        // be rejected so a typo cannot silently widen the secret surface.
+        let pipeline = pipeline_with_secrets(&["DECLARED"]);
+        let tmp = write_secrets_file("EXTRA=value\nDECLARED=real\n");
+        let flags = RunFlags {
+            secrets_files: vec![tmp.path().to_path_buf()],
+            ..RunFlags::default()
+        };
+
+        let err = resolve_inputs(&pipeline, &flags).expect_err("must reject undeclared key");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("EXTRA"), "must name the offending key: {msg}");
+        assert!(
+            msg.contains("not declared"),
+            "must explain why the key is rejected: {msg}",
+        );
+    }
+
+    #[test]
+    fn secrets_file_declared_key_succeeds() {
+        // Same shape as the previous test, but the file only contains the
+        // declared key — resolution must succeed and route it to `secrets`.
+        let pipeline = pipeline_with_secrets(&["DECLARED"]);
+        let tmp = write_secrets_file("DECLARED=real\n");
+        let flags = RunFlags {
+            secrets_files: vec![tmp.path().to_path_buf()],
+            ..RunFlags::default()
+        };
+
+        let inputs = resolve_inputs(&pipeline, &flags).expect("must succeed");
+        assert_eq!(
+            inputs.secrets.get("DECLARED").map(String::as_str),
+            Some("real"),
+        );
+        assert!(
+            !inputs.env.contains_key("DECLARED"),
+            "declared secret must not leak into env: {:?}",
+            inputs.env,
         );
     }
 }

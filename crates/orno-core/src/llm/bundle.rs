@@ -32,6 +32,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use blake3::Hasher as Blake3Hasher;
+
 use serde::{Deserialize, Serialize};
 
 use crate::pipeline::Pipeline;
@@ -76,6 +78,16 @@ pub enum BundleEntry {
     LlmEntry(TapeEntry),
     /// One recorded tool invocation from the run.
     ToolEntry(ToolTapeEntry),
+    /// Last line of every bundle. Carries the BLAKE3 hex digest over all
+    /// preceding body lines (each written as `{json}\n`), excluding the
+    /// trailer line itself. `read_bundle` verifies this digest; a missing
+    /// trailer emits a `tracing::warn!` rather than hard-failing so
+    /// pre-BS4 bundles still replay.
+    BundleTrailer {
+        /// Lowercase hex-encoded BLAKE3 digest of all body bytes written
+        /// before the trailer.
+        blake3: String,
+    },
 }
 
 /// Parsed contents of a bundle file. The two entry vectors preserve the
@@ -127,6 +139,54 @@ pub enum BundleError {
         /// Human-readable parser error message.
         msg: String,
     },
+    /// The `bundle_trailer` BLAKE3 digest does not match the digest
+    /// recomputed over the body lines. Indicates on-disk corruption or
+    /// tampering after `write_bundle` wrote the file.
+    #[error("bundle integrity check failed: expected {expected}, got {actual}")]
+    IntegrityMismatch {
+        /// Digest encoded in the `bundle_trailer` line.
+        expected: String,
+        /// Digest recomputed from the body lines during `read_bundle`.
+        actual: String,
+    },
+}
+
+/// A `Write` wrapper that accumulates a BLAKE3 digest over every byte
+/// written. Used by `write_bundle` to hash the body lines so the trailer
+/// digest covers exactly the same bytes the reader will hash on verify.
+struct HashAccumWriter<W: Write> {
+    inner: W,
+    hasher: Blake3Hasher,
+}
+
+impl<W: Write> HashAccumWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Blake3Hasher::new(),
+        }
+    }
+
+    /// Flush the inner writer, finalize the hash, and return both the
+    /// inner writer and the lowercase hex digest so the caller can write
+    /// the trailer without going through the hasher.
+    fn finalize(mut self) -> std::io::Result<(W, String)> {
+        self.inner.flush()?;
+        let digest = hex::encode(self.hasher.finalize().as_bytes());
+        Ok((self.inner, digest))
+    }
+}
+
+impl<W: Write> Write for HashAccumWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Write a bundle combining the pipeline YAML body with previously
@@ -143,6 +203,10 @@ pub enum BundleError {
 ///
 /// Either tape path may be `None` when no entries of that kind were
 /// recorded; the bundle will simply omit those lines.
+///
+/// A `bundle_trailer` line carrying a BLAKE3 hex digest over all body
+/// lines is appended last. `read_bundle` verifies this digest to detect
+/// on-disk corruption or tampering.
 pub fn write_bundle(
     pipeline_yaml: &str,
     llm_tape_path: Option<&Path>,
@@ -156,7 +220,8 @@ pub fn write_bundle(
         .create(true)
         .truncate(true)
         .open(out)?;
-    let mut writer = BufWriter::new(file);
+    // Wrap in HashAccumWriter so every body byte is hashed as it is written.
+    let mut writer = HashAccumWriter::new(BufWriter::new(file));
 
     write_entry(
         &mut writer,
@@ -172,14 +237,25 @@ pub fn write_bundle(
     )?;
 
     if let Some(path) = llm_tape_path {
-        copy_tape_file::<TapeEntry>(path, &mut writer, BundleEntry::LlmEntry)?;
+        copy_tape_file::<TapeEntry, _>(path, &mut writer, BundleEntry::LlmEntry)?;
     }
 
     if let Some(path) = tool_tape_path {
-        copy_tape_file::<ToolTapeEntry>(path, &mut writer, BundleEntry::ToolEntry)?;
+        copy_tape_file::<ToolTapeEntry, _>(path, &mut writer, BundleEntry::ToolEntry)?;
     }
 
-    writer.flush()?;
+    // Flush, extract body digest, then write the trailer directly to the
+    // inner BufWriter — bypassing the hasher so the trailer is not
+    // self-referential (the reader hashes all non-trailer lines and then
+    // compares against the digest in the trailer).
+    let (mut inner, blake3_hex) = writer.finalize().map_err(BundleError::Io)?;
+    let trailer = serde_json::to_string(&BundleEntry::BundleTrailer { blake3: blake3_hex })
+        .map_err(|e| BundleError::ParseError {
+            line: 0,
+            msg: e.to_string(),
+        })?;
+    writeln!(inner, "{trailer}")?;
+    inner.flush()?;
     Ok(())
 }
 
@@ -331,8 +407,12 @@ fn scrub_yaml_with_tokens(pipeline_yaml: &str, tokens: &[String]) -> String {
 /// Returns [`BundleError::MissingPipelineYaml`] when no `pipeline_yaml`
 /// line was found, [`BundleError::IncompatibleVersion`] when the
 /// `bundle_header` carries a `format_version` other than
-/// [`CURRENT_BUNDLE_VERSION`], and [`BundleError::ParseError`] for
-/// corrupt lines (carrying the 1-based line number).
+/// [`CURRENT_BUNDLE_VERSION`], [`BundleError::ParseError`] for corrupt
+/// lines (carrying the 1-based line number), and
+/// [`BundleError::IntegrityMismatch`] when a `bundle_trailer` is present
+/// but its BLAKE3 digest does not match the digest recomputed over the
+/// body lines. A missing trailer emits a `tracing::warn!` but is not an
+/// error so pre-BS4 bundles still replay.
 pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -340,6 +420,8 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
     let mut pipeline_yaml: Option<String> = None;
     let mut llm_entries: Vec<TapeEntry> = Vec::new();
     let mut tool_entries: Vec<ToolTapeEntry> = Vec::new();
+    let mut hasher = Blake3Hasher::new();
+    let mut trailer_seen = false;
 
     for (idx, line) in reader.lines().enumerate() {
         let line = line?;
@@ -351,6 +433,17 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
                 line: idx + 1,
                 msg: e.to_string(),
             })?;
+
+        // Hash all body lines before dispatching. The trailer line
+        // itself is excluded from the hash so the digest is not
+        // self-referential — writers skip the trailer through the
+        // same logic (writing it directly to the inner writer, not
+        // through the HashAccumWriter).
+        if !matches!(entry, BundleEntry::BundleTrailer { .. }) {
+            hasher.update(line.as_bytes());
+            hasher.update(b"\n");
+        }
+
         match entry {
             BundleEntry::BundleHeader { format_version } => {
                 // Reject mismatched versions up front so a future bundle
@@ -367,7 +460,29 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
             BundleEntry::PipelineYaml { content } => pipeline_yaml = Some(content),
             BundleEntry::LlmEntry(e) => llm_entries.push(e),
             BundleEntry::ToolEntry(e) => tool_entries.push(e),
+            BundleEntry::BundleTrailer { blake3 } => {
+                let actual = hex::encode(hasher.finalize().as_bytes());
+                if actual != blake3 {
+                    return Err(BundleError::IntegrityMismatch {
+                        expected: blake3,
+                        actual,
+                    });
+                }
+                trailer_seen = true;
+                // Stop reading: lines after the trailer are not
+                // covered by the integrity hash and must not be
+                // processed (Finding 1 — post-trailer tampering).
+                break;
+            },
         }
+    }
+
+    if !trailer_seen {
+        tracing::warn!(
+            path = %path.display(),
+            "bundle has no integrity trailer; skipping verification \
+             (bundle may have been written before BS4 or was truncated)",
+        );
     }
 
     let pipeline_yaml = pipeline_yaml.ok_or(BundleError::MissingPipelineYaml)?;
@@ -393,9 +508,9 @@ fn write_entry<W: Write>(writer: &mut W, entry: &BundleEntry) -> Result<(), Bund
 /// each entry as a `BundleEntry` through the supplied wrapper. Empty
 /// lines are skipped so a manually edited tape with trailing newlines
 /// still round-trips.
-fn copy_tape_file<T>(
+fn copy_tape_file<T, W: Write>(
     path: &Path,
-    writer: &mut BufWriter<File>,
+    writer: &mut W,
     wrap: impl Fn(T) -> BundleEntry,
 ) -> Result<(), BundleError>
 where
@@ -679,5 +794,101 @@ nodes:
             read.pipeline_yaml, yaml_body,
             "no-bearer pipeline must be embedded verbatim",
         );
+    }
+
+    #[test]
+    fn bundle_round_trip_integrity_verified() {
+        // BS4 contract: a pristine bundle written by `write_bundle` must
+        // round-trip through `read_bundle` without tripping the BLAKE3
+        // integrity check. Sanity: the pipeline YAML survives intact and
+        // both tape vectors come back populated, proving the trailer's
+        // digest covers the body lines but does not reject them.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let llm = vec![sample_tape_entry("alpha"), sample_tape_entry("beta")];
+        let tools = vec![sample_tool_entry("aaaa", "out-a")];
+
+        let llm_tape = write_tape(&llm);
+        let tool_tape = write_tape(&tools);
+        let out = tempfile::NamedTempFile::new().unwrap();
+
+        write_bundle(
+            yaml_body,
+            Some(llm_tape.path()),
+            Some(tool_tape.path()),
+            out.path(),
+        )
+        .expect("bundle write");
+
+        let read = read_bundle(out.path()).expect("bundle read must verify integrity");
+        assert_eq!(read.pipeline_yaml, yaml_body);
+        assert_eq!(read.llm_entries.len(), 2);
+        assert_eq!(read.tool_entries.len(), 1);
+    }
+
+    #[test]
+    fn bundle_tampered_body_is_rejected() {
+        // BS4 anti-tamper guarantee: flipping a single byte inside a body
+        // line must surface as `BundleError::IntegrityMismatch` so a
+        // shared bundle cannot be silently mutated between record and
+        // replay. Mutate the `pipeline_yaml` line so the tampered bundle
+        // remains structurally valid JSON-per-line and the reader still
+        // recomputes the BLAKE3 hash to compare against the trailer.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+
+        let raw = std::fs::read_to_string(out.path()).expect("read raw bundle");
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+
+        // Find and corrupt the pipeline_yaml line. Replacing a substring
+        // that is guaranteed to be present keeps the JSON parseable
+        // (so the corruption surfaces as IntegrityMismatch and not as
+        // ParseError).
+        let yaml_idx = lines
+            .iter()
+            .position(|l| l.contains(r#""type":"pipeline_yaml""#))
+            .expect("pipeline_yaml line must be present");
+        lines[yaml_idx] = lines[yaml_idx].replace("version: 1", "version: 2");
+
+        let tampered = lines.join("\n") + "\n";
+        std::fs::write(out.path(), tampered).expect("rewrite tampered bundle");
+
+        let err = read_bundle(out.path()).expect_err("tampered bundle must be rejected");
+        match err {
+            BundleError::IntegrityMismatch { expected, actual } => {
+                assert_ne!(
+                    expected, actual,
+                    "expected vs actual digests must differ on a tampered body",
+                );
+            },
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bundle_missing_trailer_warns_but_succeeds() {
+        // BS4 forward-compat path: pre-BS4 bundles (and bundles truncated
+        // mid-write) have no `bundle_trailer` line. The reader logs a
+        // `tracing::warn!` and returns `Ok` rather than rejecting, so old
+        // bundles still replay. Strip the last line — which is always the
+        // trailer for a freshly written bundle — and assert read succeeds.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+
+        let raw = std::fs::read_to_string(out.path()).expect("read raw bundle");
+        let mut lines: Vec<&str> = raw.lines().collect();
+        let last = lines.pop().expect("bundle has at least one line");
+        assert!(
+            last.contains(r#""type":"bundle_trailer""#),
+            "last line of a fresh bundle must be the trailer: {last}",
+        );
+
+        let truncated = lines.join("\n") + "\n";
+        std::fs::write(out.path(), truncated).expect("rewrite truncated bundle");
+
+        let read = read_bundle(out.path())
+            .expect("missing trailer must warn rather than error so pre-BS4 bundles still replay");
+        assert_eq!(read.pipeline_yaml, yaml_body);
     }
 }

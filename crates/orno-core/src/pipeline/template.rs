@@ -152,12 +152,71 @@ pub fn render_pipeline_vars(
     let ctx = json!({ "env": env, "secrets": secrets });
     let mut out = BTreeMap::new();
     for (key, value) in vars {
+        // F7: warn before rendering so the operator gets an early signal
+        // even if the render succeeds (e.g. via `| default("")`). This
+        // catches declaration drift where a secret is referenced in `vars`
+        // but was removed from `pipeline.secrets`.
+        warn_undeclared_secret_refs(value, key, secrets);
         out.insert(
             key.clone(),
             render_value(tmpl, &format!("vars.{key}"), value, &ctx)?,
         );
     }
     Ok(out)
+}
+
+/// Walk a `Value` tree and emit a `tracing::warn!` for every `secrets.X`
+/// reference in template strings where `X` is not a key in `secrets`.
+fn warn_undeclared_secret_refs(value: &Value, var_key: &str, secrets: &BTreeMap<String, String>) {
+    match value {
+        Value::String(s) if looks_templated(s) => {
+            for name in extract_secret_refs(s) {
+                if !secrets.contains_key(name) {
+                    tracing::warn!(
+                        var = %var_key,
+                        secret = %name,
+                        "var template references undeclared secret `{name}`; \
+                         add it to the pipeline `secrets:` block or the render will fail",
+                    );
+                }
+            }
+        },
+        Value::Array(arr) => {
+            for item in arr {
+                warn_undeclared_secret_refs(item, var_key, secrets);
+            }
+        },
+        Value::Object(map) => {
+            for (k, v) in map {
+                let nested_key = format!("{var_key}.{k}");
+                warn_undeclared_secret_refs(v, &nested_key, secrets);
+            }
+        },
+        _ => {},
+    }
+}
+
+/// Scan a template source string for `secrets.IDENTIFIER` patterns and
+/// return a deduplicated list of the secret names (the parts after
+/// `secrets.`). No regex dependency — simple byte-by-byte scan.
+fn extract_secret_refs(source: &str) -> Vec<&str> {
+    const PREFIX: &str = "secrets.";
+    let mut refs: Vec<&str> = Vec::new();
+    let mut search = source;
+    while let Some(pos) = search.find(PREFIX) {
+        let after_prefix = &search[pos + PREFIX.len()..];
+        let name_len = after_prefix
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(after_prefix.len());
+        if name_len > 0 {
+            let name = &after_prefix[..name_len];
+            if !refs.contains(&name) {
+                refs.push(name);
+            }
+        }
+        search = &search[pos + PREFIX.len()..];
+    }
+    refs
 }
 
 fn render_value(
@@ -527,5 +586,55 @@ mod tests {
         let out = render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("render must succeed");
 
         assert_eq!(out["token"], json!("redacted-fake-value"));
+    }
+
+    #[test]
+    fn warn_on_undeclared_secret_ref_in_var() {
+        // F7 contract: a `vars.X` template that references a secret not
+        // present in the secrets map must trigger a `tracing::warn!` —
+        // verified here indirectly because no `tracing_test` dependency
+        // is in the project. Strict undefined surfaces the missing key
+        // as a Template error so the warn-then-fail sequence is what an
+        // operator sees: the warn fires inside `warn_undeclared_secret_refs`
+        // before render_value runs, and render_value then errors on the
+        // strict undefined `secrets.UNDECLARED_KEY` lookup.
+        //
+        // The assertion pins the failing var name so a future renderer
+        // change that swallows the strict-undefined error would surface
+        // here as a missing render error rather than a silent regression.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[("token", json!("{{ secrets.UNDECLARED_KEY }}"))]);
+        let env = BTreeMap::new();
+        let secrets = BTreeMap::new();
+
+        let err = render_pipeline_vars(&tmpl, &vars, &env, &secrets)
+            .expect_err("undeclared secret ref must surface via strict undefined");
+        match err {
+            PipelineError::Template { name, .. } => {
+                assert_eq!(name, "vars.token", "error must name the offending var");
+            },
+            other => panic!("expected PipelineError::Template, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn declared_secret_ref_does_not_warn() {
+        // Companion to the undeclared-secret test: when the referenced
+        // secret IS in the map, the warn path is skipped and render
+        // returns the resolved value. This pins the negative half of the
+        // F7 contract — the warn fires only for undeclared references,
+        // not every secret usage.
+        let tmpl = TemplateEngine::new();
+        let vars = vars_from(&[("token", json!("{{ secrets.DECLARED_KEY }}"))]);
+        let env = BTreeMap::new();
+        let secrets = env_from(&[("DECLARED_KEY", "the-real-value")]);
+
+        let out =
+            render_pipeline_vars(&tmpl, &vars, &env, &secrets).expect("declared secret renders");
+        assert_eq!(
+            out["token"],
+            json!("the-real-value"),
+            "render must resolve the declared secret",
+        );
     }
 }

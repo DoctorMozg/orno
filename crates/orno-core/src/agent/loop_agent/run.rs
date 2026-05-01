@@ -151,20 +151,21 @@ impl Agent for LoopAgent {
             ));
         }
 
-        // Filesystem-tool root check: if the agent opted into any of
-        // the path-aware builtins, `policy.roots` must be non-empty.
-        // Without a root the path-jail check is a no-op and a tool
-        // call could read or overwrite anywhere on the host. Failing
-        // closed at `run()` start surfaces the misconfiguration before
-        // any LLM turn fires.
-        let uses_file_tool = req
+        // Filesystem-tool root check: if any registered handler in
+        // `allowed_tools` declares `requires_jail() == true`, `policy.roots`
+        // must be non-empty. Without a root the path-jail is a no-op and an
+        // LLM call could read or overwrite anywhere on the host. The check is
+        // data-driven so a future filesystem handler automatically opts in by
+        // overriding `requires_jail` (BS3).
+        let uses_jail_tool = req
             .allowed_tools
             .iter()
-            .any(|t| ["Read", "Write", "Edit"].contains(&t.as_str()));
-        if uses_file_tool && req.policy.roots.is_empty() {
+            .any(|t| self.find_handler(t).is_some_and(|h| h.requires_jail()));
+        if uses_jail_tool && req.policy.roots.is_empty() {
             return Err(AgentError::InvalidPolicy(
                 "policy.roots must be non-empty when allowed_tools contains \
-                 any of [Read, Write, Edit]"
+                 a handler that requires a root jail (Read, Write, Edit, or \
+                 any handler overriding requires_jail())"
                     .to_string(),
             ));
         }
@@ -222,7 +223,7 @@ impl Agent for LoopAgent {
         // user turn rides in `LlmRequest.prompt`; this vector captures
         // assistant tool-call turns and their paired `ToolResult`s so
         // the model can reason over what it already did.
-        let mut messages: Vec<OrnoChatMessage> = Vec::new();
+        let mut messages: Arc<Vec<OrnoChatMessage>> = Arc::new(Vec::new());
         let mut tool_call_count: u32 = 0;
         // Per-call token counter. Replaces the previous `u64` so subagent
         // tool calls can be handed an `Arc` pointer to bump on every
@@ -288,7 +289,7 @@ impl Agent for LoopAgent {
                 system: req.system.as_deref().map(str::to_string),
                 temperature: None,
                 max_tokens,
-                messages: messages.clone(),
+                messages: Arc::clone(&messages),
                 tools: declared_tools.clone(),
             };
 
@@ -410,11 +411,11 @@ impl Agent for LoopAgent {
 
             // Record the assistant's tool-call turn so the next LLM
             // request carries the full causal chain.
-            messages.push(OrnoChatMessage::ToolCalls {
+            Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolCalls {
                 calls: response.tool_calls.clone(),
             });
             if let Some(cap) = req.policy.max_message_history_bytes {
-                enforce_message_history_cap(&mut messages, cap);
+                enforce_message_history_cap(Arc::make_mut(&mut messages), cap);
             }
 
             for tool_call in &response.tool_calls {
@@ -543,12 +544,12 @@ impl Agent for LoopAgent {
                 // outbound prompt even though every other wire-format
                 // field already runs through `redactor`.
                 let redacted = self.config.redactor.redact(&truncated);
-                messages.push(OrnoChatMessage::ToolResult {
+                Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
                     content: redacted.into_owned(),
                 });
                 if let Some(cap) = req.policy.max_message_history_bytes {
-                    enforce_message_history_cap(&mut messages, cap);
+                    enforce_message_history_cap(Arc::make_mut(&mut messages), cap);
                 }
             }
         }

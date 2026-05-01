@@ -51,40 +51,121 @@ fn arg_field_names(args: &Value) -> String {
 /// reuses the same connection pool and TLS session cache. A per-call
 /// `timeout_secs` argument overrides the client's default timeout via
 /// `RequestBuilder::timeout` without rebuilding the client.
+///
+/// `allowed_domains` and `blocked_domains` are baked into the redirect
+/// policy at construction time. The agent's policy gate already enforces
+/// these on the *initial* URL; the redirect closure re-applies them on
+/// every hop so a permitted public host cannot redirect *to* a host the
+/// operator denied. Suffix matching mirrors `LoopAgent`'s `host_matches`
+/// so `blocked_domains: ["evil.com"]` also denies `sub.evil.com`. Domain
+/// lists are moved into the synchronous `'static` redirect closure at
+/// construction, so they are not stored separately on the struct.
 #[derive(Debug, Clone)]
 pub struct WebFetchHandler {
     client: reqwest::Client,
     default_timeout: Duration,
 }
 
+/// Outcome of evaluating a redirect hop's host against the handler's
+/// domain policy. Extracted from the redirect closure so the matching
+/// rules are testable without constructing a `reqwest::redirect::Attempt`.
+#[derive(Debug, PartialEq, Eq)]
+enum RedirectDomainDecision {
+    /// Host passes both lists (or neither list applies); follow.
+    Allow,
+    /// Host matches `blocked_domains`; deny with the captured host name.
+    DenyBlocked(String),
+    /// `allowed_domains` is non-empty and host matches none of it; deny.
+    DenyOutsideAllowed(String),
+}
+
+/// Suffix-match a host against a single domain entry: `host == d` or
+/// `host` ends with `.d`. Mirrors `LoopAgent::policy::host_matches` so
+/// the redirect closure and the initial-URL gate apply the same rule.
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// Apply the domain policy to a redirect hop's host. Pure function so
+/// the redirect closure stays a thin shim over testable logic.
+fn evaluate_redirect_host(
+    host: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+) -> RedirectDomainDecision {
+    if blocked_domains.iter().any(|d| host_matches_domain(host, d)) {
+        return RedirectDomainDecision::DenyBlocked(host.to_string());
+    }
+    if !allowed_domains.is_empty() && !allowed_domains.iter().any(|d| host_matches_domain(host, d))
+    {
+        return RedirectDomainDecision::DenyOutsideAllowed(host.to_string());
+    }
+    RedirectDomainDecision::Allow
+}
+
 impl WebFetchHandler {
-    /// Construct a handler with a single shared `reqwest::Client`.
+    /// Construct a handler with a single shared `reqwest::Client` and
+    /// empty domain lists. Domain enforcement on redirect hops is
+    /// effectively a no-op for instances built this way; use
+    /// [`WebFetchHandler::with_domains`] to bake in the operator's
+    /// `allowed_domains` / `blocked_domains` for redirect-time defense.
     ///
     /// `default_timeout` is the timeout applied to a request that does
     /// not supply its own `timeout_secs` argument; passing `None` falls
     /// back to the built-in 30-second default.
     #[must_use]
     pub fn new(default_timeout: Option<Duration>) -> Self {
+        Self::with_domains(default_timeout, Vec::new(), Vec::new())
+    }
+
+    /// Construct a handler whose redirect closure rejects hops to hosts
+    /// outside the configured domain policy. The lists are moved into
+    /// the synchronous redirect closure at construction time, so they
+    /// must be supplied up front; callers that mutate per-agent policy
+    /// at runtime build a separate handler per agent.
+    ///
+    /// Both lists are empty by default; `blocked_domains` always wins
+    /// over `allowed_domains` for hosts that match both.
+    #[must_use]
+    pub fn with_domains(
+        default_timeout: Option<Duration>,
+        allowed_domains: Vec<String>,
+        blocked_domains: Vec<String>,
+    ) -> Self {
         let default_timeout =
             default_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
-        // Redirect policy: re-run the literal-IP block list on each hop
-        // and cap the chain at MAX_REDIRECTS. The agent's policy gate
-        // only sees the original URL, so without this hook a permitted
-        // public host could redirect to `127.0.0.1` or a metadata IP
-        // and reqwest would happily follow.
-        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        // Move the lists into the closure: reqwest's redirect callback is
+        // synchronous and `'static`, so it keeps its own copies.
+        let allowed_for_closure = allowed_domains;
+        let blocked_for_closure = blocked_domains;
+        // Redirect policy: re-run the literal-IP block list and the
+        // domain policy on each hop, and cap the chain at MAX_REDIRECTS.
+        // The agent's policy gate only sees the original URL, so without
+        // this hook a permitted public host could redirect to
+        // `127.0.0.1`, a metadata IP, or a blocked domain and reqwest
+        // would happily follow.
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error(format!("too many redirects (>{MAX_REDIRECTS})"));
             }
-            if let Some(host) = attempt.url().host_str()
-                && let Ok(ip) = host.parse::<IpAddr>()
-            {
-                let blocked = match ip {
-                    IpAddr::V4(v4) => is_blocked_ipv4(v4),
-                    IpAddr::V6(v6) => is_blocked_ipv6(v6),
-                };
-                if blocked {
-                    return attempt.error(format!("redirect to blocked IP `{ip}`"));
+            if let Some(host) = attempt.url().host_str() {
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    let blocked = match ip {
+                        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+                        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+                    };
+                    if blocked {
+                        return attempt.error(format!("redirect to blocked IP `{ip}`"));
+                    }
+                }
+                match evaluate_redirect_host(host, &allowed_for_closure, &blocked_for_closure) {
+                    RedirectDomainDecision::Allow => {},
+                    RedirectDomainDecision::DenyBlocked(h) => {
+                        return attempt.error(format!("redirect to blocked domain `{h}`"));
+                    },
+                    RedirectDomainDecision::DenyOutsideAllowed(h) => {
+                        return attempt.error(format!("redirect to `{h}` outside allowed_domains"));
+                    },
                 }
             }
             attempt.follow()
@@ -325,5 +406,117 @@ mod tests {
             .unwrap();
         assert!(out.starts_with("status: 200"));
         assert!(out.contains("content-type:"));
+    }
+
+    #[test]
+    fn host_matches_domain_exact_and_suffix() {
+        // Exact match.
+        assert!(host_matches_domain("evil.test", "evil.test"));
+        // Suffix match — `.evil.test` boundary must hold.
+        assert!(host_matches_domain("sub.evil.test", "evil.test"));
+        assert!(host_matches_domain("a.b.evil.test", "evil.test"));
+        // Substring without dot boundary must NOT match — closes the
+        // `notevil.test` / `evil.test` footgun.
+        assert!(!host_matches_domain("notevil.test", "evil.test"));
+        // Disjoint hosts.
+        assert!(!host_matches_domain("good.test", "evil.test"));
+    }
+
+    #[test]
+    fn webfetch_redirect_to_blocked_domain_denied() {
+        // F5: redirect closure must reject hops whose host suffix-matches
+        // `blocked_domains`. Tested via the pure helper because reqwest's
+        // `redirect::Attempt` cannot be constructed from outside the crate.
+        let blocked = vec!["evil.test".to_string()];
+        let allowed: Vec<String> = Vec::new();
+
+        let decision = evaluate_redirect_host("evil.test", &allowed, &blocked);
+        assert_eq!(
+            decision,
+            RedirectDomainDecision::DenyBlocked("evil.test".to_string())
+        );
+
+        // Subdomain must be denied too — naive equality would let it through.
+        let decision = evaluate_redirect_host("sub.evil.test", &allowed, &blocked);
+        assert_eq!(
+            decision,
+            RedirectDomainDecision::DenyBlocked("sub.evil.test".to_string())
+        );
+
+        // A host that is not a suffix match passes.
+        assert_eq!(
+            evaluate_redirect_host("good.test", &allowed, &blocked),
+            RedirectDomainDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn webfetch_redirect_outside_allowlist_denied() {
+        // F5: when `allowed_domains` is non-empty, any host outside it
+        // must be rejected. Empty allowlist means "no restriction" —
+        // every non-blocked host is allowed.
+        let allowed = vec!["good.test".to_string()];
+        let blocked: Vec<String> = Vec::new();
+
+        // Outside the allowlist → denied.
+        assert_eq!(
+            evaluate_redirect_host("bad.test", &allowed, &blocked),
+            RedirectDomainDecision::DenyOutsideAllowed("bad.test".to_string()),
+        );
+
+        // Exact allowlist match → allowed.
+        assert_eq!(
+            evaluate_redirect_host("good.test", &allowed, &blocked),
+            RedirectDomainDecision::Allow,
+        );
+
+        // Subdomain of allowlist entry → allowed (suffix match).
+        assert_eq!(
+            evaluate_redirect_host("api.good.test", &allowed, &blocked),
+            RedirectDomainDecision::Allow,
+        );
+
+        // Empty allowlist → all hosts pass when not on the blocklist.
+        let empty_allow: Vec<String> = Vec::new();
+        assert_eq!(
+            evaluate_redirect_host("anything.test", &empty_allow, &blocked),
+            RedirectDomainDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn webfetch_redirect_blocklist_takes_precedence_over_allowlist() {
+        // Hosts that match both lists must be denied — `blocked_domains`
+        // wins. Without this, an operator who mistakenly added a domain
+        // to both lists would silently allow it.
+        let allowed = vec!["evil.test".to_string()];
+        let blocked = vec!["evil.test".to_string()];
+        assert_eq!(
+            evaluate_redirect_host("evil.test", &allowed, &blocked),
+            RedirectDomainDecision::DenyBlocked("evil.test".to_string()),
+        );
+    }
+
+    #[test]
+    fn with_domains_constructor_wires_timeout() {
+        // Smoke test: the new constructor wires the timeout through and the
+        // `reqwest::Client` builds successfully with a non-empty domain policy.
+        // Domain lists are moved into the redirect closure and not stored on the
+        // struct, so only the timeout is inspectable here; redirect behavior is
+        // verified in the `blocked_redirect_*` and `allowed_redirect_*` tests.
+        let handler = WebFetchHandler::with_domains(
+            Some(Duration::from_secs(11)),
+            vec!["good.test".into()],
+            vec!["evil.test".into()],
+        );
+        assert_eq!(handler.default_timeout, Duration::from_secs(11));
+    }
+
+    #[test]
+    fn default_handler_builds_without_panic() {
+        // Backward-compat: the no-arg `Default` and `new(None)` paths must
+        // succeed (no domain restrictions baked into the closure, only the IP
+        // block list enforced on hops, matching pre-F5 behavior).
+        let _handler = WebFetchHandler::default();
     }
 }

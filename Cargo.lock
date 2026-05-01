@@ -1462,8 +1462,10 @@ version = "0.1.1"
 dependencies = [
  "aho-corasick",
  "async-trait",
+ "base64",
  "blake3",
  "genai",
+ "hex",
  "lru",
  "minijinja",
  "reqwest",

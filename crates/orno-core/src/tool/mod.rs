@@ -191,6 +191,16 @@ pub trait ToolHandler: Send + Sync {
     /// agent's `allow_mutations` / `allow_network` policy before dispatch.
     fn effect(&self) -> ToolEffect;
 
+    /// Returns `true` when this handler must only be invoked under a
+    /// non-empty `roots` list. The agent loop refuses to start when any
+    /// tool in `allowed_tools` returns `true` here and `policy.roots` is
+    /// empty. Override this on every handler that performs filesystem I/O
+    /// relative to `roots`; the default of `false` keeps third-party
+    /// handlers compatible (BS3).
+    fn requires_jail(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with the per-call `inv` context and JSON `args`.
     /// Returns the tool output as a plain string (forwarded as a
     /// `ToolResult` message in the next LLM turn).

@@ -273,6 +273,7 @@ mod tests {
                     command: "true".to_string(),
                     args: Vec::new(),
                     stdin: None,
+                    env: BTreeMap::new(),
                 }),
                 needs: needs.iter().map(|s| (*s).to_string()).collect(),
                 timeout: None,

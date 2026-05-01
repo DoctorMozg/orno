@@ -27,6 +27,8 @@ blake3 = { workspace = true }
 reqwest = { workspace = true }
 rmcp = { workspace = true }
 aho-corasick = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
 lru = { workspace = true }
 async-trait = "0.1"
 # `tempfile::NamedTempFile` is used by the `EditHandler` / `WriteHandler`

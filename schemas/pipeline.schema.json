@@ -1,3 +1,7 @@
+   Compiling orno-core v0.1.1 (/home/drmozg/Work/Petproj/orno/crates/orno-core)
+   Compiling orno-cli v0.1.1 (/home/drmozg/Work/Petproj/orno/crates/orno-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.49s
+     Running `target/debug/orno schema`
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pipeline",
@@ -423,6 +427,14 @@
         },
         "command": {
           "type": "string"
+        },
+        "env": {
+          "description": "Environment variable overrides for the spawned child. The\nexecutor clears the inherited environment, restores a small\nallowlist of safe variables (`PATH`, `HOME`, etc.), then\napplies these entries on top so per-node values shadow the\nallowlist. Operator-supplied — not rendered through the\ntemplate engine.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
         },
         "stdin": {
           "description": "Content to pipe into the child's stdin. Rendered through the\nsame template context as `command` and `args`. When `None`,\nstdin is closed (default) — matching the pre-stdin behavior so\nexisting pipelines keep working. When `Some`, even an empty\nstring is delivered so the child sees a pipe that closes at\nEOF rather than a closed handle.",

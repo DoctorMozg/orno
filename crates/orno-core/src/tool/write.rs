@@ -40,6 +40,10 @@ impl ToolHandler for WriteHandler {
         ToolEffect::Mutations
     }
 
+    fn requires_jail(&self) -> bool {
+        true
+    }
+
     #[instrument(skip(self, args), fields(tool.name = "Write", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let WriteArgs { path, content } =
@@ -53,10 +57,15 @@ impl ToolHandler for WriteHandler {
         // LLM with `allow_mutations` mkdir anywhere the process can,
         // even if the subsequent write is rejected — a containment
         // violation independent of the actual file content (F1).
+        // BS1: fail closed when roots is empty — no boundary, no write.
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_path(root, &path)?
         } else {
-            PathBuf::from(&path)
+            return Err(ToolError::Denied {
+                reason: "Write tool requires a non-empty `roots` list; \
+                         no jail boundary is configured for this agent"
+                    .to_string(),
+            });
         };
 
         if let Some(parent) = resolved.parent()
@@ -114,11 +123,12 @@ mod tests {
     async fn writes_new_file() {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("out.txt");
+        let roots = vec![tmp.path().to_path_buf()];
         let handler = WriteHandler;
 
         let result = handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({ "path": path.to_str().unwrap(), "content": "hello" }),
             )
             .await
@@ -134,11 +144,12 @@ mod tests {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("out.txt");
         std::fs::write(&path, "old").expect("seed file");
+        let roots = vec![tmp.path().to_path_buf()];
 
         let handler = WriteHandler;
         handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({ "path": path.to_str().unwrap(), "content": "new content" }),
             )
             .await
@@ -203,11 +214,12 @@ mod tests {
     async fn creates_parent_directories() {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("subdir").join("nested").join("file.txt");
+        let roots = vec![tmp.path().to_path_buf()];
         let handler = WriteHandler;
 
         handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({ "path": path.to_str().unwrap(), "content": "deep" }),
             )
             .await

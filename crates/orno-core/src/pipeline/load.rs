@@ -1,8 +1,10 @@
 //! YAML → validated `Pipeline`.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 use std::path::Path;
 
+use crate::agent::loop_agent::policy::{is_blocked_ipv4, is_blocked_ipv6};
 use crate::error::PipelineError;
 
 use super::schema::{McpServerConfig, Pipeline};
@@ -58,17 +60,79 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
         return Err(PipelineError::Validation("pipeline has no nodes".into()));
     }
 
-    // Reject any MCP stdio server with an empty `command:` argv. An
-    // empty command would fail with an opaque "no such file" at run
-    // start; surfacing it at validate-time turns it into a YAML
-    // authoring error instead.
+    // Reject MCP server declarations that would fail (or be unsafe) at run
+    // start. Stdio: an empty argv would surface as an opaque "no such
+    // file" at spawn. HTTP: only http/https are allowed; bare `http://` is
+    // restricted to loopback so an operator does not accidentally ship
+    // credentials in clear, and any URL whose host is a literal IP in a
+    // blocked range (link-local, RFC 1918, cloud metadata, etc.) is
+    // refused outright. Catching all of these at validate-time turns
+    // runtime spawn / connect failures into actionable YAML authoring
+    // errors.
     for (name, server) in &pipeline.mcp_servers {
-        if let McpServerConfig::Stdio(stdio) = server
-            && stdio.command.is_empty()
-        {
-            return Err(PipelineError::Validation(format!(
-                "mcp_servers.`{name}`: stdio transport requires a non-empty `command:` argv",
-            )));
+        match server {
+            McpServerConfig::Stdio(stdio) if stdio.command.is_empty() => {
+                return Err(PipelineError::Validation(format!(
+                    "mcp_servers.`{name}`: stdio transport requires a non-empty `command:` argv",
+                )));
+            },
+            McpServerConfig::Http(http) => {
+                let parsed = reqwest::Url::parse(&http.url).map_err(|e| {
+                    PipelineError::Validation(format!(
+                        "mcp_servers.`{name}`: invalid url `{}`: {e}",
+                        http.url
+                    ))
+                })?;
+                let scheme = parsed.scheme();
+                if scheme != "https" && scheme != "http" {
+                    return Err(PipelineError::Validation(format!(
+                        "mcp_servers.`{name}`: url scheme `{scheme}` not permitted; \
+                         use https or http://localhost",
+                    )));
+                }
+                let host = parsed.host_str().unwrap_or("");
+                let host_ip = host.parse::<IpAddr>().ok();
+                // `http://` is only safe over loopback. Everything else
+                // (real IPs, public hostnames) must use https so
+                // credentials in `Authorization` headers are not sent in
+                // clear.
+                if scheme == "http" {
+                    let is_loopback = match host_ip {
+                        Some(IpAddr::V4(v4)) => v4.is_loopback(),
+                        Some(IpAddr::V6(v6)) => v6.is_loopback(),
+                        None => host == "localhost" || host == "localhost.",
+                    };
+                    if !is_loopback {
+                        return Err(PipelineError::Validation(format!(
+                            "mcp_servers.`{name}`: `http://` is only allowed for loopback hosts; \
+                             use `https://` for remote servers",
+                        )));
+                    }
+                }
+                // Block link-local, RFC 1918, CGNAT, documentation, and
+                // cloud metadata IPs even on https — these ranges should
+                // never be the target of an MCP server URL. The `http`
+                // path above already restricts to loopback explicitly, so
+                // skip this gate when scheme is `http` to avoid
+                // double-rejecting `http://127.0.0.1` (loopback is in
+                // `is_blocked_ipv4`'s set, but it's the one literal we
+                // just permitted).
+                if scheme == "https"
+                    && let Some(ip) = host_ip
+                {
+                    let blocked = match ip {
+                        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+                        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+                    };
+                    if blocked {
+                        return Err(PipelineError::Validation(format!(
+                            "mcp_servers.`{name}`: url host `{ip}` is in a blocked range \
+                             (loopback / private / link-local / CGNAT / documentation / metadata)",
+                        )));
+                    }
+                }
+            },
+            McpServerConfig::Stdio(_) => {},
         }
     }
 
@@ -179,6 +243,49 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
                          delegate to `{child_name}` (allow_network=true)"
                     )));
                 }
+                if !agent_config.policy.allow_context_writes && child.policy.allow_context_writes {
+                    return Err(PipelineError::Validation(format!(
+                        "agent `{agent_name}` (allow_context_writes=false) cannot \
+                         delegate to `{child_name}` (allow_context_writes=true)"
+                    )));
+                }
+                // Filesystem-jail compose-down: when the parent has any
+                // `roots:` declared, every child root must lie under at
+                // least one parent root. An empty parent `roots:` is the
+                // pre-existing "unjailed parent" shape — it does not
+                // constrain children, so leave them alone.
+                if !agent_config.policy.roots.is_empty() {
+                    for child_root in &child.policy.roots {
+                        let allowed = agent_config
+                            .policy
+                            .roots
+                            .iter()
+                            .any(|parent_root| child_root.starts_with(parent_root));
+                        if !allowed {
+                            return Err(PipelineError::Validation(format!(
+                                "agent `{agent_name}` cannot delegate to `{child_name}`: \
+                                 subagent root `{}` is not a subdirectory of any parent root",
+                                child_root.display(),
+                            )));
+                        }
+                    }
+                }
+                // Recursion-depth compose-down: a child's own
+                // `max_subagent_depth` budget must leave room for the
+                // current dispatch — the parent spends one unit of
+                // recursion to enter the child, so the child's cap can be
+                // at most parent - 1. `saturating_add` keeps the
+                // comparison safe at `u32::MAX`.
+                if child.policy.max_subagent_depth.saturating_add(1)
+                    > agent_config.policy.max_subagent_depth
+                {
+                    return Err(PipelineError::Validation(format!(
+                        "agent `{agent_name}` (max_subagent_depth={}) cannot \
+                         delegate to `{child_name}` (max_subagent_depth={}); \
+                         child must be at most parent - 1",
+                        agent_config.policy.max_subagent_depth, child.policy.max_subagent_depth,
+                    )));
+                }
             }
         }
     }
@@ -257,8 +364,8 @@ mod tests {
     use super::*;
 
     use crate::pipeline::schema::{
-        AgentConfig, AgentPolicy, McpServerConfig, McpStdioConfig, Node, NodeKind, OnParseError,
-        Pipeline, ShellNode,
+        AgentConfig, AgentPolicy, McpHttpConfig, McpServerConfig, McpStdioConfig, Node, NodeKind,
+        OnParseError, Pipeline, ShellNode,
     };
 
     fn shell_node(id: &str, needs: &[&str]) -> Node {
@@ -268,6 +375,7 @@ mod tests {
                 command: "true".to_string(),
                 args: Vec::new(),
                 stdin: None,
+                env: BTreeMap::new(),
             }),
             needs: needs.iter().map(|s| (*s).to_string()).collect(),
             timeout: None,
@@ -397,6 +505,20 @@ mod tests {
         }
     }
 
+    /// Build an `AgentConfig` with a fully custom `AgentPolicy`. Used by
+    /// compose-down tests that need to vary fields beyond the
+    /// `allow_mutations` / `allow_network` pair the shorthand exposes
+    /// (depth, roots, context-writes).
+    fn agent_config_with_policy(allowed_tools: Vec<String>, policy: AgentPolicy) -> AgentConfig {
+        AgentConfig {
+            model: "test-model".to_string(),
+            provider: "test-provider".to_string(),
+            system: None,
+            allowed_tools,
+            policy,
+        }
+    }
+
     fn stdio_mcp_server() -> McpServerConfig {
         McpServerConfig::Stdio(McpStdioConfig {
             command: vec!["echo".to_string()],
@@ -485,17 +607,168 @@ mod tests {
 
     #[test]
     fn subagent_same_or_more_restrictive_policy_is_accepted() {
+        // Parent dispatches to child; mutation/network/context-write
+        // policies are identical and the child's `max_subagent_depth` is
+        // strictly less than the parent's (parent spends one unit of
+        // recursion to enter the child, so child depth ≤ parent - 1).
         let mut p = pipeline(vec![shell_node("n", &[])]);
+        let mut child_policy = base_policy(false, false);
+        child_policy.max_subagent_depth = 0;
         p.agents.insert(
             "child".to_string(),
-            // same policy as parent
-            agent_config(Vec::new(), false, false),
+            agent_config_with_policy(Vec::new(), child_policy),
         );
         p.agents.insert(
             "parent".to_string(),
             agent_config(vec!["subagent.child".to_string()], false, false),
         );
         assert!(validate(&p).is_ok());
+    }
+
+    #[test]
+    fn validate_subagent_compose_down_allow_context_writes() {
+        // Compose-down: a child cannot enable `allow_context_writes`
+        // when the parent has it disabled — otherwise the parent's
+        // ContextSelf gate could be bypassed by delegating.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        let mut child_policy = base_policy(false, false);
+        child_policy.allow_context_writes = true;
+        child_policy.max_subagent_depth = 0;
+        p.agents.insert(
+            "child".to_string(),
+            agent_config_with_policy(Vec::new(), child_policy),
+        );
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.child".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected compose-down validation error for allow_context_writes");
+        };
+        assert!(
+            msg.contains("allow_context_writes"),
+            "error should name the policy dimension: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_subagent_roots_must_be_subset() {
+        // Compose-down: every child root must be a subdirectory of
+        // some parent root. A sibling path (`/work/other` next to
+        // `/work/parent`) is not — surface the offending path so the
+        // operator can see which root needs to move.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        let mut parent_policy = base_policy(false, false);
+        parent_policy.roots = vec![std::path::PathBuf::from("/work/parent")];
+        let mut child_policy = base_policy(false, false);
+        child_policy.roots = vec![std::path::PathBuf::from("/work/other")];
+        child_policy.max_subagent_depth = 0;
+        p.agents.insert(
+            "child".to_string(),
+            agent_config_with_policy(Vec::new(), child_policy),
+        );
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config_with_policy(vec!["subagent.child".to_string()], parent_policy),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected compose-down validation error for roots subset");
+        };
+        assert!(
+            msg.contains("/work/other"),
+            "error should name the offending root: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_subagent_max_depth_decreases() {
+        // Compose-down: a child's `max_subagent_depth` must be at
+        // most parent - 1, since the parent spends one unit of
+        // recursion to enter the child. Equal depths fail.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        // Both default to depth=1 from `base_policy`.
+        p.agents
+            .insert("child".to_string(), agent_config(Vec::new(), false, false));
+        p.agents.insert(
+            "parent".to_string(),
+            agent_config(vec!["subagent.child".to_string()], false, false),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected compose-down validation error for max_subagent_depth");
+        };
+        assert!(
+            msg.contains("max_subagent_depth"),
+            "error should name the policy dimension: {msg}"
+        );
+    }
+
+    fn http_mcp_server(url: &str) -> McpServerConfig {
+        McpServerConfig::Http(McpHttpConfig {
+            url: url.to_string(),
+            auth: None,
+            headers: BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn validate_mcp_http_rejects_non_loopback() {
+        // Plain `http://` is restricted to loopback so credentials in
+        // `Authorization` headers are not sent in the clear over the
+        // network.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers
+            .insert("remote".to_string(), http_mcp_server("http://example.com"));
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for non-loopback http://");
+        };
+        assert!(
+            msg.contains("loopback") && msg.contains("https"),
+            "error should explain that https is required for remote: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_http_allows_loopback() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert(
+            "local".to_string(),
+            http_mcp_server("http://localhost:5000"),
+        );
+        assert!(
+            validate(&p).is_ok(),
+            "http://localhost must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_https_allows_remote() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert(
+            "remote".to_string(),
+            http_mcp_server("https://api.example.com"),
+        );
+        assert!(
+            validate(&p).is_ok(),
+            "https:// to a public host must pass validation"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_http_rejects_blocked_ip() {
+        // The cloud metadata IP — exactly the kind of address an MCP
+        // server URL should never target — even on https.
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert(
+            "metadata".to_string(),
+            http_mcp_server("https://169.254.169.254/"),
+        );
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for blocked IP range");
+        };
+        assert!(
+            msg.contains("blocked range") || msg.contains("169.254"),
+            "error should explain why the IP is blocked: {msg}"
+        );
     }
 
     #[test]

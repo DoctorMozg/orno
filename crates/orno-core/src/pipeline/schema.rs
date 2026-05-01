@@ -98,6 +98,14 @@ pub struct ShellNode {
     /// EOF rather than a closed handle.
     #[serde(default)]
     pub stdin: Option<String>,
+    /// Environment variable overrides for the spawned child. The
+    /// executor clears the inherited environment, restores a small
+    /// allowlist of safe variables (`PATH`, `HOME`, etc.), then
+    /// applies these entries on top so per-node values shadow the
+    /// allowlist. Operator-supplied — not rendered through the
+    /// template engine.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// Named agent configuration. Referenced by `kind: agent` nodes and by
