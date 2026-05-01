@@ -413,6 +413,10 @@ pub struct DenyShellExecutor;
 
 #[async_trait]
 impl NodeExecutor for DenyShellExecutor {
+    #[instrument(
+        skip(self, _req),
+        fields(node.id = %id, node.kind = "shell", pipeline.run_id = %_run_id),
+    )]
     async fn execute(
         &self,
         _run_id: &str,

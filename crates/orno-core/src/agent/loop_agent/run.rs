@@ -20,7 +20,7 @@ use crate::events::{BudgetKind, Event, LlmFailure};
 use crate::llm::{LlmRequest, OrnoChatMessage, OrnoChatTool};
 use crate::tool::{StateHandle, ToolInvocation};
 
-use super::{LoopAgent, SUBAGENT_PREFIX};
+use super::{LoopAgent, SUBAGENT_PREFIX, wire_name_from_yaml};
 
 /// Default cap on the per-call tool output bytes appended to the
 /// conversation history. Mirrors the `AgentPolicy.max_tool_output_bytes`
@@ -188,18 +188,21 @@ impl Agent for LoopAgent {
 
         // Build the tool definitions the LLM sees on each request —
         // intersection of `allowed_tools` and the registered handler
-        // set. Empty vector when the agent declared no tools.
-        let declared_tools: Vec<OrnoChatTool> = self
-            .config
-            .tools
-            .iter()
-            .filter(|h| req.allowed_tools.iter().any(|n| n == h.name()))
-            .map(|h| OrnoChatTool {
-                name: Self::to_wire_name(h.name()),
-                description: h.description().to_string(),
-                schema: h.schema(),
-            })
-            .collect();
+        // set. Empty vector when the agent declared no tools. The
+        // `Arc` wrapper means each iteration's `LlmRequest` clones the
+        // pointer instead of the underlying schema vector.
+        let declared_tools: Arc<Vec<OrnoChatTool>> = Arc::new(
+            self.config
+                .tools
+                .iter()
+                .filter(|h| req.allowed_tools.iter().any(|n| n == h.name()))
+                .map(|h| OrnoChatTool {
+                    name: wire_name_from_yaml(h.name()),
+                    description: h.description().to_string(),
+                    schema: h.schema(),
+                })
+                .collect::<Vec<_>>(),
+        );
 
         // Reverse map: wire name the LLM sends back → YAML name we
         // registered under. Only dotted YAML names appear here with a
@@ -212,12 +215,22 @@ impl Agent for LoopAgent {
             .filter(|h| req.allowed_tools.iter().any(|n| n == h.name()))
             .map(|h| {
                 let yaml = h.name().to_string();
-                (Self::to_wire_name(&yaml), yaml)
+                (wire_name_from_yaml(&yaml), yaml)
             })
             .collect();
 
         let prompt_excerpt = self.excerpt_for_wire(&req.initial_prompt);
         let system_excerpt = req.system.as_deref().map(|s| self.excerpt_for_wire(s));
+
+        // Pre-compute the per-loop immutable string copies of the
+        // request's `Arc<str>` fields. Each iteration clones these
+        // owned `String`s into the outgoing `LlmRequest`/event
+        // envelopes; doing the conversion once per `run` avoids
+        // re-paying the `Arc<str>::to_string` cost on every iteration.
+        let provider_str = req.provider.to_string();
+        let model_str = req.model.to_string();
+        let prompt_str = req.initial_prompt.to_string();
+        let system_str = req.system.as_deref().map(str::to_string);
 
         // Growing conversation history across iterations. The initial
         // user turn rides in `LlmRequest.prompt`; this vector captures
@@ -283,14 +296,14 @@ impl Agent for LoopAgent {
             };
 
             let llm_req = LlmRequest {
-                provider: req.provider.to_string(),
-                model: req.model.to_string(),
-                prompt: req.initial_prompt.to_string(),
-                system: req.system.as_deref().map(str::to_string),
+                provider: provider_str.clone(),
+                model: model_str.clone(),
+                prompt: prompt_str.clone(),
+                system: system_str.clone(),
                 temperature: None,
                 max_tokens,
                 messages: Arc::clone(&messages),
-                tools: declared_tools.clone(),
+                tools: Arc::clone(&declared_tools),
             };
 
             self.config
@@ -298,8 +311,8 @@ impl Agent for LoopAgent {
                 .record(Event::LlmRequestStarted {
                     run_id: run_id.to_string(),
                     node_id: node_id.to_string(),
-                    provider: req.provider.to_string(),
-                    model: req.model.to_string(),
+                    provider: provider_str.clone(),
+                    model: model_str.clone(),
                     prompt_excerpt: prompt_excerpt.clone(),
                     system_excerpt: system_excerpt.clone(),
                 })
@@ -315,8 +328,8 @@ impl Agent for LoopAgent {
                         .record(Event::LlmRequestFailed {
                             run_id: run_id.to_string(),
                             node_id: node_id.to_string(),
-                            provider: req.provider.to_string(),
-                            model: req.model.to_string(),
+                            provider: provider_str.clone(),
+                            model: model_str.clone(),
                             failure,
                         })
                         .await;
@@ -411,6 +424,10 @@ impl Agent for LoopAgent {
 
             // Record the assistant's tool-call turn so the next LLM
             // request carries the full causal chain.
+            //
+            // INVARIANT: messages must have refcount 1 here — no transport may retain
+            // an Arc clone across the await point. If violated, make_mut deep-clones
+            // the entire history on every iteration (O(n²)). See LlmTransport contract.
             Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolCalls {
                 calls: response.tool_calls.clone(),
             });
@@ -544,6 +561,9 @@ impl Agent for LoopAgent {
                 // outbound prompt even though every other wire-format
                 // field already runs through `redactor`.
                 let redacted = self.config.redactor.redact(&truncated);
+                // INVARIANT: messages must have refcount 1 here — no transport may retain
+                // an Arc clone across the await point. If violated, make_mut deep-clones
+                // the entire history on every iteration (O(n²)). See LlmTransport contract.
                 Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
                     content: redacted.into_owned(),

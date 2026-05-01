@@ -121,7 +121,7 @@ impl LoopAgent {
     /// Emit a `ToolDenied` event and return the denial string fed back
     /// to the model. `tool_name` is the wire-form name the LLM called
     /// (dotted YAML names are sanitized to underscores at the schema
-    /// boundary — see `to_wire_name` in `mod.rs`); `wire_to_yaml`
+    /// boundary — see `wire_name_from_yaml` in `mod.rs`); `wire_to_yaml`
     /// reverse-translates so both the emitted `tool_name` and the
     /// "denied: tool `<name>` blocked by …" text use the YAML form
     /// operators wrote in their pipeline. Builtins map to themselves
@@ -356,25 +356,6 @@ impl LoopAgent {
                             &inv,
                             &tool_call.fn_name,
                             "allow_network=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                // Bash cannot be constrained by allowed_domains — it opens
-                // arbitrary network connections that orno cannot intercept.
-                // When the operator has set an allowlist they expect it to
-                // enforce egress; silently skipping that constraint would give
-                // a false sense of confinement. Refuse Bash when any allowlist
-                // is configured so the failure is explicit (F20).
-                if !policy.allowed_domains.is_empty() {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "Bash cannot enforce allowed_domains; refuse Bash \
-                             invocation when a domain allowlist is set — \
-                             remove allowed_domains or disable Bash in allowed_tools"
-                                .into(),
                             wire_to_yaml,
                         )
                         .await);

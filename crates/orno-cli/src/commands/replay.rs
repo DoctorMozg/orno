@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, bail};
+use orno_core::agent::loop_agent::wire_name_from_yaml;
 use orno_core::agent::{Agent, LoopAgent, LoopAgentConfig};
 use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
 use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
@@ -168,7 +169,7 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
             if !tool.starts_with("mcp.") || !mcp_seen.insert(tool.clone()) {
                 continue;
             }
-            let wire = yaml_to_wire_name(tool);
+            let wire = wire_name_from_yaml(tool);
             let (description, schema) = mcp_tool_defs
                 .iter()
                 .find(|def| def.name == wire)
@@ -278,19 +279,6 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Translate a YAML-form tool name into the wire form `LoopAgent`
-/// uses when building `OrnoChatTool` definitions for the LLM.
-/// Mirrors `LoopAgent::to_wire_name` (private to that module) — this
-/// duplicate keeps replay independent of agent-internal helpers and
-/// is small enough that the cost is negligible.
-fn yaml_to_wire_name(yaml_name: &str) -> String {
-    if yaml_name.contains('.') {
-        yaml_name.replace('.', "_")
-    } else {
-        yaml_name.to_string()
-    }
-}
-
 /// Walk every recorded LLM request's `tools` list and collect the
 /// `OrnoChatTool` definition for each MCP tool the agent loop sent
 /// to the model. Returned in first-occurrence order so callers can
@@ -300,18 +288,18 @@ fn yaml_to_wire_name(yaml_name: &str) -> String {
 /// same `tools` list, so duplicates are expected and harmless.
 ///
 /// Order matters here because `tape_key = blake3(json(LlmRequest))`
-/// and `LlmRequest.tools` is a `Vec` — its position is part of the
-/// hashed bytes. A `HashMap` return type previously scrambled tool
-/// order across program runs (`HashMap` key iteration is randomized),
-/// causing every replay to miss with `LlmError::ReplayMiss`. The
-/// `Vec` return preserves the order each tool first appeared in
-/// the tape, which is the order the agent loop sent them on the
-/// recorded run.
+/// and `LlmRequest.tools` serializes as a JSON array — element
+/// position is part of the hashed bytes. A `HashMap` return type
+/// previously scrambled tool order across program runs (`HashMap`
+/// key iteration is randomized), causing every replay to miss with
+/// `LlmError::ReplayMiss`. The `Vec` return preserves the order
+/// each tool first appeared in the tape, which is the order the
+/// agent loop sent them on the recorded run.
 fn discover_mcp_tool_definitions(llm_entries: &[TapeEntry]) -> Vec<OrnoChatTool> {
     let mut out: Vec<OrnoChatTool> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for entry in llm_entries {
-        for tool in &entry.req.tools {
+        for tool in entry.req.tools.iter() {
             if tool.name.starts_with("mcp_") && seen.insert(tool.name.clone()) {
                 out.push(tool.clone());
             }
@@ -390,16 +378,15 @@ mod tests {
 
     fn tape_entry_with_tools(tools: Vec<OrnoChatTool>) -> TapeEntry {
         TapeEntry {
-            req: LlmRequest {
-                provider: "openai".into(),
-                model: "gpt-5".into(),
-                prompt: "x".into(),
-                system: None,
-                temperature: None,
-                max_tokens: None,
-                messages: Arc::new(vec![]),
-                tools,
-            },
+            req: LlmRequest::from_prompt(
+                "openai".into(),
+                "gpt-5".into(),
+                "x".into(),
+                None,
+                None,
+                None,
+            )
+            .with_tools(tools),
             outcome: TapeOutcome::Ok {
                 res: LlmResponse {
                     content: "ok".into(),
@@ -417,19 +404,6 @@ mod tests {
             description: desc.into(),
             schema: serde_json::json!({"type": "object"}),
         }
-    }
-
-    #[test]
-    fn yaml_to_wire_name_replaces_dots_with_underscores() {
-        assert_eq!(
-            yaml_to_wire_name("mcp.filesystem.read_file"),
-            "mcp_filesystem_read_file"
-        );
-    }
-
-    #[test]
-    fn yaml_to_wire_name_passes_through_dotless_names() {
-        assert_eq!(yaml_to_wire_name("Bash"), "Bash");
     }
 
     #[test]

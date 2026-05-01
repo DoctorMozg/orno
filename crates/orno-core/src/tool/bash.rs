@@ -147,10 +147,9 @@ impl ToolHandler for BashHandler {
         // Jail the requested `cwd` against the agent's first declared
         // root so the LLM cannot `cd` outside the policy-allowed tree
         // and run commands from there. Mirrors the path-guard contract
-        // used by Read / Write / Edit. When `roots` is empty (handler
-        // dispatched outside a `LoopAgent`, or agent declared no root),
-        // fall through to the raw path so tests and root-less pipelines
-        // keep working — policy enforcement is the caller's job there.
+        // used by Read / Write / Edit. When `roots` is empty there is
+        // no jail boundary — accepting a raw `cwd` would let the LLM
+        // chdir anywhere on the host, so the request is denied instead.
         if let Some(dir) = &cwd {
             let cwd_path: PathBuf = if let Some(root) = inv.roots.first() {
                 jail_path(root, dir).map_err(|e| ToolError::Invocation {
@@ -158,7 +157,12 @@ impl ToolHandler for BashHandler {
                     source: Box::new(std::io::Error::other(e.to_string())),
                 })?
             } else {
-                PathBuf::from(dir)
+                // cwd without a jail boundary is unsafe — deny rather than allow unrestricted chdir.
+                return Err(ToolError::Denied {
+                    reason: "Bash `cwd` requires a non-empty `roots` list; \
+                             no jail boundary is configured for this agent"
+                        .to_string(),
+                });
             };
             cmd.current_dir(&cwd_path);
         }
@@ -498,25 +502,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cwd_is_respected() {
+    async fn cwd_denied_when_roots_is_empty() {
         let tmp = TempDir::new().expect("create tempdir");
-        // Resolve symlinks so the comparison matches `pwd -P`'s output on
-        // platforms (macOS) where $TMPDIR contains symlinked components.
-        let canonical = tmp.path().canonicalize().expect("canonicalize tempdir");
         let handler = BashHandler;
+        let result = handler
+            .invoke(
+                ToolInvocation::for_test("call-1"),
+                json!({ "command": "pwd", "cwd": tmp.path().to_str().unwrap() }),
+            )
+            .await;
 
+        assert!(
+            matches!(result, Err(ToolError::Denied { .. })),
+            "cwd without a jail boundary must be denied, got {result:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_cwd_with_empty_roots_is_allowed() {
+        // Regression guard for the audit fix's scope: the empty-roots
+        // deny path must fire ONLY when the LLM passes an explicit `cwd`.
+        // A bash call without `cwd` has no chdir to jail, so it must
+        // continue to succeed even when the agent has no roots
+        // configured. Without this test, a future refactor could move
+        // the deny check outside the `if let Some(dir) = &cwd` branch
+        // and silently break every agent that runs Bash in its default
+        // working directory.
+        let handler = BashHandler;
         let out = handler
             .invoke(
                 ToolInvocation::for_test("call-1"),
-                json!({ "command": "pwd -P", "cwd": tmp.path().to_str().unwrap() }),
+                json!({ "command": "echo no-cwd-needed" }),
             )
             .await
-            .expect("pwd in tempdir should succeed");
+            .expect("Bash without cwd must succeed regardless of roots");
 
-        let expected = canonical.to_str().expect("utf8 tempdir path");
+        assert!(out.contains("exit_code: 0"), "unexpected output: {out}");
         assert!(
-            out.contains(expected),
-            "output should contain tempdir path {expected}: {out}"
+            out.contains("no-cwd-needed"),
+            "stdout payload missing: {out}",
         );
     }
 

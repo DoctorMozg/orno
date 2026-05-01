@@ -120,22 +120,28 @@ impl LoopAgent {
     fn find_handler(&self, yaml_name: &str) -> Option<&Arc<dyn ToolHandler>> {
         self.config.tools.iter().find(|h| h.name() == yaml_name)
     }
+}
 
-    /// Translate a YAML-facing tool name (possibly containing dots, as
-    /// in `subagent.contributor_vibes`) into the wire-safe form the LLM
-    /// schema presents. Dotless names are returned unchanged; a new
-    /// allocation only happens for the subagent case.
-    fn to_wire_name(yaml_name: &str) -> String {
-        if yaml_name.contains('.') {
-            yaml_name.replace('.', "_")
-        } else {
-            yaml_name.to_string()
-        }
+/// Translate a YAML-facing tool name (possibly containing dots, as
+/// in `subagent.contributor_vibes`) into the wire-safe form the LLM
+/// schema presents. Dotless names are returned unchanged; a new
+/// allocation only happens for the subagent case.
+///
+/// Lives at module level so callers outside `LoopAgent` (e.g.
+/// `orno replay`'s MCP stub registration) can produce the same wire
+/// form without duplicating the logic.
+#[must_use]
+pub fn wire_name_from_yaml(yaml_name: &str) -> String {
+    if yaml_name.contains('.') {
+        yaml_name.replace('.', "_")
+    } else {
+        yaml_name.to_string()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    mod arc_invariant;
     mod events;
     mod helpers;
     mod parse_retry;
@@ -144,4 +150,19 @@ mod tests {
     mod strictness_resources;
     mod strictness_tools;
     mod subagent;
+
+    use super::wire_name_from_yaml;
+
+    #[test]
+    fn wire_name_from_yaml_replaces_dots_with_underscores() {
+        assert_eq!(
+            wire_name_from_yaml("mcp.filesystem.read_file"),
+            "mcp_filesystem_read_file"
+        );
+    }
+
+    #[test]
+    fn wire_name_from_yaml_passes_through_dotless_names() {
+        assert_eq!(wire_name_from_yaml("Bash"), "Bash");
+    }
 }

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::instrument;
 
 use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
@@ -51,6 +52,7 @@ impl ToolHandler for ReadHandler {
         true
     }
 
+    #[instrument(skip(self, args), fields(tool.name = "Read", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let ReadArgs { path } =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
@@ -186,5 +188,19 @@ mod tests {
             ToolError::Invocation { name, .. } => assert_eq!(name, "Read"),
             other => panic!("expected Invocation, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn empty_roots_returns_denied() {
+        let handler = ReadHandler;
+        let args = json!({ "path": "/etc/passwd" });
+        let err = handler
+            .invoke(ToolInvocation::for_test("call-1"), args)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "expected Denied when roots is empty, got {err:?}"
+        );
     }
 }
