@@ -109,7 +109,7 @@ impl LlmTransport for GenAiTransport {
         if let Some(system) = &req.system {
             chat = chat.with_system(system.clone());
         }
-        for msg in &req.messages {
+        for msg in req.messages.iter() {
             chat = chat.append_message(orno_msg_to_genai(msg));
         }
         if !req.tools.is_empty() {

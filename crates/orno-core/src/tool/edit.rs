@@ -43,6 +43,10 @@ impl ToolHandler for EditHandler {
         ToolEffect::Mutations
     }
 
+    fn requires_jail(&self) -> bool {
+        true
+    }
+
     #[instrument(skip(self, args), fields(tool.name = "Edit", tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let EditArgs {
@@ -57,7 +61,12 @@ impl ToolHandler for EditHandler {
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_path(root, &path)?
         } else {
-            PathBuf::from(&path)
+            // BS1: fail closed when roots is empty — no boundary, no edit.
+            return Err(ToolError::Denied {
+                reason: "Edit tool requires a non-empty `roots` list; \
+                         no jail boundary is configured for this agent"
+                    .to_string(),
+            });
         };
 
         let original = std::fs::read_to_string(&resolved).map_err(|e| ToolError::Invocation {
@@ -131,11 +140,12 @@ mod tests {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("doc.txt");
         std::fs::write(&path, "hello world").expect("seed file");
+        let roots = vec![tmp.path().to_path_buf()];
 
         let handler = EditHandler;
         let result = handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({
                     "path": path.to_str().unwrap(),
                     "old_string": "world",
@@ -155,11 +165,12 @@ mod tests {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("doc.txt");
         std::fs::write(&path, "hello world").expect("seed file");
+        let roots = vec![tmp.path().to_path_buf()];
 
         let handler = EditHandler;
         let err = handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({
                     "path": path.to_str().unwrap(),
                     "old_string": "missing",
@@ -186,11 +197,12 @@ mod tests {
         let tmp = TempDir::new().expect("create tempdir");
         let path = tmp.path().join("doc.txt");
         std::fs::write(&path, "foo bar foo baz").expect("seed file");
+        let roots = vec![tmp.path().to_path_buf()];
 
         let handler = EditHandler;
         let err = handler
             .invoke(
-                ToolInvocation::for_test("call-1"),
+                ToolInvocation::for_test_with_roots("call-1", &roots),
                 json!({
                     "path": path.to_str().unwrap(),
                     "old_string": "foo",

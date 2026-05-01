@@ -316,6 +316,7 @@ mod tests {
             command: "echo".to_string(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         })
     }
 

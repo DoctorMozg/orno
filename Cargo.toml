@@ -109,6 +109,16 @@ blake3 = "1"
 # crate over a hand-rolled scan.
 aho-corasick = { version = "1", default-features = false, features = ["std", "perf-literal"] }
 
+# Encoding-aware secret redaction. The `Redactor` registers every secret
+# value plus its base64 (standard + URL-safe-no-pad) and hex encodings so
+# an LLM cannot bypass redaction by encoding a secret before exfiltrating
+# it. `base64 0.22` is already pulled transitively by `genai`, `reqwest`,
+# and `hyper-util`, so adding a direct dep does not multiply versions.
+# `hex 0.4` is a fresh direct dep — small, std-only, no transitive
+# competitors in the lock file.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+hex    = { version = "0.4", default-features = false, features = ["std"] }
+
 # LRU eviction cache for `TemplateEngine`. Caps the number of compiled
 # MiniJinja templates so a long-lived engine cannot grow without bound.
 # `default-features = false` keeps the hashbrown backend in place and

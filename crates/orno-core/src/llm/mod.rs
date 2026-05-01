@@ -12,6 +12,8 @@ pub mod genai;
 pub mod recording;
 pub mod replay;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +42,7 @@ pub struct LlmRequest {
     pub max_tokens: Option<u32>,
     /// Multi-turn conversation history. Empty for single-turn requests.
     #[serde(default)]
-    pub messages: Vec<OrnoChatMessage>,
+    pub messages: Arc<Vec<OrnoChatMessage>>,
     /// Tools the model may call on this request. Empty means no tool use.
     #[serde(default)]
     pub tools: Vec<OrnoChatTool>,
@@ -69,7 +71,7 @@ impl LlmRequest {
             system,
             temperature,
             max_tokens,
-            messages: Vec::new(),
+            messages: Arc::new(Vec::new()),
             tools: Vec::new(),
         }
     }

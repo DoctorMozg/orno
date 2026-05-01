@@ -330,12 +330,14 @@ mod tests {
     #[tokio::test]
     async fn non_agent_request_rejected() {
         use crate::node::ShellNodeRequest;
+        use std::collections::BTreeMap;
         let sink = Arc::new(InMemorySink::new());
         let exec = AgentExecutor::with_defaults(Arc::new(DummyTransport), sink);
         let req = NodeRequest::Shell(ShellNodeRequest {
             command: "echo".into(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         });
         let err = exec
             .execute("run_test", "n", req)

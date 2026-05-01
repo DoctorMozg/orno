@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use aho_corasick::{AhoCorasick, MatchKind};
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 /// Replaces every occurrence of a known secret value with `"***"`.
@@ -25,14 +27,17 @@ use serde_json::Value;
 /// empty-string match would replace every zero-width position in the
 /// haystack, which is worse than not redacting at all.
 ///
-/// Internally, the secret list is compiled into an Aho-Corasick
-/// automaton so a single pass over the haystack catches every match
-/// regardless of how many secrets are registered. `MatchKind::LeftmostLongest`
-/// preserves the previous "longest secret wins" behavior in the rare
-/// case where two secrets overlap.
+/// Each secret is registered alongside its base64 (standard and URL-safe
+/// no-padding) and lowercase hex encodings so an LLM cannot bypass
+/// redaction by encoding a secret before exfiltrating it. The expanded
+/// pattern set is fed into an Aho-Corasick automaton so a single pass
+/// over the haystack catches every match regardless of how many secrets
+/// are registered. `MatchKind::LeftmostLongest` preserves the "longest
+/// pattern wins" behavior in the rare case where two patterns overlap.
 #[derive(Default)]
 pub struct Redactor {
-    /// Original secret values, retained for `Clone` reconstruction
+    /// Patterns registered with the automaton — the raw secrets plus
+    /// their base64/hex encodings. Retained for `Clone` reconstruction
     /// (the automaton itself does not expose its source patterns).
     values: Vec<String>,
     /// Compiled multi-pattern matcher. `None` when no secrets were
@@ -44,16 +49,45 @@ impl Redactor {
     /// Build a redactor from the run's `secrets.*` namespace. Duplicate
     /// values collapse to one entry; empty values are dropped because a
     /// zero-width match would corrupt every position in the haystack.
+    /// Every retained secret also contributes its base64 and hex
+    /// encodings to the pattern set.
     #[must_use]
     pub fn new(secrets: &BTreeMap<String, String>) -> Self {
-        let mut values: Vec<String> = secrets
+        let raw: Vec<String> = secrets
             .values()
             .filter(|v| !v.is_empty())
             .cloned()
             .collect();
-        values.sort();
-        values.dedup();
-        Self::from_values(values)
+        Self::from_values(Self::expand_encodings(raw))
+    }
+
+    /// Expand each raw secret into its literal form plus base64
+    /// (standard and URL-safe-no-pad) and lowercase-hex encodings, then
+    /// sort and dedup so the automaton sees each unique pattern once.
+    fn expand_encodings(raw: Vec<String>) -> Vec<String> {
+        let mut patterns: Vec<String> = Vec::with_capacity(raw.len() * 4);
+        for v in raw {
+            let bytes = v.as_bytes();
+            let b64_standard = STANDARD.encode(bytes);
+            let b64_url = URL_SAFE_NO_PAD.encode(bytes);
+            let hex_val = hex::encode(bytes);
+            patterns.push(v);
+            // Encodings of an empty input produce empty strings; the
+            // earlier non-empty filter on `raw` makes this unreachable
+            // for real input, but the guard keeps the contract local.
+            if !b64_standard.is_empty() {
+                patterns.push(b64_standard);
+            }
+            if !b64_url.is_empty() {
+                patterns.push(b64_url);
+            }
+            if !hex_val.is_empty() {
+                patterns.push(hex_val);
+            }
+        }
+        patterns.sort();
+        patterns.dedup();
+        patterns
     }
 
     /// Compile an `AhoCorasick` automaton over `values`. Pulled out so
@@ -285,5 +319,45 @@ mod tests {
         assert_eq!(out["list"][0], json!("***"));
         assert_eq!(out["list"][1], json!(42));
         assert_eq!(out["list"][2], json!(true));
+    }
+
+    #[test]
+    fn redactor_literal_still_redacted() {
+        // Sanity: registering encoding-aware patterns must not regress the
+        // literal-secret path. `"hunter2"` itself has to stay matchable
+        // alongside its base64/hex forms.
+        let r = redactor_with(&[("k", "hunter2")]);
+        let out = r.redact("password=hunter2 done").into_owned();
+        assert_eq!(out, "password=*** done");
+    }
+
+    #[test]
+    fn redactor_redacts_base64_standard_encoded_secret() {
+        // Standard base64 (`+` / `/` alphabet, `=` padding) is the form
+        // most LLMs reach for when asked to encode a string. `"hunter2"`
+        // encodes to `aHVudGVyMg==` and must collapse to the marker.
+        let r = redactor_with(&[("k", "hunter2")]);
+        let out = r.redact("leak: aHVudGVyMg== here").into_owned();
+        assert_eq!(out, "leak: *** here");
+    }
+
+    #[test]
+    fn redactor_redacts_base64_url_safe_encoded_secret() {
+        // URL-safe-no-pad is the form base64 takes inside JWTs and any
+        // "URL-friendly" exfiltration channel. `"hunter2"` encodes to
+        // `aHVudGVyMg` (no `=` padding) and must also collapse.
+        let r = redactor_with(&[("k", "hunter2")]);
+        let out = r.redact("token=aHVudGVyMg next").into_owned();
+        assert_eq!(out, "token=*** next");
+    }
+
+    #[test]
+    fn redactor_redacts_hex_encoded_secret() {
+        // Lowercase hex is the third common bypass vector, especially in
+        // logs and CTF-style payloads. `"hunter2"` encodes to
+        // `68756e74657232` and must collapse to the marker.
+        let r = redactor_with(&[("k", "hunter2")]);
+        let out = r.redact("hex: 68756e74657232 end").into_owned();
+        assert_eq!(out, "hex: *** end");
     }
 }

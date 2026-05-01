@@ -242,9 +242,9 @@ mod tests {
         );
 
         let mut with_history = base_req.clone();
-        with_history.messages = vec![OrnoChatMessage::User {
+        with_history.messages = Arc::new(vec![OrnoChatMessage::User {
             content: "previous turn".into(),
-        }];
+        }]);
 
         assert_ne!(
             tape_key(&base_req),

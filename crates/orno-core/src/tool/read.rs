@@ -46,6 +46,11 @@ impl ToolHandler for ReadHandler {
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }
+
+    fn requires_jail(&self) -> bool {
+        true
+    }
+
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let ReadArgs { path } =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
@@ -56,7 +61,13 @@ impl ToolHandler for ReadHandler {
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_path(root, &path)?
         } else {
-            PathBuf::from(&path)
+            // BS1: empty roots means no jail boundary — refuse rather than
+            // allowing unrestricted host filesystem access.
+            return Err(ToolError::Denied {
+                reason: "Read tool requires a non-empty `roots` list; \
+                         no jail boundary is configured for this agent"
+                    .to_string(),
+            });
         };
 
         let metadata = std::fs::metadata(&resolved).map_err(|e| ToolError::Invocation {
@@ -96,19 +107,19 @@ impl ToolHandler for ReadHandler {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Write;
 
     #[tokio::test]
     async fn reads_existing_file() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("file.txt");
         let contents = "line one\nline two\n";
-        tmp.write_all(contents.as_bytes()).unwrap();
-        tmp.flush().unwrap();
+        std::fs::write(&path, contents).unwrap();
 
+        let roots = vec![tmp.path().to_path_buf()];
         let handler = ReadHandler;
-        let args = json!({ "path": tmp.path().to_str().unwrap() });
+        let args = json!({ "path": path.to_str().unwrap() });
         let out = handler
-            .invoke(ToolInvocation::for_test("call-1"), args)
+            .invoke(ToolInvocation::for_test_with_roots("call-1", &roots), args)
             .await
             .unwrap();
         assert_eq!(out, contents);
@@ -162,10 +173,13 @@ mod tests {
 
     #[tokio::test]
     async fn nonexistent_file_returns_invocation_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("does-not-exist.txt");
+        let roots = vec![tmp.path().to_path_buf()];
         let handler = ReadHandler;
-        let args = json!({ "path": "/nonexistent/path/that/should/not/exist/orno-read-test" });
+        let args = json!({ "path": path.to_str().unwrap() });
         let err = handler
-            .invoke(ToolInvocation::for_test("call-1"), args)
+            .invoke(ToolInvocation::for_test_with_roots("call-1", &roots), args)
             .await
             .unwrap_err();
         match err {

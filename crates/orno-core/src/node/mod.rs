@@ -74,6 +74,11 @@ pub struct ShellNodeRequest {
     /// closed stdin (`Stdio::null()`). See `ShellNode::stdin`.
     #[serde(default)]
     pub stdin: Option<String>,
+    /// Environment variable overrides applied after the executor
+    /// clears the inherited env and restores its safe allowlist.
+    /// See `ShellNode::env` for the security rationale.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +158,7 @@ pub fn render_request(
                 command,
                 args,
                 stdin,
+                env: n.env.clone(),
             }))
         },
     }
@@ -204,6 +210,7 @@ mod tests {
             command: "true".into(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         });
         assert_eq!(kind_str(&agent), "agent");
         assert_eq!(kind_str(&shell), "shell");
@@ -266,6 +273,7 @@ mod tests {
             command: "echo".into(),
             args: vec!["hi".into(), "there".into()],
             stdin: None,
+            env: BTreeMap::new(),
         });
         let tmpl = TemplateEngine::new();
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
@@ -275,5 +283,26 @@ mod tests {
         };
         assert_eq!(req.command, "echo");
         assert_eq!(req.args, vec!["hi".to_string(), "there".to_string()]);
+    }
+
+    #[test]
+    fn render_request_passes_shell_env_through() {
+        let agents: BTreeMap<String, AgentConfig> = BTreeMap::new();
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        env.insert("BAZ".to_string(), "qux".to_string());
+        let kind = NodeKind::Shell(ShellNode {
+            command: "true".into(),
+            args: Vec::new(),
+            stdin: None,
+            env: env.clone(),
+        });
+        let tmpl = TemplateEngine::new();
+        let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+
+        let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
+            panic!("expected NodeRequest::Shell");
+        };
+        assert_eq!(req.env, env);
     }
 }

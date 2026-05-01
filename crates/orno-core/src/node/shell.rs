@@ -40,6 +40,11 @@ pub const DEFAULT_MAX_NODE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 /// waiting for the reader.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 
+/// Allowlist of environment variable names propagated from the orno
+/// process into a shell node child. Everything else is stripped by
+/// `env_clear()` to prevent API keys and MCP bearer tokens from leaking.
+const SAFE_ENV_VARS: &[&str] = &["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "TERM"];
+
 #[derive(Clone)]
 pub struct ShellExecutor {
     /// Per-stream capture cap. Shared with the engine's
@@ -101,6 +106,7 @@ impl NodeExecutor for ShellExecutor {
             command,
             args,
             stdin,
+            env,
         }) = req
         else {
             return Err(NodeError::Execution {
@@ -123,6 +129,24 @@ impl NodeExecutor for ShellExecutor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Defense against secret leakage: a child inheriting the orno
+        // process's full environment can see API keys, MCP bearer
+        // tokens, and any other credential the runner pulled in. Clear
+        // it, restore a small allowlist of variables a generic shell
+        // node legitimately needs (PATH for binaries, HOME / USER for
+        // tools that read them, locale and TERM for output), then
+        // apply per-node overrides on top so a node can shadow any of
+        // those values without being exposed to the rest.
+        cmd.env_clear();
+        for name in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(name) {
+                cmd.env(name, val);
+            }
+        }
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
 
         if stdin.is_some() {
             cmd.stdin(Stdio::piped());
@@ -377,9 +401,33 @@ fn signal_from_status(_status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// A node executor that refuses every `kind: shell` node during `orno
+/// replay`. Shell side-effects — subprocess spawning, filesystem writes,
+/// network I/O — are not captured in a record bundle, so replaying them
+/// live would break the bounded-non-determinism guarantee. Registering
+/// this executor as "shell" in `commands::replay` ensures a clear
+/// `NodeError::ReplayRefused` rather than silently running live
+/// subprocesses against the host.
+#[derive(Debug, Clone, Default)]
+pub struct DenyShellExecutor;
+
+#[async_trait]
+impl NodeExecutor for DenyShellExecutor {
+    async fn execute(
+        &self,
+        _run_id: &str,
+        id: &str,
+        _req: NodeRequest,
+    ) -> Result<NodeResponse, NodeError> {
+        Err(NodeError::ReplayRefused { id: id.to_string() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
 
     use crate::events::InMemorySink;
     use crate::pipeline::{AgentPolicy, OnParseError};
@@ -409,6 +457,7 @@ mod tests {
             command: "echo".to_string(),
             args: vec!["hi".to_string()],
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "test_node", req).await.unwrap();
@@ -432,6 +481,7 @@ mod tests {
             command: "false".to_string(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec
@@ -484,6 +534,7 @@ mod tests {
             command: "definitely-not-a-real-program-xyz-12345".to_string(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let err = exec
@@ -507,6 +558,7 @@ mod tests {
             command: "cat".to_string(),
             args: Vec::new(),
             stdin: Some("hello over stdin\n".to_string()),
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "cat_node", req).await.unwrap();
@@ -526,6 +578,7 @@ mod tests {
             command: "cat".to_string(),
             args: Vec::new(),
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "cat_node", req).await.unwrap();
@@ -547,6 +600,7 @@ mod tests {
             command: "cat".to_string(),
             args: Vec::new(),
             stdin: Some(payload.clone()),
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "big", req).await.unwrap();
@@ -571,6 +625,7 @@ mod tests {
             command: "head".to_string(),
             args: vec!["-c".to_string(), "4".to_string()],
             stdin: Some("A".repeat(256 * 1024)),
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "head_node", req).await.unwrap();
@@ -598,6 +653,7 @@ mod tests {
             command: "sh".to_string(),
             args: vec!["-c".to_string(), "yes A | head -c 65536".to_string()],
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "noisy", req).await.unwrap();
@@ -653,6 +709,7 @@ mod tests {
                 "yes O | head -c 32768; yes E | head -c 32768 1>&2".to_string(),
             ],
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "both", req).await.unwrap();
@@ -686,6 +743,7 @@ mod tests {
             command: "echo".to_string(),
             args: vec!["small payload".to_string()],
             stdin: None,
+            env: BTreeMap::new(),
         });
 
         let resp = exec.execute("run_test", "small", req).await.unwrap();
@@ -696,6 +754,34 @@ mod tests {
             .iter()
             .any(|e| matches!(e.event, Event::NodeOutputTruncated { .. }));
         assert!(!any_trunc, "no truncation event for under-cap output");
+    }
+
+    #[tokio::test]
+    async fn deny_shell_executor_returns_replay_refused() {
+        // Replay-time contract: every `kind: shell` node must surface
+        // `NodeError::ReplayRefused` carrying the original node id, not
+        // silently spawn a real subprocess against the host. The id round
+        // trips so a downstream `Event::NodeFinished` carrying the failure
+        // can pinpoint which node was refused.
+        let exec = DenyShellExecutor;
+        let req = NodeRequest::Shell(ShellNodeRequest {
+            command: "echo".to_string(),
+            args: vec!["does not matter".to_string()],
+            stdin: None,
+            env: BTreeMap::new(),
+        });
+
+        let err = exec
+            .execute("run_test", "shell_node", req)
+            .await
+            .expect_err("DenyShellExecutor must refuse shell nodes during replay");
+
+        match err {
+            NodeError::ReplayRefused { id } => {
+                assert_eq!(id, "shell_node", "ReplayRefused must echo the node id");
+            },
+            other => panic!("expected NodeError::ReplayRefused, got {other:?}"),
+        }
     }
 
     #[tokio::test]

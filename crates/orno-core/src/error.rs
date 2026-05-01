@@ -82,6 +82,13 @@ pub enum NodeError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// Raised by [`crate::node::shell::DenyShellExecutor`] when `orno
+    /// replay` encounters a `kind: shell` node. Shell side-effects
+    /// cannot be replayed from a bundle; only LLM and tool interactions
+    /// are recorded.
+    #[error("node `{id}` refused during replay: shell nodes cannot be replayed")]
+    ReplayRefused { id: String },
 }
 
 /// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Carries

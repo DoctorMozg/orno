@@ -29,7 +29,7 @@ use orno_core::llm::recording::TapeEntry;
 use orno_core::llm::{LlmTransport, OrnoChatTool, ReplayTransport, read_bundle};
 use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
-use orno_core::node::shell::ShellExecutor;
+use orno_core::node::shell::DenyShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
@@ -214,13 +214,11 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     let agent: Arc<dyn Agent> = loop_agent;
     let engine_config = EngineConfig::default();
     let mut registry = NodeRegistry::new();
-    registry.register(
-        "shell",
-        Arc::new(ShellExecutor::with_config(
-            sink.clone(),
-            engine_config.max_node_output_bytes,
-        )),
-    );
+    // Shell nodes are never replayed: their side-effects (filesystem,
+    // network, subprocess spawning) were not captured in the bundle.
+    // DenyShellExecutor returns NodeError::ReplayRefused so the operator
+    // gets a clear failure rather than silently running live subprocesses.
+    registry.register("shell", Arc::new(DenyShellExecutor));
     registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
     let registry = Arc::new(registry);
     let templates = Arc::new(TemplateEngine::new());
@@ -399,7 +397,7 @@ mod tests {
                 system: None,
                 temperature: None,
                 max_tokens: None,
-                messages: vec![],
+                messages: Arc::new(vec![]),
                 tools,
             },
             outcome: TapeOutcome::Ok {

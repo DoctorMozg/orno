@@ -124,6 +124,13 @@ impl ToolHandler for BashHandler {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // Make the child its own process group leader so any descendants
+        // (e.g. `sh -c 'foo | bar'`) share that group. `kill_on_drop`
+        // signals only the direct child; without a fresh group, grandchildren
+        // would survive an aborted invocation. Safe API — no `unsafe` needed.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         // Drop every host environment variable, then re-export only the
         // entries on the safe allowlist. Without this the spawned shell
         // would inherit provider API keys (`OPENAI_API_KEY`, etc.) and
@@ -244,13 +251,20 @@ async fn run_with_capped_pipes(mut cmd: Command) -> Result<RunOutcome, ToolError
 
     let stdout_fut = read_capped(stdout_pipe, MAX_OUTPUT_BYTES_PER_STREAM);
     let stderr_fut = read_capped(stderr_pipe, MAX_OUTPUT_BYTES_PER_STREAM);
-    let ((stdout_buf, stdout_total), (stderr_buf, stderr_total)) =
-        tokio::try_join!(stdout_fut, stderr_fut).map_err(|e| ToolError::Invocation {
-            name: "Bash".to_string(),
-            source: Box::new(e),
-        })?;
+    // drain both concurrently to EOF — `join!` ensures a failure on one
+    // pipe does not cancel the other mid-drain, which would leave the
+    // child blocked on a full PIPE buffer.
+    let (stdout_result, stderr_result) = tokio::join!(stdout_fut, stderr_fut);
 
     let status = child.wait().await.map_err(|e| ToolError::Invocation {
+        name: "Bash".to_string(),
+        source: Box::new(e),
+    })?;
+    let (stdout_buf, stdout_total) = stdout_result.map_err(|e| ToolError::Invocation {
+        name: "Bash".to_string(),
+        source: Box::new(e),
+    })?;
+    let (stderr_buf, stderr_total) = stderr_result.map_err(|e| ToolError::Invocation {
         name: "Bash".to_string(),
         source: Box::new(e),
     })?;
@@ -557,6 +571,81 @@ mod tests {
         assert!(
             out.contains(expected),
             "output should contain root path {expected}: {out}",
+        );
+    }
+
+    /// F16 regression: switching from `try_join!` to `join!` must still
+    /// drain both pipes to EOF when the child writes to stdout *and*
+    /// stderr in the same invocation. Both payloads must reach the
+    /// captured output verbatim.
+    #[tokio::test]
+    async fn bash_join_drains_both_pipes_on_eof() {
+        let handler = BashHandler;
+        let out = handler
+            .invoke(
+                ToolInvocation::for_test("call-1"),
+                json!({
+                    "command": "echo out_marker; echo err_marker 1>&2",
+                }),
+            )
+            .await
+            .expect("dual-stream write should succeed");
+
+        assert!(out.contains("exit_code: 0"), "unexpected output: {out}");
+        assert!(
+            out.contains("out_marker"),
+            "stdout payload missing from captured output: {out}",
+        );
+        assert!(
+            out.contains("err_marker"),
+            "stderr payload missing from captured output: {out}",
+        );
+    }
+
+    /// F6 regression: on Unix the child must run in its own process
+    /// group. The handler spawns `/bin/sh -c <command>`, so `$$` inside
+    /// the command is the *direct* child's PID. With `process_group(0)`
+    /// set, that child became its own group leader, so its PGID equals
+    /// its PID. Without the fix, the child would inherit the test
+    /// runner's process group and the two would differ.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_process_group_is_set() {
+        let handler = BashHandler;
+        let out = handler
+            .invoke(
+                ToolInvocation::for_test("call-1"),
+                json!({
+                    "command": "echo $$; ps -o pgid= -p $$",
+                }),
+            )
+            .await
+            .expect("pgid query should succeed");
+
+        assert!(out.contains("exit_code: 0"), "unexpected output: {out}");
+
+        // Pull the two whitespace-separated numbers out of stdout: the
+        // first is the child shell's PID (`$$`), the second is the PGID
+        // reported by `ps`. The handler's output format places stdout
+        // after the `stdout:\n` line and before `stderr:`.
+        let stdout_section = out
+            .split("stdout:\n")
+            .nth(1)
+            .and_then(|s| s.split("\nstderr:").next())
+            .expect("stdout section present");
+        let nums: Vec<u32> = stdout_section
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect();
+        assert_eq!(
+            nums.len(),
+            2,
+            "expected two numeric tokens (PID, PGID) in {stdout_section:?}",
+        );
+        assert_eq!(
+            nums[0], nums[1],
+            "child must be its own process group leader: PID={} PGID={}",
+            nums[0], nums[1],
         );
     }
 }

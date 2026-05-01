@@ -836,6 +836,87 @@ async fn mutations_and_network_tool_denied_when_network_false() {
 }
 
 #[tokio::test]
+async fn bash_with_allowed_domains_is_denied_hard() {
+    // F20 contract: `Bash` opens arbitrary network sockets that orno
+    // cannot intercept, so an `allowed_domains` allowlist cannot be
+    // honored on a Bash invocation. Silently letting the call through
+    // would give a false sense of egress confinement; instead the gate
+    // refuses the call up front. Denial is non-terminal — the message
+    // feeds back as a `ToolResult` and the loop continues — but the
+    // refusal must explicitly name `allowed_domains` so the operator
+    // can correct the misconfiguration.
+    use crate::tool::BashHandler;
+
+    let sink = Arc::new(InMemorySink::new());
+    let handler: Arc<dyn crate::tool::ToolHandler> = Arc::new(BashHandler);
+
+    let transport = ScriptedTransport::new(vec![
+        ScriptedTransport::tool_call_response(
+            "c1",
+            "Bash",
+            serde_json::json!({ "command": "echo hello" }),
+        ),
+        ScriptedTransport::text_response("acknowledging Bash denial"),
+    ]);
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(transport),
+        sink: sink.clone(),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![handler],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    // Both Mutations and Network must be ON so the F20 gate is the only
+    // refusal in play — otherwise the prior `allow_mutations` /
+    // `allow_network` gates would mask the allowed_domains denial.
+    req.policy.allow_mutations = true;
+    req.policy.allow_network = true;
+    req.policy.allowed_domains = vec!["example.com".into()];
+    req.allowed_tools = vec!["Bash".into()];
+
+    let out = agent
+        .run("run_test", "n", req)
+        .await
+        .expect("Bash + allowed_domains denial must feed back, not terminate");
+
+    assert!(
+        out.content.contains("acknowledging Bash denial"),
+        "loop must continue past the denial: {:?}",
+        out.content,
+    );
+
+    let events = sink.snapshot();
+    let recorded = events
+        .iter()
+        .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
+        .expect("ToolCallRecorded must fire for a denied Bash call");
+    if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
+        assert!(
+            output_excerpt.contains("cannot enforce allowed_domains"),
+            "feed-back string must name the F20 refusal: {output_excerpt:?}",
+        );
+    }
+
+    let denied = events
+        .iter()
+        .find(|e| matches!(e.event, Event::ToolDenied { .. }))
+        .expect("ToolDenied must fire for the F20 refusal");
+    if let Event::ToolDenied {
+        tool_name, reason, ..
+    } = &denied.event
+    {
+        assert_eq!(tool_name, "Bash");
+        assert!(
+            reason.contains("cannot enforce allowed_domains"),
+            "ToolDenied.reason must explain the F20 refusal: {reason:?}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn mutations_and_network_tool_allowed_when_both_true() {
     // Positive control: when both underlying flags are on, the combined
     // effect must pass through to the handler and produce a real tool
