@@ -149,6 +149,14 @@ pub enum BundleError {
         /// Digest recomputed from the body lines during `read_bundle`.
         actual: String,
     },
+    /// Content was found after the integrity trailer, indicating potential tampering.
+    #[error(
+        "bundle contains {line_count} line(s) after the integrity trailer — possible tampering"
+    )]
+    ExtraContentAfterTrailer {
+        /// Number of extra lines found.
+        line_count: usize,
+    },
 }
 
 /// A `Write` wrapper that accumulates a BLAKE3 digest over every byte
@@ -413,6 +421,10 @@ fn scrub_yaml_with_tokens(pipeline_yaml: &str, tokens: &[String]) -> String {
 /// but its BLAKE3 digest does not match the digest recomputed over the
 /// body lines. A missing trailer emits a `tracing::warn!` but is not an
 /// error so pre-BS4 bundles still replay.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential parse-hash-dispatch loop with integrity verification and post-trailer detection"
+)]
 pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -422,10 +434,21 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
     let mut tool_entries: Vec<ToolTapeEntry> = Vec::new();
     let mut hasher = Blake3Hasher::new();
     let mut trailer_seen = false;
+    let mut extra_after_trailer: usize = 0;
 
     for (idx, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
+            continue;
+        }
+        // Guard against post-trailer tampering: any non-empty line that
+        // arrives after the integrity trailer is outside the hashed body
+        // and must not be parsed or hashed. Counting (rather than breaking)
+        // surfaces the violation as a typed error instead of silently
+        // dropping the bytes, and placing the check before the JSON parse
+        // ensures garbage payloads do not masquerade as `ParseError`.
+        if trailer_seen {
+            extra_after_trailer += 1;
             continue;
         }
         let entry: BundleEntry =
@@ -469,12 +492,14 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
                     });
                 }
                 trailer_seen = true;
-                // Stop reading: lines after the trailer are not
-                // covered by the integrity hash and must not be
-                // processed (Finding 1 — post-trailer tampering).
-                break;
             },
         }
+    }
+
+    if extra_after_trailer > 0 {
+        return Err(BundleError::ExtraContentAfterTrailer {
+            line_count: extra_after_trailer,
+        });
     }
 
     if !trailer_seen {
@@ -890,5 +915,64 @@ nodes:
         let read = read_bundle(out.path())
             .expect("missing trailer must warn rather than error so pre-BS4 bundles still replay");
         assert_eq!(read.pipeline_yaml, yaml_body);
+    }
+
+    #[test]
+    fn read_bundle_rejects_post_trailer_content() {
+        // Anti-tamper guarantee: lines appearing after a valid integrity
+        // trailer are outside the hashed body and must not be silently
+        // dropped. An attacker who appends a structurally valid NDJSON
+        // entry must surface as `ExtraContentAfterTrailer`, not as the
+        // misleading downstream errors that arise from dropping the bytes.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let llm = vec![sample_tape_entry("alpha")];
+        let llm_tape = write_tape(&llm);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, Some(llm_tape.path()), None, out.path()).expect("bundle write");
+
+        // Append a structurally valid bundle line after the trailer. The
+        // appended bytes are not covered by the trailer's BLAKE3 digest,
+        // so a permissive reader would silently process them.
+        let appended = sample_tape_entry("appended");
+        let extra_line =
+            serde_json::to_string(&BundleEntry::LlmEntry(appended)).expect("serialize entry");
+        let mut existing = std::fs::read_to_string(out.path()).expect("read raw bundle");
+        existing.push_str(&extra_line);
+        existing.push('\n');
+        std::fs::write(out.path(), existing).expect("rewrite bundle with post-trailer line");
+
+        let err = read_bundle(out.path()).expect_err("post-trailer content must be rejected");
+        match err {
+            BundleError::ExtraContentAfterTrailer { line_count } => {
+                assert_eq!(line_count, 1, "exactly one line was appended");
+            },
+            other => panic!("expected ExtraContentAfterTrailer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_bundle_rejects_garbage_after_trailer() {
+        // The post-trailer guard must fire before the JSON parse so
+        // garbage bytes after the trailer surface as
+        // `ExtraContentAfterTrailer`, not as `ParseError`. Without this
+        // ordering, an attacker appending non-JSON would get a misleading
+        // parse error message that hides the integrity violation.
+        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+        let out = tempfile::NamedTempFile::new().unwrap();
+        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+
+        let mut existing = std::fs::read_to_string(out.path()).expect("read raw bundle");
+        existing.push_str("not valid json !!!!\n");
+        std::fs::write(out.path(), existing).expect("rewrite bundle with garbage trailer line");
+
+        let err = read_bundle(out.path()).expect_err("garbage after trailer must be rejected");
+        match err {
+            BundleError::ExtraContentAfterTrailer { line_count } => {
+                assert_eq!(line_count, 1);
+            },
+            other => panic!(
+                "expected ExtraContentAfterTrailer (guard must fire before JSON parse), got {other:?}",
+            ),
+        }
     }
 }

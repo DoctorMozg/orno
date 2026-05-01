@@ -638,7 +638,7 @@ async fn non_http_scheme_denied() {
         })
         .expect("ToolDenied must fire for non-HTTP scheme");
     assert!(
-        reason.contains("file"),
+        reason.contains("`file`"),
         "reason should name the disallowed scheme: {reason:?}",
     );
 }
@@ -836,15 +836,15 @@ async fn mutations_and_network_tool_denied_when_network_false() {
 }
 
 #[tokio::test]
-async fn bash_with_allowed_domains_is_denied_hard() {
-    // F20 contract: `Bash` opens arbitrary network sockets that orno
-    // cannot intercept, so an `allowed_domains` allowlist cannot be
-    // honored on a Bash invocation. Silently letting the call through
-    // would give a false sense of egress confinement; instead the gate
-    // refuses the call up front. Denial is non-terminal — the message
-    // feeds back as a `ToolResult` and the loop continues — but the
-    // refusal must explicitly name `allowed_domains` so the operator
-    // can correct the misconfiguration.
+async fn bash_with_allowed_domains_and_allow_network_is_permitted() {
+    // `allowed_domains` is an HTTP-tool domain filter — it gates URL-bearing
+    // `Network` effect tools, not the broader `MutationsAndNetwork` class
+    // that covers Bash. A user who configures `allowed_domains` for
+    // `WebFetch` while also enabling Bash must still be able to invoke
+    // Bash; the `allow_network` flag is the kill-switch for shell network
+    // access, not the domain allowlist. Verify Bash passes the gate when
+    // both `allow_mutations` and `allow_network` are on, even with a
+    // non-empty `allowed_domains`.
     use crate::tool::BashHandler;
 
     let sink = Arc::new(InMemorySink::new());
@@ -856,7 +856,7 @@ async fn bash_with_allowed_domains_is_denied_hard() {
             "Bash",
             serde_json::json!({ "command": "echo hello" }),
         ),
-        ScriptedTransport::text_response("acknowledging Bash denial"),
+        ScriptedTransport::text_response("done"),
     ]);
 
     let agent = LoopAgent::new(LoopAgentConfig {
@@ -869,9 +869,6 @@ async fn bash_with_allowed_domains_is_denied_hard() {
 
     let mut req = request();
     req.policy.max_iterations = 3;
-    // Both Mutations and Network must be ON so the F20 gate is the only
-    // refusal in play — otherwise the prior `allow_mutations` /
-    // `allow_network` gates would mask the allowed_domains denial.
     req.policy.allow_mutations = true;
     req.policy.allow_network = true;
     req.policy.allowed_domains = vec!["example.com".into()];
@@ -880,40 +877,23 @@ async fn bash_with_allowed_domains_is_denied_hard() {
     let out = agent
         .run("run_test", "n", req)
         .await
-        .expect("Bash + allowed_domains denial must feed back, not terminate");
+        .expect("Bash must be permitted when allow_network=true even if allowed_domains is set");
 
     assert!(
-        out.content.contains("acknowledging Bash denial"),
-        "loop must continue past the denial: {:?}",
+        out.content.contains("done"),
+        "loop must terminate on the final text response: {:?}",
         out.content,
     );
 
     let events = sink.snapshot();
-    let recorded = events
-        .iter()
-        .find(|e| matches!(e.event, Event::ToolCallRecorded { .. }))
-        .expect("ToolCallRecorded must fire for a denied Bash call");
-    if let Event::ToolCallRecorded { output_excerpt, .. } = &recorded.event {
-        assert!(
-            output_excerpt.contains("cannot enforce allowed_domains"),
-            "feed-back string must name the F20 refusal: {output_excerpt:?}",
-        );
-    }
-
-    let denied = events
-        .iter()
-        .find(|e| matches!(e.event, Event::ToolDenied { .. }))
-        .expect("ToolDenied must fire for the F20 refusal");
-    if let Event::ToolDenied {
-        tool_name, reason, ..
-    } = &denied.event
-    {
-        assert_eq!(tool_name, "Bash");
-        assert!(
-            reason.contains("cannot enforce allowed_domains"),
-            "ToolDenied.reason must explain the F20 refusal: {reason:?}",
-        );
-    }
+    let denied = events.iter().find_map(|e| match &e.event {
+        Event::ToolDenied { reason, .. } => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(
+        denied.is_none(),
+        "ToolDenied must NOT fire for Bash when allow_network=true: {denied:?}",
+    );
 }
 
 #[tokio::test]

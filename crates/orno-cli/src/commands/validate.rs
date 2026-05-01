@@ -147,7 +147,7 @@ fn validate_agent(
 
 /// Reject MCP server names where one is an underscore-prefixed extension of
 /// another. At replay time, `mcp.<server>.<tool>` names are flattened by
-/// replacing dots with underscores (see `replay::yaml_to_wire_name`); a pair
+/// replacing dots with underscores (see `orno_core::agent::loop_agent::wire_name_from_yaml`); a pair
 /// like `foo` and `foo_bar` produces wire names that cannot be unambiguously
 /// routed back to a single server.
 fn validate_mcp_server_names(

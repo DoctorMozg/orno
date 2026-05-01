@@ -44,8 +44,12 @@ pub struct LlmRequest {
     #[serde(default)]
     pub messages: Arc<Vec<OrnoChatMessage>>,
     /// Tools the model may call on this request. Empty means no tool use.
+    /// `Arc`-wrapped so the agent loop can hand the same definitions
+    /// to every iteration's request without re-cloning the underlying
+    /// `Vec`. Serializes identically to `Vec<OrnoChatTool>` thanks to
+    /// serde's blanket `Arc<T>` impl, so the wire format is unchanged.
     #[serde(default)]
-    pub tools: Vec<OrnoChatTool>,
+    pub tools: Arc<Vec<OrnoChatTool>>,
 }
 
 impl LlmRequest {
@@ -72,8 +76,17 @@ impl LlmRequest {
             temperature,
             max_tokens,
             messages: Arc::new(Vec::new()),
-            tools: Vec::new(),
+            tools: Arc::new(Vec::new()),
         }
+    }
+
+    /// Replace the request's tool definitions. The vector is wrapped in
+    /// an `Arc` internally so the same definitions can be cheaply shared
+    /// across iterations of an agent loop.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<OrnoChatTool>) -> Self {
+        self.tools = Arc::new(tools);
+        self
     }
 }
 
@@ -156,4 +169,111 @@ pub struct Usage {
 #[async_trait]
 pub trait LlmTransport: Send + Sync {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_prompt_initializes_tools_to_empty_arc_vec() {
+        // Default constructor invariant: a `from_prompt` request carries
+        // an empty `Arc<Vec<OrnoChatTool>>`, never a `None` placeholder
+        // or a stack-borrowed slice. Subsequent `Arc::clone(&tools)` in
+        // the agent loop relies on this shape to cheaply hand the same
+        // (empty) definitions to every iteration.
+        let req = LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hi".into(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            req.tools.is_empty(),
+            "from_prompt must yield an empty tools list",
+        );
+        // A second clone of the request must share the same underlying
+        // allocation — proves the field is genuinely `Arc<Vec<...>>` and
+        // not, say, an inner `Vec` rebuilt on each clone.
+        let cloned = req.clone();
+        assert!(
+            Arc::ptr_eq(&req.tools, &cloned.tools),
+            "from_prompt's empty tools Arc must be shared by Clone",
+        );
+    }
+
+    #[test]
+    fn with_tools_wraps_in_arc_and_replaces_existing() {
+        // Audit fix: `LlmRequest.tools` was promoted to `Arc<Vec<...>>`
+        // so the agent loop hands the same definitions to every
+        // iteration without re-cloning the schema vector. `with_tools`
+        // takes an owned `Vec` and must wrap it in a fresh `Arc`,
+        // overwriting any prior tools.
+        let tool = OrnoChatTool {
+            name: "Bash".into(),
+            description: "run a shell command".into(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let req = LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hi".into(),
+            None,
+            None,
+            None,
+        )
+        .with_tools(vec![tool.clone()]);
+
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "Bash");
+
+        // Replacement semantics: a second call must drop the prior
+        // contents, not append. Without this, a caller that re-uses an
+        // `LlmRequest` builder would see stale tool defs leak into the
+        // next request.
+        let replaced = req.with_tools(vec![]);
+        assert!(
+            replaced.tools.is_empty(),
+            "with_tools must replace the existing list, not append",
+        );
+    }
+
+    #[test]
+    fn with_tools_arc_is_shared_across_clones() {
+        // The `Arc` shape is load-bearing for the agent loop's
+        // hot-path: every iteration clones the entire `LlmRequest` to
+        // hand it to the transport, and a deep `Vec` clone on each
+        // iteration would be O(n) over the schema list. `Arc::ptr_eq`
+        // proves the bytes are not duplicated on `Clone`.
+        let tools = vec![
+            OrnoChatTool {
+                name: "Bash".into(),
+                description: "run".into(),
+                schema: serde_json::json!({}),
+            },
+            OrnoChatTool {
+                name: "Read".into(),
+                description: "read".into(),
+                schema: serde_json::json!({}),
+            },
+        ];
+        let req = LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hi".into(),
+            None,
+            None,
+            None,
+        )
+        .with_tools(tools);
+
+        let cloned = req.clone();
+        assert!(
+            Arc::ptr_eq(&req.tools, &cloned.tools),
+            "Clone must share the tools allocation; otherwise every \
+             agent-loop iteration deep-clones the schema list",
+        );
+    }
 }
