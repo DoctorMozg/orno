@@ -476,3 +476,222 @@ async fn tool_output_under_cap_passes_through_unchanged() {
         .expect("second request must contain the tool-result message");
     assert_eq!(result_msg, "aaaaa");
 }
+
+#[tokio::test]
+async fn history_cap_evicts_multiple_messages_in_single_pass() {
+    // F11 regression: the previous eviction loop used `messages.remove(0)`
+    // inside a `while` that re-summed `messages.iter()` on every iteration —
+    // O(n^2) over the history depth. The fixed implementation runs in a
+    // single O(n) pass: track a running total, mark `evict` indices, then
+    // `drain(..evict)` once. This test proves the cap is still enforced
+    // correctly when many messages exceed it across many iterations, so a
+    // future regression to a re-sum loop would still be caught by behavior
+    // rather than only by performance benchmarks.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(200));
+
+    // Build five tool-call responses so the loop accumulates five
+    // ToolCalls/ToolResult pairs, then a final text answer terminating the
+    // loop. With a 50-byte cap and ~200-byte tool results, every request
+    // after the first must carry at most the two most recent messages.
+    let mut responses: Vec<LlmResponse> = (0..5)
+        .map(|i| LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+            tool_calls: vec![OrnoChatToolCall {
+                call_id: format!("c{i}"),
+                fn_name: "LongOutputTool".into(),
+                fn_arguments: serde_json::json!({}),
+            }],
+        })
+        .collect();
+    responses.push(final_text_response());
+
+    let transport = Arc::new(RecordingScriptedTransport::new(responses));
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 6;
+    req.policy.max_tool_calls = 5;
+    req.policy.max_message_history_bytes = Some(50);
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must complete despite tiny history cap");
+
+    let observed = transport.messages_seen();
+    assert_eq!(observed.len(), 6, "transport must observe six requests");
+    // From the second request onward the history is capped at two
+    // messages — anything more would mean the eviction loop terminated
+    // early and the cap is no longer being enforced.
+    for (i, msgs) in observed.iter().enumerate().skip(1) {
+        assert!(
+            msgs.len() <= 2,
+            "request {i} must have at most 2 messages under the tiny cap, got {}",
+            msgs.len(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_cap_keeps_at_least_two_messages() {
+    // The eviction loop must stop at two messages even when the total still
+    // exceeds the cap — the model needs at least one ToolCalls/ToolResult
+    // pair to make causal sense of the next turn. Setting the cap below any
+    // single message's byte cost forces the floor to engage.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(1_000));
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        long_tool_call_response("c1"),
+        final_text_response(),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_tool_calls = 1;
+    req.policy.max_message_history_bytes = Some(1);
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must not crash when the cap is smaller than any single message");
+
+    let observed = transport.messages_seen();
+    assert_eq!(
+        observed[1].len(),
+        2,
+        "second request must carry exactly two messages when the cap forces the minimum",
+    );
+}
+
+#[tokio::test]
+async fn token_budget_exhausted_before_iteration_does_not_call_transport() {
+    // F14 regression: when `used == max_total_tokens` at the start of an
+    // iteration, the loop must return `BudgetExceeded` WITHOUT making an
+    // LLM call. Before the fix, `(remaining > 0).then(...)` produced
+    // `max_tokens: None` for the next iteration's request — an uncapped
+    // (and billable) call that was only detected after the response.
+    let sink = Arc::new(InMemorySink::new());
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![LlmResponse {
+        content: String::new(),
+        finish_reason: Some("tool_calls".to_string()),
+        usage: Some(Usage {
+            prompt_tokens: 200,
+            completion_tokens: 200,
+            total_tokens: 400,
+        }),
+        tool_calls: vec![OrnoChatToolCall {
+            call_id: "c1".into(),
+            fn_name: "EchoTool".into(),
+            fn_arguments: serde_json::json!({}),
+        }],
+    }]));
+
+    let tool = Arc::new(EchoTool::new(ToolEffect::ReadOnly, "ok"));
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_total_tokens = 400;
+    req.policy.max_tool_calls = 5;
+    req.allowed_tools = vec!["EchoTool".into()];
+
+    let err = agent
+        .run("run_test", "n", req)
+        .await
+        .expect_err("budget exactly exhausted at iteration boundary must return BudgetExceeded");
+    assert!(
+        matches!(
+            err,
+            AgentError::BudgetExceeded {
+                kind: BudgetKind::Tokens
+            }
+        ),
+        "expected BudgetExceeded(Tokens), got {err:?}",
+    );
+    // Transport called exactly once. A second call would prove the
+    // pre-check is missing — that's the bypass the fix prevents.
+    assert_eq!(
+        transport.max_tokens_seen().len(),
+        1,
+        "transport must be called exactly once; a second call would be an uncapped billing bypass",
+    );
+}
+
+#[tokio::test]
+async fn token_counter_saturates_at_u64_max_instead_of_wrapping() {
+    // F15 regression: `AtomicU64::fetch_add` wraps on overflow. If the
+    // counter wraps from near-`u64::MAX` to near-zero, the post-response
+    // budget check `total_tokens > max_total_tokens` no longer fires
+    // because the addition silently rolled over. The fix uses
+    // `fetch_update` with `saturating_add`, so a runaway response saturates
+    // the counter at `u64::MAX` and the budget breach is reported on the
+    // same iteration.
+    let sink = Arc::new(InMemorySink::new());
+    // `Usage::total_tokens` is `u32`, so the largest single-response
+    // delta we can express is `u32::MAX`. That's enough to drive the
+    // saturating path because the post-add check reads the counter
+    // back via `Ordering::Relaxed` and compares against
+    // `max_total_tokens`.
+    let huge_usage = u32::MAX;
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![LlmResponse {
+        content: String::new(),
+        finish_reason: Some("stop".to_string()),
+        usage: Some(Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: huge_usage,
+        }),
+        tool_calls: Vec::new(),
+    }]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: Vec::new(),
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_total_tokens = u64::from(huge_usage) - 1;
+
+    let err = agent
+        .run("run_test", "n", req)
+        .await
+        .expect_err("massive usage must trip the budget");
+    assert!(
+        matches!(
+            err,
+            AgentError::BudgetExceeded {
+                kind: BudgetKind::Tokens
+            }
+        ),
+        "expected BudgetExceeded(Tokens), got {err:?}",
+    );
+}

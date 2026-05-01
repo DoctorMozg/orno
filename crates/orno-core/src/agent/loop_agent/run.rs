@@ -82,17 +82,27 @@ fn estimated_message_bytes(msg: &OrnoChatMessage) -> usize {
 /// below the cap, always keeping at least the two most recent messages
 /// so the model sees at least one request-response pair.
 fn enforce_message_history_cap(messages: &mut Vec<OrnoChatMessage>, cap: usize) {
-    let total: usize = messages.iter().map(estimated_message_bytes).sum();
+    let mut total: usize = messages.iter().map(estimated_message_bytes).sum();
     if total <= cap {
         return;
     }
-    // Evict from the front, keeping at least 2 entries.
-    while messages.len() > 2 {
-        let remaining: usize = messages.iter().map(estimated_message_bytes).sum();
-        if remaining <= cap {
+    // Single-pass O(n) eviction: maintain a running total by subtracting
+    // each evicted message's estimated bytes instead of re-summing the
+    // whole vector on every iteration. Defer the front shift to a single
+    // `drain(..evict)` call so the underlying memmove also runs once.
+    // Stop at len-2 so the model always sees at least one tool-call/result
+    // pair even when the cap is smaller than any single message.
+    let mut evict = 0usize;
+    while messages.len() - evict > 2 {
+        let msg_bytes = estimated_message_bytes(&messages[evict]);
+        total = total.saturating_sub(msg_bytes);
+        evict += 1;
+        if total <= cap {
             break;
         }
-        messages.remove(0);
+    }
+    if evict > 0 {
+        messages.drain(..evict);
     }
     // Emit the warning once per truncation event, after eviction, so
     // the log shows the post-truncation byte total.
@@ -257,7 +267,18 @@ impl Agent for LoopAgent {
             } else {
                 let used = token_counter.load(Ordering::Relaxed);
                 let remaining = req.policy.max_total_tokens.saturating_sub(used);
-                (remaining > 0).then(|| u32::try_from(remaining).unwrap_or(u32::MAX))
+                // Pre-check: token budget fully consumed. Returning
+                // `BudgetExceeded` before issuing the next LLM call
+                // prevents an uncapped (`max_tokens: None`) request from
+                // being billed and only being detected after the
+                // response — the breach happens at iteration boundaries
+                // too, not just inside a response that pushes us over.
+                if remaining == 0 {
+                    return Err(AgentError::BudgetExceeded {
+                        kind: BudgetKind::Tokens,
+                    });
+                }
+                Some(u32::try_from(remaining).unwrap_or(u32::MAX))
             };
 
             let llm_req = LlmRequest {
@@ -322,7 +343,18 @@ impl Agent for LoopAgent {
 
             if let Some(usage) = &response.usage {
                 let delta = u64::from(usage.total_tokens);
-                token_counter.fetch_add(delta, Ordering::Relaxed);
+                // Saturating add prevents `u64` wrap-around from
+                // bypassing the token-budget check below: a near-`u64::MAX`
+                // counter plus a large `delta` would otherwise wrap to
+                // near 0 and silently re-enable an exhausted budget.
+                // `fetch_update` retries on CAS failure but the closure
+                // always returns `Some`, so the update succeeds on the
+                // first try in this single-tasked loop.
+                token_counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        Some(old.saturating_add(delta))
+                    })
+                    .ok();
                 // Bump the parent's counter in lockstep so a parent
                 // loop's `policy.max_total_tokens` budget transitively
                 // covers child subagent token spend. The chain is
@@ -330,7 +362,11 @@ impl Agent for LoopAgent {
                 // grandparent through the parent's `parent_token_counter`
                 // hop on the next-up loop's iteration check.
                 if let Some(parent) = &req.parent_token_counter {
-                    parent.fetch_add(delta, Ordering::Relaxed);
+                    parent
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                            Some(old.saturating_add(delta))
+                        })
+                        .ok();
                 }
                 let total_tokens = token_counter.load(Ordering::Relaxed);
                 if req.policy.max_total_tokens > 0 && total_tokens > req.policy.max_total_tokens {

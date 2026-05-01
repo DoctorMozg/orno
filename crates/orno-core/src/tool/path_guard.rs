@@ -17,6 +17,19 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::ToolError;
 
+/// Resolve `.` components in `path` without touching the filesystem.
+/// `..` is NOT handled here — callers must reject `..` before calling.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {},
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Validate that `requested` resolves inside `root`. Returns the
 /// canonical absolute path on success; `ToolError::Denied` on rejection.
 ///
@@ -24,9 +37,12 @@ use crate::error::ToolError;
 /// - Reject any literal `..` component in `requested`.
 /// - Canonicalize `root` (which must exist).
 /// - For an existing `requested`, canonicalize it.
-/// - For a not-yet-existing `requested` (a `Write` target), canonicalize
-///   the parent and append the file name. The parent must already exist.
-/// - Require the canonical requested path to start with the canonical
+/// - For a not-yet-existing `requested` (a `Write` target), build the
+///   absolute path by joining the canonical root with the requested path
+///   (relative) or normalizing an absolute path. Intermediate parents
+///   are NOT required to exist — the handler creates them after the
+///   jail check succeeds.
+/// - Require the resolved requested path to start with the canonical
 ///   root path.
 pub(super) fn jail_path(root: &Path, requested: &str) -> Result<PathBuf, ToolError> {
     let req_path = Path::new(requested);
@@ -48,15 +64,30 @@ pub(super) fn jail_path(root: &Path, requested: &str) -> Result<PathBuf, ToolErr
             source: Box::new(e),
         })?
     } else {
-        let parent = req_path.parent().unwrap_or_else(|| Path::new("."));
-        let canon_parent = parent.canonicalize().map_err(|e| ToolError::Invocation {
-            name: "path_guard".to_string(),
-            source: Box::new(e),
-        })?;
-        let file_name = req_path.file_name().ok_or_else(|| ToolError::Denied {
-            reason: format!("path has no file-name component: {requested}"),
-        })?;
-        canon_parent.join(file_name)
+        // Path does not yet exist. Build the absolute path by joining the
+        // canonical root with the requested path (relative) or normalizing
+        // an absolute path — without requiring any intermediate directory to
+        // exist. `..` components were already rejected above.
+        if req_path.file_name().is_none() {
+            return Err(ToolError::Denied {
+                reason: format!("path has no file-name component: {requested}"),
+            });
+        }
+        let abs = if req_path.is_absolute() {
+            normalize_path(req_path)
+        } else {
+            normalize_path(&canon_root.join(req_path))
+        };
+        if !abs.starts_with(&canon_root) {
+            return Err(ToolError::Denied {
+                reason: format!(
+                    "path `{}` is outside the allowed root `{}`",
+                    abs.display(),
+                    canon_root.display(),
+                ),
+            });
+        }
+        abs
     };
 
     if !canon_req.starts_with(&canon_root) {
@@ -180,5 +211,46 @@ mod tests {
             },
             other => panic!("expected Denied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_nonexisting_multi_level_path_inside_root() {
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        // subdir/nested/ does not exist — the old code would fail here
+        let target = tmp.path().join("subdir").join("nested").join("file.txt");
+        let resolved = jail_path(tmp.path(), target.to_str().unwrap())
+            .expect("multi-level non-existing path inside root must be accepted");
+        assert!(resolved.starts_with(tmp.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn rejects_absolute_path_outside_root_when_nonexistent() {
+        let root = tempfile::TempDir::new().expect("create root");
+        let other = tempfile::TempDir::new().expect("create other");
+        // Target is in `other` dir and does not exist — must be rejected
+        let outside = other.path().join("secret").join("file.txt");
+        let err = jail_path(root.path(), outside.to_str().unwrap())
+            .expect_err("absolute non-existing path outside root must be rejected");
+        assert!(
+            matches!(err, ToolError::Denied { .. }),
+            "expected Denied, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_relative_path_resolving_to_curdot_inside_root() {
+        // ./subdir/file.txt — the `.` component must be normalized away
+        // when the relative path is joined against the canonical root.
+        let tmp = tempfile::TempDir::new().expect("create tempdir");
+        let inner = tmp.path().join("subdir").join("file.txt");
+        // Seed the file so the assertion has something to round-trip
+        // against, but the jail goes through the non-existing branch
+        // because the relative path is resolved against the test's cwd.
+        fs::create_dir_all(inner.parent().unwrap()).expect("create subdir");
+        fs::write(&inner, b"x").expect("seed file");
+        let rel = "./subdir/file.txt".to_string();
+        let resolved =
+            jail_path(tmp.path(), &rel).expect("relative path with ./ prefix must be accepted");
+        assert!(resolved.starts_with(tmp.path().canonicalize().unwrap()));
     }
 }

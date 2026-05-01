@@ -2,6 +2,7 @@
 //! `allow_mutations` and `allow_network`.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, instrument};
 
+use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -135,8 +137,23 @@ impl ToolHandler for BashHandler {
             }
         }
 
+        // Jail the requested `cwd` against the agent's first declared
+        // root so the LLM cannot `cd` outside the policy-allowed tree
+        // and run commands from there. Mirrors the path-guard contract
+        // used by Read / Write / Edit. When `roots` is empty (handler
+        // dispatched outside a `LoopAgent`, or agent declared no root),
+        // fall through to the raw path so tests and root-less pipelines
+        // keep working — policy enforcement is the caller's job there.
         if let Some(dir) = &cwd {
-            cmd.current_dir(dir);
+            let cwd_path: PathBuf = if let Some(root) = inv.roots.first() {
+                jail_path(root, dir).map_err(|e| ToolError::Invocation {
+                    name: "Bash".to_string(),
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                })?
+            } else {
+                PathBuf::from(dir)
+            };
+            cmd.current_dir(&cwd_path);
         }
 
         debug!(
@@ -486,6 +503,60 @@ mod tests {
         assert!(
             out.contains(expected),
             "output should contain tempdir path {expected}: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_outside_root_is_denied_when_root_is_set() {
+        // F3 regression: BashHandler must jail the `cwd` field when policy.roots
+        // is non-empty. An LLM trying to cd outside the root must get Denied.
+        let root = TempDir::new().expect("create root");
+        let outside = TempDir::new().expect("create outside");
+        let roots = vec![root.path().to_path_buf()];
+
+        let handler = BashHandler;
+        let err = handler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({
+                    "command": "pwd",
+                    "cwd": outside.path().to_str().unwrap()
+                }),
+            )
+            .await
+            .expect_err("cwd outside root must be denied");
+
+        assert!(
+            matches!(err, ToolError::Invocation { .. }),
+            "expected Invocation (wrapping Denied), got {err:?}",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_inside_root_is_allowed_when_root_is_set() {
+        // Companion: cwd inside the declared root must work normally.
+        let root = TempDir::new().expect("create root");
+        let canonical = root.path().canonicalize().expect("canonicalize");
+        let roots = vec![root.path().to_path_buf()];
+
+        let handler = BashHandler;
+        let out = handler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({
+                    "command": "pwd -P",
+                    "cwd": root.path().to_str().unwrap()
+                }),
+            )
+            .await
+            .expect("cwd inside root must succeed");
+
+        let expected = canonical.to_str().expect("utf8");
+        assert!(
+            out.contains(expected),
+            "output should contain root path {expected}: {out}",
         );
     }
 }
