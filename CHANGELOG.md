@@ -7,13 +7,76 @@ once the first tagged release ships.
 
 ## Unreleased
 
+## 0.2.0 - 2026-05-03
+
+### Security
+
+- **SSRF defense in `WebFetchHandler` redirect handling.** The previous
+  redirect path used `reqwest`'s built-in follower, which checks the
+  initial host against `allowed_domains` / `blocked_domains` /
+  private-IP rules but lets the followed hops escape that gate. A
+  malicious public host could `302` to `http://169.254.169.254/`
+  (cloud metadata) or to an internal hostname and the request would
+  proceed. The handler now sets `Policy::none()` and runs the redirect
+  loop manually: each hop re-resolves the host through the bounded
+  blocking DNS path, re-checks every IP against the private-block list,
+  and re-validates the host against the agent's domain policy. DNS is
+  capped at 5 s via `tokio::time::timeout` over `spawn_blocking` and
+  fails closed.
+- **Bash `cwd` now requires a configured jail.** Previously, agents
+  with an empty `roots` list could pass an arbitrary `cwd:` to the
+  Bash tool and execute commands rooted anywhere on the filesystem.
+  The handler now denies `cwd` outright when `roots` is empty so a
+  pipeline cannot accidentally hand a bash node unrestricted reach.
+  Pipelines that want a working directory must declare a `roots`
+  list; cwd is then validated against those roots.
+- **Bundle integrity: post-trailer content rejected.** `read_bundle`
+  used to verify the BLAKE3 trailer and stop, but additional bytes
+  appended *after* the trailer were silently consumed without error.
+  An attacker who could append to a record bundle (e.g., shared
+  storage with append-but-not-overwrite ACLs) could thus inject extra
+  recorded turns that replay would treat as legitimate. The new
+  `BundleError::ExtraContentAfterTrailer { line_count }` variant
+  surfaces any post-trailer bytes and aborts the read.
+
 ### Bug fixes
 
+- Bash node no longer denied when `allowed_domains` is configured but
+  `allow_network` is `true`. The `MutationsAndNetwork` policy arm
+  previously forced `allowed_domains` to imply network-required, even
+  for tools (like Bash) whose effects don't traverse the network at
+  all.
+- LoopAgent: `declared_tools` is now stored as `Arc<Vec<OrnoChatTool>>`
+  and shared by reference across iterations rather than deep-cloned
+  every turn. Cuts a per-iteration allocation that grew with the tool
+  count.
+- LoopAgent: `Arc::make_mut` invariant on the message history is now
+  covered by a regression test (`RetainingTransport`) that retains an
+  `Arc::clone` of the request and asserts the loop's copy-on-write
+  path produces a fresh allocation, guarding against a future refactor
+  that accidentally aliases storage with an external retainer.
+- `wire_name_from_yaml` (formerly `LoopAgent::to_wire_name`) is now a
+  public free function in `agent::loop_agent`, removing the duplicate
+  `yaml_to_wire_name` helper from the replay command.
+- `LlmRequest::with_tools(...)` builder added to centralize the
+  `Arc<Vec<OrnoChatTool>>` wrap-and-replace pattern across the seven
+  call sites that previously inlined it.
+- Tracing parity: `ReadHandler::invoke` and `DenyShellExecutor::execute`
+  now carry `#[instrument]` attributes matching the rest of the tool /
+  executor seams.
+- `install.sh`: corrected sha256 sidecar URL derivation. Previous
+  versions appended `.sha256` to the archive URL, producing
+  `<bin>-<version>-<target>.tar.gz.sha256`, but
+  `taiki-e/upload-rust-binary-action` publishes the sidecar with the
+  archive extension *replaced* (`<bin>-<version>-<target>.sha256`),
+  so v0.1.1 installs failed with a 404 on the checksum download.
+  Action consumers pinned to v0.1.1 had to set `ORNO_SKIP_SHA256=1`
+  as a workaround; that workaround is no longer required at v0.2.0.
 - Regenerated `schemas/pipeline.schema.json` to include `roots`,
-  `max_message_history_bytes`, and `max_tool_output_bytes` on `AgentPolicy`.
-  These three fields landed in 0.1.1 but the regenerated schema was not
-  committed, so IDE yaml-language-server users saw stale autocomplete
-  for one release.
+  `max_message_history_bytes`, and `max_tool_output_bytes` on
+  `AgentPolicy`. These three fields landed in 0.1.1 but the regenerated
+  schema was not committed, so IDE yaml-language-server users saw
+  stale autocomplete for one release.
 
 ### Other changes
 
@@ -39,10 +102,15 @@ once the first tagged release ships.
   `roots` jailed to the PR-head checkout. Two-checkout pattern (trusted
   master + PR head) prevents a malicious PR from rewriting either the
   pipeline YAML or the rubric; the orno binary itself is installed from
-  the pinned `DoctorMozg/orno@v0.1.1` release tag, never built from the
+  the pinned `DoctorMozg/orno@v0.2.0` release tag, never built from the
   PR commit. Forks are excluded by an explicit `if:` guard. The verdict
   step parses `VERDICT: PASS` / `VERDICT: FAIL` from the produced
   `.orno-self-review.md` and gates the PR check accordingly.
+- `dogfood-self-review` workflow gained a bootstrap-detection step:
+  if `examples/self-review/pipeline.yaml` is not yet on master, the
+  job emits a `::notice::` and short-circuits to a green check
+  instead of failing. Activates automatically once the file lands on
+  master.
 
 ## 0.1.1 - 2026-04-28
 

@@ -18,7 +18,7 @@ One bad prompt and an agent loop in CI will burn a weekend of tokens, hit endpoi
 - **The contract lives in YAML.** Set the ceiling once; orno enforces it at runtime. Nothing to wire up in code, no policy library to keep in sync, and no place to quietly disable the limits.
 - **One binary, one YAML file.** No server. No database. No scheduler to babysit. Drop the binary on a runner and call it.
 - **Two streams, no parser.** NDJSON events on stdout, tracing JSON on stderr. Pipe stdout into `jq`, Splunk, or Datadog as-is; the streams never cross.
-- **GitHub Action you pin like any other.** `DoctorMozg/orno@v0.1.1` in the workflow, secrets file alongside, done.
+- **GitHub Action you pin like any other.** `DoctorMozg/orno@v0.2.0` in the workflow, secrets file alongside, done.
 
 ## The five strictness dimensions
 
@@ -44,7 +44,7 @@ Grab the latest release binary for your platform:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/master/install.sh | bash
 ```
 
-The script pulls `orno` from GitHub Releases and drops it into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin`, or pin a version with `ORNO_VERSION=v0.1.1`.
+The script pulls `orno` from GitHub Releases and drops it into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin`, or pin a version with `ORNO_VERSION=v0.2.0`.
 
 Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-pc-windows-msvc` (via Git Bash).
 
@@ -53,7 +53,7 @@ Supported targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-p
 Run an orno pipeline from a workflow without bringing your own binary:
 
 ```yaml
-- uses: DoctorMozg/orno@v0.1.1
+- uses: DoctorMozg/orno@v0.2.0
   with:
     pipeline: examples/hello/pipeline.yaml
     command: run                # run | plan | validate (default: run)
@@ -61,7 +61,7 @@ Run an orno pipeline from a workflow without bringing your own binary:
     args: --record-bundle run.ndjson  # optional, forwarded to orno
 ```
 
-Pin to a tagged release (`@v0.1.1`) when you want the run reproducible; pin to the major tag (`@v1`) if you'd rather take non-breaking patches as they ship. The action installs orno into the runner's tool cache and runs the pipeline. Stdout is NDJSON and stderr is tracing JSON, the same shape you'd see invoking it locally.
+Pin to a tagged release (`@v0.2.0`) when you want the run reproducible; pin to the major tag (`@v0`) if you'd rather take non-breaking patches as they ship. The action installs orno into the runner's tool cache and runs the pipeline. Stdout is NDJSON and stderr is tracing JSON, the same shape you'd see invoking it locally.
 
 ### Build from source
 

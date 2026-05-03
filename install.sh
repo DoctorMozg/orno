@@ -69,7 +69,7 @@ latest_version() {
   tag=$(echo "$response" | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/' | head -1)
 
   if [ -z "$tag" ]; then
-    echo "error: no release found for ${REPO}. orno is pre-v0.1.1 -- build from source: https://github.com/${REPO}#build-from-source" >&2
+    echo "error: no release found for ${REPO}. orno is pre-v0.2.0 -- build from source: https://github.com/${REPO}#build-from-source" >&2
     exit 1
   fi
 

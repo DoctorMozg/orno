@@ -40,16 +40,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    # WORKAROUND (remove after v0.1.2): install.sh in v0.1.1 builds the
-    # checksum URL by appending `.sha256` to the archive URL, but
-    # taiki-e/upload-rust-binary-action publishes the sidecar with the
-    # archive extension *replaced* (`...-target.sha256`, not
-    # `...-target.tar.gz.sha256`), so the v0.1.1 install fails with a 404
-    # before sha256 verification can run. Set at job scope so the runner
-    # exports it to the composite action's bash subshell. Once v0.1.2 ships
-    # with the fix, drop both the `version: v0.1.1` pin and this env block.
-    env:
-      ORNO_SKIP_SHA256: '1'
 
     steps:
       - name: Checkout trusted master (pipeline + rubric)
@@ -109,7 +99,7 @@ jobs:
         # PR commit would let a malicious PR patch the runtime to bypass
         # bounded-effects enforcement. The pinned tag isolates the supply
         # chain from PR content.
-        uses: DoctorMozg/orno@v0.1.1
+        uses: DoctorMozg/orno@v0.2.0
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_REPO: ${{ github.workspace }}/pr-head
@@ -120,7 +110,7 @@ jobs:
           # `post_comment` shell node sees this token automatically.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: v0.1.1
+          version: v0.2.0
           pipeline: trusted-master/examples/self-review/pipeline.yaml
           secrets-file: ${{ runner.temp }}/orno-secrets.env
 
