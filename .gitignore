@@ -6,7 +6,10 @@
 .DS_Store
 .env.secrets
 
-# insta snapshot artifacts are regenerated locally, not committed.
-*.snap
+# insta committed snapshots (`*.snap`) are the test fixtures themselves
+# and MUST be checked in -- CI runs in non-interactive mode, so a missing
+# snapshot fails the assertion. Only `*.snap.new` is local-only: it's the
+# pending-review artifact that `cargo insta review` either accepts (rename
+# to `.snap`) or discards.
 *.snap.new
 .claude/agent-memory/
