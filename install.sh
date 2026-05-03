@@ -106,7 +106,7 @@ download_archive() {
 
 verify_archive() {
   local archive="$1"
-  local url="$2"
+  local sha_url="$2"
 
   # Respect opt-out for environments where the sidecar isn't reachable
   # (e.g. an offline mirror). Default-on is the secure behavior.
@@ -115,7 +115,6 @@ verify_archive() {
     return 0
   fi
 
-  local sha_url="${url}.sha256"
   local sha_file="${archive}.sha256"
 
   # Download the sidecar checksum file published by the release workflow.
@@ -217,7 +216,7 @@ install_binary() {
 }
 
 main() {
-  local target version scratch_dir ext archive_name archive_path archive_url
+  local target version scratch_dir ext archive_name archive_path archive_url sha_url
 
   INSTALL_DIR="${ORNO_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
   VERSION="${ORNO_VERSION:-}"
@@ -237,10 +236,16 @@ main() {
   archive_name="${BINARY}-${version}-${target}.${ext}"
   archive_path="$scratch_dir/$archive_name"
   archive_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
+  # taiki-e/upload-rust-binary-action publishes the sha256 sidecar as
+  # `${BINARY}-${version}-${target}.sha256` -- the archive extension is
+  # replaced, not suffixed. Build the sidecar URL from the bare basename
+  # instead of appending `.sha256` to `archive_url`, which would yield a
+  # nonexistent `....tar.gz.sha256` and 404.
+  sha_url="https://github.com/${REPO}/releases/download/${version}/${BINARY}-${version}-${target}.sha256"
 
   echo "Installing ${BINARY} ${version} (${target})..."
   download_archive "$archive_path" "$archive_url"
-  verify_archive "$archive_path" "$archive_url"
+  verify_archive "$archive_path" "$sha_url"
   extract_archive "$archive_path" "$scratch_dir"
   install_binary "$scratch_dir" "$INSTALL_DIR"
 
