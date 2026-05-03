@@ -73,7 +73,26 @@ jobs:
           set -euo pipefail
           git fetch --no-tags origin master:refs/remotes/origin/master
 
+      - name: Detect bootstrap (pipeline not yet on master)
+        # The trust model fetches pipeline.yaml from trusted-master so a
+        # malicious PR cannot rewrite reviewer policy. That breaks for the
+        # bootstrap PR that *introduces* the self-review pipeline: master
+        # has no `examples/self-review/pipeline.yaml` to read. Detect that
+        # state and short-circuit the run with a notice rather than failing
+        # — once the bootstrap PR merges, every subsequent PR finds the
+        # pipeline on master and runs normally.
+        id: bootstrap
+        run: |
+          set -euo pipefail
+          if [ ! -f "trusted-master/examples/self-review/pipeline.yaml" ]; then
+            echo "::notice::self-review pipeline not yet on master; this is the bootstrap PR — skipping self-review (it will activate after merge)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Write secrets file
+        if: steps.bootstrap.outputs.skip != 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -85,6 +104,7 @@ jobs:
             > "${RUNNER_TEMP}/orno-secrets.env"
 
       - name: Run self-review
+        if: steps.bootstrap.outputs.skip != 'true'
         # Pinned to a released tag — never `@master`. Building orno from a
         # PR commit would let a malicious PR patch the runtime to bypass
         # bounded-effects enforcement. The pinned tag isolates the supply
@@ -105,6 +125,7 @@ jobs:
           secrets-file: ${{ runner.temp }}/orno-secrets.env
 
       - name: Enforce verdict
+        if: steps.bootstrap.outputs.skip != 'true'
         # The reviewer agent ends its report with `VERDICT: PASS` or
         # `VERDICT: FAIL`. FAIL marks this check failing so the PR cannot
         # merge until the author addresses findings (or pushes a commit
@@ -132,5 +153,5 @@ jobs:
           esac
 
       - name: Cleanup secrets file
-        if: always()
+        if: always() && steps.bootstrap.outputs.skip != 'true'
         run: rm -f "${RUNNER_TEMP}/orno-secrets.env"
