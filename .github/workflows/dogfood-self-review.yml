@@ -40,6 +40,16 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # WORKAROUND (remove after v0.1.2): install.sh in v0.1.1 builds the
+    # checksum URL by appending `.sha256` to the archive URL, but
+    # taiki-e/upload-rust-binary-action publishes the sidecar with the
+    # archive extension *replaced* (`...-target.sha256`, not
+    # `...-target.tar.gz.sha256`), so the v0.1.1 install fails with a 404
+    # before sha256 verification can run. Set at job scope so the runner
+    # exports it to the composite action's bash subshell. Once v0.1.2 ships
+    # with the fix, drop both the `version: v0.1.1` pin and this env block.
+    env:
+      ORNO_SKIP_SHA256: '1'
 
     steps:
       - name: Checkout trusted master (pipeline + rubric)
