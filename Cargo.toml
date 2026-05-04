@@ -123,7 +123,7 @@ hex    = { version = "0.4", default-features = false, features = ["std"] }
 # MiniJinja templates so a long-lived engine cannot grow without bound.
 # `default-features = false` keeps the hashbrown backend in place and
 # omits the optional `serde` support that orno does not need.
-lru = { version = "0.12", default-features = false }
+lru = { version = "0.18", default-features = false }
 
 # Tape I/O for `RecordingTransport` / `ReplayTransport` tests. Used from
 # integration tests and from round-trip unit tests — pulled at workspace
