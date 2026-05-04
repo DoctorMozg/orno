@@ -25,7 +25,7 @@ jobs:
         # TODO: pin to SHA. Run:
         #   gh api repos/softprops/action-gh-release/git/refs/tags/v2 --jq .object.sha
         # to obtain the commit SHA, then replace `@v2` with `@<sha> # v2`.
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Created as draft so consumers cannot pull a release whose binary
           # assets have not finished uploading yet (see publish-release below).
