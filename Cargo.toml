@@ -74,7 +74,7 @@ ulid = "1"
 # pre-release rules keep this requirement narrow (same `0.6.0-beta`
 # stream only). genai has no `[features]` table, so the workspace-
 # wide `default-features = false` discipline does not apply.
-genai = "0.6.0-beta.17"
+genai = "0.6.0-beta.19"
 
 # HTTP client for WebFetchHandler. Pinned to the same major
 # that genai pulls transitively. Only `rustls` is enabled (reqwest 0.13
