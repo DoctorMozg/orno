@@ -14,7 +14,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{debug, instrument};
 
-use super::path_guard::jail_path;
+use super::path_guard::jail_path_any;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -144,26 +144,25 @@ impl ToolHandler for BashHandler {
             }
         }
 
-        // Jail the requested `cwd` against the agent's first declared
-        // root so the LLM cannot `cd` outside the policy-allowed tree
+        // Jail the requested `cwd` against any of the agent's declared
+        // roots so the LLM cannot `cd` outside the policy-allowed tree
         // and run commands from there. Mirrors the path-guard contract
         // used by Read / Write / Edit. When `roots` is empty there is
         // no jail boundary — accepting a raw `cwd` would let the LLM
         // chdir anywhere on the host, so the request is denied instead.
         if let Some(dir) = &cwd {
-            let cwd_path: PathBuf = if let Some(root) = inv.roots.first() {
-                jail_path(root, dir).map_err(|e| ToolError::Invocation {
-                    name: "Bash".to_string(),
-                    source: Box::new(std::io::Error::other(e.to_string())),
-                })?
-            } else {
-                // cwd without a jail boundary is unsafe — deny rather than allow unrestricted chdir.
+            if inv.roots.is_empty() {
                 return Err(ToolError::Denied {
                     reason: "Bash `cwd` requires a non-empty `roots` list; \
                              no jail boundary is configured for this agent"
                         .to_string(),
                 });
-            };
+            }
+            let cwd_path: PathBuf =
+                jail_path_any(inv.roots, dir).map_err(|e| ToolError::Invocation {
+                    name: "Bash".to_string(),
+                    source: Box::new(std::io::Error::other(e.to_string())),
+                })?;
             cmd.current_dir(&cwd_path);
         }
 

@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
-use super::path_guard::jail_path;
+use super::path_guard::jail_path_any;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -57,16 +57,9 @@ impl ToolHandler for WriteHandler {
         // LLM with `allow_mutations` mkdir anywhere the process can,
         // even if the subsequent write is rejected — a containment
         // violation independent of the actual file content (F1).
-        // BS1: fail closed when roots is empty — no boundary, no write.
-        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
-        } else {
-            return Err(ToolError::Denied {
-                reason: "Write tool requires a non-empty `roots` list; \
-                         no jail boundary is configured for this agent"
-                    .to_string(),
-            });
-        };
+        // BS1: `jail_path_any` fails closed when roots is empty — no
+        // boundary, no write. The path may resolve inside any root.
+        let resolved: PathBuf = jail_path_any(inv.roots, &path)?;
 
         if let Some(parent) = resolved.parent()
             && !parent.as_os_str().is_empty()

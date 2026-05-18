@@ -167,12 +167,12 @@ pub struct AgentPolicy {
     #[serde(default)]
     pub blocked_domains: Vec<String>,
     pub on_parse_error: OnParseError,
-    /// Filesystem roots the `Read` / `Write` / `Edit` builtins are
-    /// jailed to. When the agent's `allowed_tools` list contains any
-    /// of those names, this list must be non-empty — `LoopAgent`
-    /// rejects with `AgentError::InvalidPolicy` at run start.
-    /// Currently only `roots[0]` is consulted; multi-root agents are
-    /// a v0.2+ extension.
+    /// Filesystem roots the `Read` / `Write` / `Edit` / `Bash` `cwd`
+    /// builtins are jailed to. When the agent's `allowed_tools` list
+    /// contains any of those names, this list must be non-empty —
+    /// `LoopAgent` rejects with `AgentError::InvalidPolicy` at run
+    /// start. A path is in-jail when it resolves inside any one of
+    /// these roots.
     #[serde(default)]
     pub roots: Vec<std::path::PathBuf>,
     /// Soft cap on the approximate byte size of the accumulated

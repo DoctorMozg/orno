@@ -97,12 +97,13 @@ pub struct ToolInvocation<'a> {
     /// sites). Adding this field is why `ToolInvocation` is `Clone` but
     /// no longer `Copy` — `Arc` is not trivially copyable.
     pub token_budget_share: Option<Arc<AtomicU64>>,
-    /// Filesystem roots the file builtins (`Read` / `Write` / `Edit`)
-    /// are jailed to. Borrowed from the agent's `AgentPolicy.roots`.
-    /// Empty when the calling agent did not declare any root or when
-    /// the handler is dispatched outside a `LoopAgent` (unit tests).
-    /// File handlers reject paths that escape `roots[0]`; non-file
-    /// handlers ignore this field entirely.
+    /// Filesystem roots the file builtins (`Read` / `Write` / `Edit` /
+    /// `Bash` `cwd`) are jailed to. Borrowed from the agent's
+    /// `AgentPolicy.roots`. Empty when the calling agent did not declare
+    /// any root or when the handler is dispatched outside a `LoopAgent`
+    /// (unit tests). A file handler accepts a path that resolves inside
+    /// any one of these roots and rejects a path that escapes every
+    /// configured root; non-file handlers ignore this field entirely.
     pub roots: &'a [PathBuf],
 }
 

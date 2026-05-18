@@ -90,8 +90,8 @@ fn enforce_message_history_cap(messages: &mut Vec<OrnoChatMessage>, cap: usize) 
     // each evicted message's estimated bytes instead of re-summing the
     // whole vector on every iteration. Defer the front shift to a single
     // `drain(..evict)` call so the underlying memmove also runs once.
-    // Stop at len-2 so the model always sees at least one tool-call/result
-    // pair even when the cap is smaller than any single message.
+    // The byte loop stops at len-2 so it does not strip the history bare
+    // on a tiny cap.
     let mut evict = 0usize;
     while messages.len() - evict > 2 {
         let msg_bytes = estimated_message_bytes(&messages[evict]);
@@ -100,6 +100,16 @@ fn enforce_message_history_cap(messages: &mut Vec<OrnoChatMessage>, cap: usize) 
         if total <= cap {
             break;
         }
+    }
+    // Never let the retained history begin with an orphaned `ToolResult`
+    // — a tool result whose paired `ToolCalls` turn was just evicted has
+    // no matching tool-call id and is rejected by chat-completion APIs,
+    // which would fail the next request instead of bounding the history.
+    // Advance the eviction point past any leading `ToolResult` so the
+    // retained slice always starts on a turn boundary, even if doing so
+    // empties the history.
+    while evict < messages.len() && matches!(messages[evict], OrnoChatMessage::ToolResult { .. }) {
+        evict += 1;
     }
     if evict > 0 {
         messages.drain(..evict);
@@ -552,21 +562,21 @@ impl Agent for LoopAgent {
                     .policy
                     .max_tool_output_bytes
                     .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
-                let truncated = truncate_tool_output(&result_content, cap);
-                // Redact `secrets.*` leaves before the result enters the
-                // conversation history. The handler may have read a
-                // secret-bearing file or echoed an env var, and the
-                // history is replayed verbatim on the next LLM request —
-                // without this hop, a secret would leave the host on the
-                // outbound prompt even though every other wire-format
-                // field already runs through `redactor`.
-                let redacted = self.config.redactor.redact(&truncated);
+                // Redact `secrets.*` leaves BEFORE truncating. The handler
+                // may have read a secret-bearing file or echoed an env
+                // var, and the history is replayed verbatim on the next
+                // LLM request. Redacting first guarantees a secret that
+                // straddles the `cap` byte boundary collapses to `***`
+                // before truncation can slice it — truncating first would
+                // leave an unmatchable partial secret in the history.
+                let redacted = self.config.redactor.redact(&result_content);
+                let truncated = truncate_tool_output(&redacted, cap);
                 // INVARIANT: messages must have refcount 1 here — no transport may retain
                 // an Arc clone across the await point. If violated, make_mut deep-clones
                 // the entire history on every iteration (O(n²)). See LlmTransport contract.
                 Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
-                    content: redacted.into_owned(),
+                    content: truncated,
                 });
                 if let Some(cap) = req.policy.max_message_history_bytes {
                     enforce_message_history_cap(Arc::make_mut(&mut messages), cap);

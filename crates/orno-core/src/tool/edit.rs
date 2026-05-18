@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
-use super::path_guard::jail_path;
+use super::path_guard::jail_path_any;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -58,16 +58,9 @@ impl ToolHandler for EditHandler {
             message: e.to_string(),
         })?;
 
-        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
-        } else {
-            // BS1: fail closed when roots is empty — no boundary, no edit.
-            return Err(ToolError::Denied {
-                reason: "Edit tool requires a non-empty `roots` list; \
-                         no jail boundary is configured for this agent"
-                    .to_string(),
-            });
-        };
+        // BS1: `jail_path_any` fails closed when roots is empty — no
+        // boundary, no edit. The path may resolve inside any root.
+        let resolved: PathBuf = jail_path_any(inv.roots, &path)?;
 
         let original = std::fs::read_to_string(&resolved).map_err(|e| ToolError::Invocation {
             name: "Edit".to_string(),
