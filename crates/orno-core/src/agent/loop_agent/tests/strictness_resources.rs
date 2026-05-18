@@ -695,3 +695,138 @@ async fn token_counter_saturates_at_u64_max_instead_of_wrapping() {
         "expected BudgetExceeded(Tokens), got {err:?}",
     );
 }
+
+#[tokio::test]
+async fn history_cap_never_sends_orphaned_tool_result() {
+    // Finding 2 regression: a tool-call turn with TWO calls produces one
+    // `ToolCalls` message followed by two `ToolResult` messages. A history
+    // cap small enough to evict into the middle of that turn must never
+    // leave the retained history starting on a `ToolResult` whose paired
+    // `ToolCalls` was evicted — an orphaned tool result has no matching
+    // tool-call id and is rejected by chat-completion APIs, which would
+    // fail the next request instead of bounding the history.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(400));
+
+    let two_call_turn = LlmResponse {
+        content: String::new(),
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+        tool_calls: vec![
+            OrnoChatToolCall {
+                call_id: "a1".into(),
+                fn_name: "LongOutputTool".into(),
+                fn_arguments: serde_json::json!({}),
+            },
+            OrnoChatToolCall {
+                call_id: "a2".into(),
+                fn_name: "LongOutputTool".into(),
+                fn_arguments: serde_json::json!({}),
+            },
+        ],
+    };
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        two_call_turn,
+        final_text_response(),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_tool_calls = 4;
+    req.policy.max_message_history_bytes = Some(50);
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must complete despite the orphan-prone history cap");
+
+    let observed = transport.messages_seen();
+    let second = &observed[1];
+    assert!(
+        !matches!(second.first(), Some(OrnoChatMessage::ToolResult { .. })),
+        "request built from the capped history must not begin with an \
+         orphaned ToolResult: {second:?}",
+    );
+}
+
+#[tokio::test]
+async fn tool_output_secret_redacted_before_truncation() {
+    // Finding 3 regression: the per-call tool output must be redacted
+    // BEFORE it is truncated to `max_tool_output_bytes`. A secret that
+    // straddles the truncation boundary would otherwise survive as an
+    // unmatchable partial string and leak into conversation history,
+    // replayed verbatim on the next outbound LLM request.
+    use std::collections::BTreeMap;
+
+    let secret = "SUPERSECRETVALUE";
+    // 20 padding bytes, the 16-byte secret, 20 padding bytes. A 28-byte
+    // head-keep cap slices the secret in half.
+    let tool_output = "xxxxxxxxxxxxxxxxxxxxSUPERSECRETVALUEyyyyyyyyyyyyyyyyyyyy";
+
+    let mut secrets = BTreeMap::new();
+    secrets.insert("k".to_string(), secret.to_string());
+    let redactor = Arc::new(Redactor::new(&secrets));
+
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(EchoTool::new(ToolEffect::ReadOnly, tool_output));
+
+    let first = LlmResponse {
+        content: String::new(),
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+        tool_calls: vec![OrnoChatToolCall {
+            call_id: "c1".into(),
+            fn_name: "EchoTool".into(),
+            fn_arguments: serde_json::json!({}),
+        }],
+    };
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        first,
+        final_text_response(),
+    ]));
+
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor,
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_tool_calls = 1;
+    req.policy.max_tool_output_bytes = Some(28);
+    req.allowed_tools = vec!["EchoTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop must complete");
+
+    let observed = transport.messages_seen();
+    let result_msg = observed[1]
+        .iter()
+        .find_map(|m| match m {
+            OrnoChatMessage::ToolResult { call_id, content } if call_id == "c1" => Some(content),
+            _ => None,
+        })
+        .expect("second request must contain the tool-result message");
+    assert!(
+        !result_msg.contains("SUPERSEC"),
+        "no fragment of the secret may survive into history: {result_msg:?}",
+    );
+    assert!(
+        !result_msg.contains(secret),
+        "the full secret must not appear in history: {result_msg:?}",
+    );
+}

@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::instrument;
 
-use super::path_guard::jail_path;
+use super::path_guard::jail_path_any;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -60,17 +60,10 @@ impl ToolHandler for ReadHandler {
                 message: e.to_string(),
             })?;
 
-        let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
-        } else {
-            // BS1: empty roots means no jail boundary — refuse rather than
-            // allowing unrestricted host filesystem access.
-            return Err(ToolError::Denied {
-                reason: "Read tool requires a non-empty `roots` list; \
-                         no jail boundary is configured for this agent"
-                    .to_string(),
-            });
-        };
+        // Accept a path inside any configured root. BS1: empty roots
+        // means no jail boundary — `jail_path_any` refuses every path in
+        // that case rather than allowing unrestricted host access.
+        let resolved: PathBuf = jail_path_any(inv.roots, &path)?;
 
         let metadata = std::fs::metadata(&resolved).map_err(|e| ToolError::Invocation {
             name: "Read".to_string(),
