@@ -20,7 +20,7 @@ jobs:
     name: create-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Create GitHub Release (draft)
         # TODO: pin to SHA. Run:
         #   gh api repos/softprops/action-gh-release/git/refs/tags/v2 --jq .object.sha
@@ -50,7 +50,7 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-2022
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95
         with:
           targets: ${{ matrix.target }}
@@ -99,7 +99,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Move major tag to latest release

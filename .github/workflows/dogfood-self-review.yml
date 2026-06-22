@@ -43,13 +43,13 @@ jobs:
 
     steps:
       - name: Checkout trusted master (pipeline + rubric)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: master
           path: trusted-master
 
       - name: Checkout PR head (under review)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           path: pr-head
