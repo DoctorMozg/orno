@@ -6,8 +6,7 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+-*'
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,13 +18,26 @@ jobs:
   create-release:
     name: create-release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
+      - name: Verify tag matches workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Take the first `version = "..."` after [workspace.package]; a tag
+          # that disagrees with Cargo.toml would ship binaries reporting the
+          # wrong --version.
+          manifest=$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | grep -m1 '^version' | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          if [ -z "$manifest" ] || [ "${TAG#v}" != "$manifest" ]; then
+            echo "error: tag $TAG does not match workspace.package.version '$manifest'" >&2
+            exit 1
+          fi
       - name: Create GitHub Release (draft)
-        # TODO: pin to SHA. Run:
-        #   gh api repos/softprops/action-gh-release/git/refs/tags/v2 --jq .object.sha
-        # to obtain the commit SHA, then replace `@v2` with `@<sha> # v2`.
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           # Created as draft so consumers cannot pull a release whose binary
           # assets have not finished uploading yet (see publish-release below).
@@ -37,6 +49,8 @@ jobs:
     name: upload (${{ matrix.target }})
     needs: create-release
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       # Default fail-fast (true) prevents publishing a release with a partial
       # asset matrix: any platform failure aborts the rest, leaving the draft
@@ -51,14 +65,11 @@ jobs:
             os: windows-2022
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.95
+      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95
         with:
+          toolchain: '1.95'
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      # TODO: pin to SHA. Run:
-      #   gh api repos/taiki-e/upload-rust-binary-action/git/refs/tags/v1 --jq .object.sha
-      # to obtain the commit SHA, then replace `@v1` with `@<sha> # v1`.
-      - uses: taiki-e/upload-rust-binary-action@v1
+      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
           bin: orno
           target: ${{ matrix.target }}
@@ -78,12 +89,14 @@ jobs:
       - name: Publish release (un-draft)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # Flip draft to false only after every matrix asset has uploaded.
           # Until this step runs, install.sh's "latest release" lookup will
           # not see the tag, so users cannot pull an incomplete release.
-          gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+          gh release edit "$TAG" --draft=false --repo "$REPO"
 
   update-major-tag:
     name: update major tag

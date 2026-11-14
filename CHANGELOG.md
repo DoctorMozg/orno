@@ -7,6 +7,11 @@ once the first tagged release ships.
 
 ## Unreleased
 
+### Added
+
+- Optional per-server `call_timeout_secs` on `mcp_servers` entries
+  (default 30).
+
 ### Changed
 
 - `policy.roots` entries and shell-node `env:` values are rendered
@@ -23,6 +28,19 @@ once the first tagged release ships.
 - `AgentError::SubagentDepthExceeded` and `LlmError::NotImplemented`
   (never constructed).
 - The uncompiled `orno_core::config` module.
+
+### Fixed
+
+- MCP stdio servers' stderr no longer leaks into orno's stderr; it is
+  logged at debug level.
+- MCP tool calls with non-object arguments now fail instead of running
+  with none, image/audio-only results yield a placeholder instead of an
+  empty string, and a repeated `initialize` returns the cached tools.
+
+### Security
+
+- Bump `rmcp` to 3.10 (fixes RUSTSEC-2026-0462, unbounded response
+  buffering in the streamable HTTP client).
 
 ## 0.2.0 - 2026-05-03
 

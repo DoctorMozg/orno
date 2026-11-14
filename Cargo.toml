@@ -82,11 +82,11 @@ genai = "0.6.0-beta.17"
 # pools are needed for a simple GET.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
-# MCP stack. Pinned to 1.x; the 1.0 release (2026-03) stabilised
-# the API. Access goes only through McpClient (orno-core types never
+# MCP stack. Pinned to 3.x (>= 3.9 fixes RUSTSEC-2026-0462).
+# Access goes only through McpClient (orno-core types never
 # re-export rmcp items). Features enumerated explicitly per
 # default-features = false discipline; exact names verified at build time.
-rmcp = { version = "1.5", default-features = false, features = [
+rmcp = { version = "3.10", default-features = false, features = [
     "client",
     "transport-child-process",
     # Streamable HTTP client + reqwest backend wire MCP's HTTP

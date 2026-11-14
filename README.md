@@ -41,7 +41,7 @@ Wall-clock deadlines are a node-level attribute (`timeout:`) and apply uniformly
 Grab the latest release binary for your platform:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/master/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/DoctorMozg/orno/v0.2.0/install.sh | bash
 ```
 
 The script pulls `orno` from GitHub Releases and drops it into `${CARGO_HOME:-$HOME/.cargo}/bin`. Override the destination with `ORNO_INSTALL_DIR=/path/to/bin`, or pin a version with `ORNO_VERSION=v0.2.0`.

@@ -502,6 +502,7 @@ mod tests {
             McpServerConfig::Stdio(McpStdioConfig {
                 command: vec!["true".to_string()],
                 env: BTreeMap::new(),
+                call_timeout_secs: None,
             }),
         );
         let pipeline = Pipeline {

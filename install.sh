@@ -69,19 +69,23 @@ latest_version() {
   tag=$(echo "$response" | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/' | head -1)
 
   if [ -z "$tag" ]; then
-    echo "error: no release found for ${REPO}. orno is pre-v0.2.0 -- build from source: https://github.com/${REPO}#build-from-source" >&2
+    echo "error: no release found for ${REPO}; build from source: https://github.com/${REPO}#build-from-source" >&2
     exit 1
   fi
 
-  # Validate tag format to prevent injection via a poisoned API response
-  # (e.g. a man-in-the-middle could otherwise inject shell metacharacters
-  # that flow into the download URL).
-  if ! echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
-    echo "error: unexpected tag format from GitHub API: $tag" >&2
-    exit 1
-  fi
-
+  validate_version "$tag" "GitHub API"
   echo "$tag"
+}
+
+# A poisoned API response or env var must not smuggle shell metacharacters or
+# path segments into the download URL.
+validate_version() {
+  local version="$1"
+  local source="$2"
+  if ! echo "$version" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+    echo "error: unexpected version format from ${source}: $version" >&2
+    exit 1
+  fi
 }
 
 download_archive() {
@@ -222,6 +226,9 @@ main() {
   VERSION="${ORNO_VERSION:-}"
 
   target=$(detect_target)
+  if [ -n "$VERSION" ]; then
+    validate_version "$VERSION" "ORNO_VERSION"
+  fi
   version="${VERSION:-$(latest_version)}"
 
   scratch_dir=$(mktemp -d)

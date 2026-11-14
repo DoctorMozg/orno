@@ -7,7 +7,7 @@
 //! The trait surface is intentionally minimal: `initialize` collapses
 //! spawn + handshake + `tools/list`; `call_tool` handles invocation;
 //! `shutdown` terminates cleanly. Lifecycle events are emitted by the
-//! run orchestration in `orno-cli/src/commands/run.rs`, NOT inside the
+//! run orchestration in `orno-cli/src/commands/run/mod.rs`, NOT inside the
 //! client — the client's job is protocol, not observability.
 
 pub mod rmcp_client;
@@ -64,8 +64,8 @@ pub trait McpClient: Send + Sync + std::fmt::Debug {
 
     /// Spawn the server (stdio: `Command`; http: establish connection),
     /// perform the MCP `initialize` handshake, call `tools/list`, and return
-    /// the cached tool list. Called exactly once per run before any
-    /// `call_tool` dispatch.
+    /// the cached tool list. Called once per run before any `call_tool`
+    /// dispatch; a repeat call on a connected client returns the cached list.
     async fn initialize(&mut self) -> Result<Vec<McpTool>, McpError>;
 
     /// Invoke `tools/call` for the named tool. `args` is a JSON object
@@ -74,9 +74,8 @@ pub trait McpClient: Send + Sync + std::fmt::Debug {
     /// `isError: true`) surface as [`McpToolCallResult`]`{ ok: false, .. }`.
     async fn call_tool(&self, tool: &str, args: Value) -> Result<McpToolCallResult, McpError>;
 
-    /// Initiate clean shutdown. For stdio: send `notifications/exit`, then
-    /// wait up to a bounded timeout for the child to exit, SIGTERM on
-    /// timeout. For http: close the connection. Idempotent — safe to call
-    /// twice on a clean run.
+    /// Cancel the rmcp session (closing the transport) within a bounded
+    /// timeout. For stdio, a child that outlives the timeout is left to
+    /// rmcp's drop-time kill. Idempotent — safe to call twice on a clean run.
     async fn shutdown(&mut self) -> Result<(), McpError>;
 }

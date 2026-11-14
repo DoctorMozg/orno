@@ -13,7 +13,9 @@ use orno_core::pipeline::schema::McpStdioConfig;
 /// A minimal Python3 MCP server. Handles `initialize`, the
 /// `notifications/initialized` notification, `tools/list`, and `tools/call`.
 const FAKE_MCP_SCRIPT: &str = r#"
-import sys, json
+import sys, json, os, time
+
+EXTRA = os.environ.get("FAKE_EXTRA_TOOLS") == "1"
 
 def send(msg):
     line = json.dumps(msg)
@@ -37,11 +39,23 @@ for raw in sys.stdin:
     elif method == "notifications/initialized":
         pass  # notification, no response
     elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{
+        tools = [{
             "name":"echo",
             "description":"Echo the message back",
             "inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}
-        }]}})
+        }]
+        if EXTRA:
+            for name in ("image", "slow"):
+                tools.append({"name":name,"description":name,"inputSchema":{"type":"object"}})
+        send({"jsonrpc":"2.0","id":mid,"result":{"tools":tools}})
+    elif method == "tools/call" and msg["params"]["name"] == "image":
+        send({"jsonrpc":"2.0","id":mid,"result":{
+            "content":[{"type":"image","data":"aGk=","mimeType":"image/png"}],
+            "isError":False
+        }})
+    elif method == "tools/call" and msg["params"]["name"] == "slow":
+        time.sleep(3)
+        send({"jsonrpc":"2.0","id":mid,"result":{"content":[],"isError":False}})
     elif method == "tools/call":
         args = msg.get("params",{}).get("arguments",{})
         text = args.get("message","(no message)")
@@ -68,6 +82,7 @@ fn fake_server_config() -> McpStdioConfig {
             FAKE_MCP_SCRIPT.to_string(),
         ],
         env: std::collections::BTreeMap::new(),
+        call_timeout_secs: None,
     }
 }
 
@@ -118,6 +133,107 @@ async fn rmcp_client_call_tool_returns_content() {
     client.shutdown().await.expect("shutdown should succeed");
 }
 
+fn extra_tools_config(call_timeout_secs: Option<u64>) -> McpStdioConfig {
+    let mut cfg = fake_server_config();
+    cfg.env
+        .insert("FAKE_EXTRA_TOOLS".to_string(), "1".to_string());
+    cfg.call_timeout_secs = call_timeout_secs;
+    cfg
+}
+
+#[tokio::test]
+async fn rmcp_client_non_object_args_return_error() {
+    if !python3_available() {
+        eprintln!("skipping mcp_fake: python3 not available");
+        return;
+    }
+
+    let mut client = RmcpClient::new_stdio("fake".to_string(), &fake_server_config());
+    client.initialize().await.expect("initialize");
+
+    for bad in [serde_json::json!("hi"), serde_json::json!([1, 2])] {
+        let err = client
+            .call_tool("echo", bad.clone())
+            .await
+            .expect_err("non-object args must be rejected");
+        let source = std::error::Error::source(&err).expect("source").to_string();
+        assert!(
+            source.contains("must be a JSON object"),
+            "args {bad}: unexpected source: {source}"
+        );
+    }
+
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rmcp_client_image_only_result_yields_placeholder() {
+    if !python3_available() {
+        eprintln!("skipping mcp_fake: python3 not available");
+        return;
+    }
+
+    let mut client = RmcpClient::new_stdio("fake".to_string(), &extra_tools_config(None));
+    client.initialize().await.expect("initialize");
+
+    let result = client
+        .call_tool("image", serde_json::json!({}))
+        .await
+        .expect("call_tool");
+
+    assert!(result.ok);
+    assert_eq!(result.content, "[image content omitted]");
+
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rmcp_client_repeated_initialize_returns_cached_tools() {
+    if !python3_available() {
+        eprintln!("skipping mcp_fake: python3 not available");
+        return;
+    }
+
+    let mut client = RmcpClient::new_stdio("fake".to_string(), &fake_server_config());
+    let first = client.initialize().await.expect("first initialize");
+    let second = client.initialize().await.expect("second initialize");
+
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        second.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        first.iter().map(|t| &t.name).collect::<Vec<_>>(),
+    );
+
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rmcp_client_call_timeout_is_configurable() {
+    if !python3_available() {
+        eprintln!("skipping mcp_fake: python3 not available");
+        return;
+    }
+
+    let mut client = RmcpClient::new_stdio("fake".to_string(), &extra_tools_config(Some(1)));
+    client.initialize().await.expect("initialize");
+
+    let started = std::time::Instant::now();
+    let err = client
+        .call_tool("slow", serde_json::json!({}))
+        .await
+        .expect_err("slow tool must hit the 1s call timeout");
+    let source = std::error::Error::source(&err).expect("source").to_string();
+
+    assert!(source.contains("timed out after 1s"), "got: {source}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "timeout fired late: {:?}",
+        started.elapsed()
+    );
+
+    client.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn rmcp_client_call_tool_before_initialize_returns_error() {
     let cfg = fake_server_config();
@@ -137,6 +253,7 @@ async fn rmcp_client_empty_command_returns_spawn_error() {
     let cfg = McpStdioConfig {
         command: vec![],
         env: std::collections::BTreeMap::new(),
+        call_timeout_secs: None,
     };
     let mut client = RmcpClient::new_stdio("empty".to_string(), &cfg);
     let err = client.initialize().await.unwrap_err();
@@ -194,6 +311,7 @@ mod http_transport {
             url: format!("{}/mcp", server.uri()),
             auth: None,
             headers: BTreeMap::new(),
+            call_timeout_secs: None,
         };
 
         let mut client = RmcpClient::new_http("http-server".to_string(), &cfg);
@@ -227,6 +345,7 @@ mod http_transport {
                 token: "test-token-abc".to_string(),
             }),
             headers: BTreeMap::new(),
+            call_timeout_secs: None,
         };
 
         let mut client = RmcpClient::new_http("http-bearer".to_string(), &cfg);
@@ -258,6 +377,7 @@ mod http_transport {
             url: format!("{}/mcp", server.uri()),
             auth: None,
             headers,
+            call_timeout_secs: None,
         };
 
         let mut client = RmcpClient::new_http("http-headers".to_string(), &cfg);
@@ -278,6 +398,7 @@ mod http_transport {
                 password: "p".to_string(),
             }),
             headers: BTreeMap::new(),
+            call_timeout_secs: None,
         };
 
         let mut client = RmcpClient::new_http("http-basic".to_string(), &cfg);
@@ -309,6 +430,7 @@ mod http_transport {
             url: "http://127.0.0.1:1/mcp".to_string(),
             auth: None,
             headers,
+            call_timeout_secs: None,
         };
 
         let mut client = RmcpClient::new_http("http-bad-header".to_string(), &cfg);

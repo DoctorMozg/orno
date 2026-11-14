@@ -256,6 +256,7 @@ mod tests {
         McpServerConfig::Stdio(McpStdioConfig {
             command: vec!["echo".to_string()],
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         })
     }
 

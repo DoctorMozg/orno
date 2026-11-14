@@ -28,6 +28,7 @@ fn filesystem_server_config(allowed_dir: &str) -> McpStdioConfig {
             allowed_dir.to_string(),
         ],
         env: std::collections::BTreeMap::new(),
+        call_timeout_secs: None,
     }
 }
 

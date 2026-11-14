@@ -229,6 +229,9 @@ pub struct McpStdioConfig {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.
+    #[serde(default)]
+    pub call_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -238,6 +241,9 @@ pub struct McpHttpConfig {
     pub auth: Option<McpAuthConfig>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.
+    #[serde(default)]
+    pub call_timeout_secs: Option<u64>,
 }
 
 /// MCP HTTP authentication. `bearer` takes a single token; `basic`

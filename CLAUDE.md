@@ -36,7 +36,7 @@ cargo machete                                       # unused-dep scan
 cargo nextest run --workspace --all-targets         # faster test runner (optional)
 ```
 
-CI (`.github/workflows/ci.yml`) runs 14 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `shellcheck`, `test`, `test-mcp-real`, `msrv`, `coverage`, `build-matrix`, `install-smoke`, and `dogfood`. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — phase activation after doc comments land.
+CI (`.github/workflows/ci.yml`) runs 13 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `shellcheck`, `test`, `test-mcp-real`, `coverage`, `build-matrix`, `install-smoke`, and `dogfood`. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — phase activation after doc comments land.
 
 ## Verification after every change batch
 

@@ -7,23 +7,25 @@
 //! # Lifecycle
 //! 1. Construct with [`new_stdio`][RmcpClient::new_stdio] or
 //!    [`new_http`][RmcpClient::new_http].
-//! 2. Call [`initialize`][super::McpClient::initialize] once to spawn/connect
-//!    and cache tools.
+//! 2. Call [`initialize`][super::McpClient::initialize] to spawn/connect and
+//!    cache tools; a repeat call returns the cached list.
 //! 3. Call [`call_tool`][super::McpClient::call_tool] any number of times.
 //! 4. Call [`shutdown`][super::McpClient::shutdown] at run end.
 
 use std::collections::{BTreeMap, HashMap};
+use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::{Peer, RoleClient, RunningService};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, Transport};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tracing::instrument;
 
 use crate::error::McpError;
@@ -36,14 +38,9 @@ use super::{McpClient, McpTool, McpToolCallResult};
 /// surfaces a timeout. A misbehaving stdio child or a slow HTTP
 /// endpoint must not be able to hang the whole pipeline indefinitely.
 const MCP_HANDSHAKE_TIMEOUT_SECS: u64 = 30;
-/// Maximum time a single `tools/call` may run before the client
-/// surfaces a timeout. Mirrors [`MCP_HANDSHAKE_TIMEOUT_SECS`]; a
-/// per-tool override is intentionally out of scope for v0.1.
-const MCP_CALL_TIMEOUT_SECS: u64 = 30;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Config snapshots (private — rmcp types never leak from here)
-// ──────────────────────────────────────────────────────────────────────────────
+/// Default `tools/call` timeout when the server config sets no
+/// `call_timeout_secs`.
+const DEFAULT_CALL_TIMEOUT_SECS: u64 = 30;
 
 struct StdioConfig {
     command: Vec<String>,
@@ -56,15 +53,13 @@ struct HttpConfig {
     headers: BTreeMap<String, String>,
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// State machine
-// ──────────────────────────────────────────────────────────────────────────────
-
 enum State {
     Pending(Config),
     Connected {
         /// Cloned from `RunningService` at initialize time; `call_tool` uses it.
         peer: Peer<RoleClient>,
+        /// `tools/list` result, returned again if `initialize` is repeated.
+        tools: Vec<McpTool>,
         /// Held so `shutdown` can call `cancel()`. Taken on first shutdown.
         service: Option<RunningService<RoleClient, ()>>,
     },
@@ -76,16 +71,13 @@ enum Config {
     Http(HttpConfig),
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Public struct
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// MCP client backed by `rmcp`. The concrete transport (stdio or HTTP) is
 /// selected at construction time; connecting is deferred to
 /// [`initialize`][McpClient::initialize] so callers can construct the client
 /// before the engine starts and then open connections as a batch.
 pub struct RmcpClient {
     server: String,
+    call_timeout: Duration,
     state: State,
 }
 
@@ -100,6 +92,7 @@ impl std::fmt::Debug for RmcpClient {
         f.debug_struct("RmcpClient")
             .field("server", &self.server)
             .field("transport", &transport_label)
+            .field("call_timeout", &self.call_timeout)
             .field("connected", &connected)
             .finish()
     }
@@ -110,6 +103,7 @@ impl RmcpClient {
     pub fn new_stdio(server: String, cfg: &McpStdioConfig) -> Self {
         Self {
             server,
+            call_timeout: call_timeout(cfg.call_timeout_secs),
             state: State::Pending(Config::Stdio(StdioConfig {
                 command: cfg.command.clone(),
                 env: cfg.env.clone(),
@@ -125,6 +119,7 @@ impl RmcpClient {
     pub fn new_http(server: String, cfg: &McpHttpConfig) -> Self {
         Self {
             server,
+            call_timeout: call_timeout(cfg.call_timeout_secs),
             state: State::Pending(Config::Http(HttpConfig {
                 url: cfg.url.clone(),
                 auth: cfg.auth.clone(),
@@ -133,10 +128,6 @@ impl RmcpClient {
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// McpClient impl
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl McpClient for RmcpClient {
@@ -148,9 +139,9 @@ impl McpClient for RmcpClient {
     async fn initialize(&mut self) -> Result<Vec<McpTool>, McpError> {
         let config = match &self.state {
             State::Pending(cfg) => cfg,
-            State::Connected { .. } => {
+            State::Connected { tools, .. } => {
                 tracing::warn!("initialize called on already-connected client");
-                return Ok(vec![]);
+                return Ok(tools.clone());
             },
             State::Disconnected => {
                 return Err(McpError::SpawnFailed {
@@ -197,6 +188,7 @@ impl McpClient for RmcpClient {
         tracing::debug!(tool_count = mcp_tools.len(), "mcp server initialized");
         self.state = State::Connected {
             peer,
+            tools: mcp_tools.clone(),
             service: Some(service),
         };
         Ok(mcp_tools)
@@ -215,34 +207,47 @@ impl McpClient for RmcpClient {
         };
 
         let mut param = CallToolRequestParams::new(tool.to_owned());
-        if let Some(obj) = args.as_object() {
-            param = param.with_arguments(obj.clone());
+        match args {
+            Value::Object(obj) => param = param.with_arguments(obj),
+            Value::Null => {},
+            other => {
+                return Err(McpError::CallFailed {
+                    server: self.server.clone(),
+                    tool: tool.to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "tool arguments must be a JSON object, got {}",
+                            json_kind(&other)
+                        ),
+                    )),
+                });
+            },
         }
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(MCP_CALL_TIMEOUT_SECS),
-            peer.call_tool(param),
-        )
-        .await
-        .map_err(|_| McpError::CallFailed {
-            server: self.server.clone(),
-            tool: tool.to_string(),
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("call_tool timed out after {MCP_CALL_TIMEOUT_SECS}s"),
-            )),
-        })?
-        .map_err(|e| McpError::CallFailed {
-            server: self.server.clone(),
-            tool: tool.to_string(),
-            source: Box::new(e),
-        })?;
+        // Dropping the in-flight call on timeout makes rmcp send
+        // `notifications/cancelled` to the server.
+        let result = tokio::time::timeout(self.call_timeout, peer.call_tool(param))
+            .await
+            .map_err(|_| McpError::CallFailed {
+                server: self.server.clone(),
+                tool: tool.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("call_tool timed out after {}s", self.call_timeout.as_secs()),
+                )),
+            })?
+            .map_err(|e| McpError::CallFailed {
+                server: self.server.clone(),
+                tool: tool.to_string(),
+                source: Box::new(e),
+            })?;
 
         let ok = !result.is_error.unwrap_or(false);
         let content = result
             .content
             .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+            .map(content_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -298,10 +303,6 @@ impl McpClient for RmcpClient {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Transport helpers (rmcp-specific, stays behind the trait boundary)
-// ──────────────────────────────────────────────────────────────────────────────
-
 async fn spawn_stdio_client(
     server_name: &str,
     cfg: &StdioConfig,
@@ -332,10 +333,18 @@ async fn spawn_stdio_client(
         cmd.env(k, v);
     }
 
-    let transport = TokioChildProcess::new(cmd).map_err(|e| McpError::SpawnFailed {
-        server: server_name.to_string(),
-        source: Box::new(e),
-    })?;
+    // stderr must not reach orno's own stderr (tracing JSON only), so pipe it
+    // into debug logs; it can carry secrets, hence debug level.
+    let (transport, child_stderr) = TokioChildProcess::builder(cmd)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| McpError::SpawnFailed {
+            server: server_name.to_string(),
+            source: Box::new(e),
+        })?;
+    if let Some(stderr) = child_stderr {
+        tokio::spawn(forward_stderr(server_name.to_string(), stderr));
+    }
 
     let service = tokio::time::timeout(
         Duration::from_secs(MCP_HANDSHAKE_TIMEOUT_SECS),
@@ -355,6 +364,46 @@ async fn spawn_stdio_client(
     })?;
 
     Ok(service)
+}
+
+async fn forward_stderr(server: String, stderr: tokio::process::ChildStderr) {
+    let mut lines = BufReader::new(stderr).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                tracing::debug!(mcp.server = %server, line = %line, "mcp server stderr");
+            },
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(mcp.server = %server, error = %e, "mcp stderr read failed");
+                break;
+            },
+        }
+    }
+}
+
+fn call_timeout(secs: Option<u64>) -> Duration {
+    Duration::from_secs(secs.unwrap_or(DEFAULT_CALL_TIMEOUT_SECS))
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn content_text(block: &ContentBlock) -> &str {
+    match block {
+        ContentBlock::Text(t) => &t.text,
+        ContentBlock::Image(_) => "[image content omitted]",
+        ContentBlock::Audio(_) => "[audio content omitted]",
+        _ => "[non-text content omitted]",
+    }
 }
 
 /// Open a streamable-HTTP MCP session against `cfg.url` and complete the

@@ -70,6 +70,15 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
     // runtime spawn / connect failures into actionable YAML authoring
     // errors.
     for (name, server) in &pipeline.mcp_servers {
+        let call_timeout_secs = match server {
+            McpServerConfig::Stdio(stdio) => stdio.call_timeout_secs,
+            McpServerConfig::Http(http) => http.call_timeout_secs,
+        };
+        if call_timeout_secs == Some(0) {
+            return Err(PipelineError::Validation(format!(
+                "mcp_servers.`{name}`: `call_timeout_secs` must be greater than zero",
+            )));
+        }
         match server {
             McpServerConfig::Stdio(stdio) if stdio.command.is_empty() => {
                 return Err(PipelineError::Validation(format!(
@@ -462,6 +471,7 @@ mod tests {
             McpServerConfig::Stdio(McpStdioConfig {
                 command: Vec::new(),
                 env: BTreeMap::new(),
+                call_timeout_secs: None,
             }),
         );
         let Err(PipelineError::Validation(msg)) = validate(&p) else {
@@ -470,6 +480,24 @@ mod tests {
         assert!(
             msg.contains("broken") && msg.contains("command"),
             "error should name the server and mention `command`: {msg}",
+        );
+    }
+
+    #[test]
+    fn mcp_zero_call_timeout_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        let McpServerConfig::Stdio(mut stdio) = stdio_mcp_server() else {
+            unreachable!("stdio_mcp_server builds a stdio config");
+        };
+        stdio.call_timeout_secs = Some(0);
+        p.mcp_servers
+            .insert("zero".to_string(), McpServerConfig::Stdio(stdio));
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error for zero call_timeout_secs");
+        };
+        assert!(
+            msg.contains("zero") && msg.contains("call_timeout_secs"),
+            "error should name the server and the field: {msg}",
         );
     }
 
@@ -523,6 +551,7 @@ mod tests {
         McpServerConfig::Stdio(McpStdioConfig {
             command: vec!["echo".to_string()],
             env: BTreeMap::new(),
+            call_timeout_secs: None,
         })
     }
 
@@ -707,6 +736,7 @@ mod tests {
             url: url.to_string(),
             auth: None,
             headers: BTreeMap::new(),
+            call_timeout_secs: None,
         })
     }
 

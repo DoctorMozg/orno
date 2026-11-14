@@ -1,5 +1,5 @@
 # cargo-deny 0.19+ configuration.
-# Run `cargo deny check` locally; CI runs deny per matrix {advisories, bans, licenses, sources}.
+# Run `cargo deny check` locally; CI runs a single `deny` job (`check`, all four sections).
 
 [graph]
 targets = [
@@ -42,9 +42,9 @@ allow = [
 confidence-threshold = 0.8
 
 # `ring` carries a composite MIT/ISC/OpenSSL license.
-# IMPORTANT: The hash below is a TEMPLATE VALUE. Before the deny/licenses CI
-# job passes, run `cargo deny check licenses` locally and replace the hash
-# with the value shown in the error output for the actual ring version.
+# The hash pins the LICENSE file contents of the ring version in Cargo.lock;
+# when a ring upgrade changes that file, `cargo deny check licenses` reports
+# the new value to paste here.
 [[licenses.clarify]]
 crate         = "ring"
 expression    = "MIT AND ISC AND OpenSSL"

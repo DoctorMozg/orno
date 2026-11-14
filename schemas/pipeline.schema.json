@@ -272,6 +272,16 @@
           ],
           "default": null
         },
+        "call_timeout_secs": {
+          "description": "Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "headers": {
           "type": "object",
           "additionalProperties": {
@@ -321,6 +331,16 @@
     "McpStdioConfig": {
       "type": "object",
       "properties": {
+        "call_timeout_secs": {
+          "description": "Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "command": {
           "description": "argv vector. Not passed through a shell.",
           "type": "array",
