@@ -150,10 +150,11 @@ impl RecordingTransport {
     /// hiding behind the original call's success path — a tape write
     /// error that cannot be observed defeats the strictness guarantee.
     fn write_entry(&self, entry: &TapeEntry) -> Result<(), LlmError> {
-        let raw_entry =
+        let mut raw_entry =
             serde_json::to_value(entry).map_err(|e| LlmError::ParseError(e.to_string()))?;
-        let line = serde_json::to_string(&self.redactor.redact_json(&raw_entry))
-            .map_err(|e| LlmError::ParseError(e.to_string()))?;
+        self.redactor.redact_json(&mut raw_entry);
+        let line =
+            serde_json::to_string(&raw_entry).map_err(|e| LlmError::ParseError(e.to_string()))?;
         let mut guard = self.tape.lock().expect("tape mutex poisoned");
         writeln!(*guard, "{line}").map_err(|e| LlmError::Transport(Box::new(e)))?;
         Ok(())

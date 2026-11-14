@@ -281,6 +281,46 @@ async fn tool_output_truncated_in_conversation_history() {
     );
 }
 
+#[tokio::test]
+async fn tool_output_redacts_secret_straddling_the_cap() {
+    // LongOutputTool emits 'a' * N; the secret is the aaaa run itself, so a
+    // cap inside it would leave a partial secret if truncation ran first.
+    let sink = Arc::new(InMemorySink::new());
+    let tool = Arc::new(LongOutputTool::new(1_000));
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        long_tool_call_response("c1"),
+        final_text_response(),
+    ]));
+    let secrets = std::collections::BTreeMap::from([("K".to_string(), "a".repeat(100))]);
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: transport.clone(),
+        sink,
+        redactor: Arc::new(Redactor::new(&secrets)),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    });
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_tool_calls = 1;
+    req.policy.max_tool_output_bytes = Some(50);
+    req.allowed_tools = vec!["LongOutputTool".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("loop completes");
+
+    let observed = transport.messages_seen();
+    let content = observed[1]
+        .iter()
+        .find_map(|m| match m {
+            OrnoChatMessage::ToolResult { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("tool result in second request");
+    assert!(!content.contains('a'), "partial secret leaked: {content}");
+}
+
 /// Build a tool-call response that targets `LongOutputTool` with a given
 /// call id. Shared by the message-history cap tests so each test stays
 /// focused on its own assertions rather than the response shape boilerplate.

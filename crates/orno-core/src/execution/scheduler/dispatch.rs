@@ -5,7 +5,7 @@
 //! orthogonal to `Engine::run`'s orchestration of the walker and the
 //! run-level aggregates. The inherent `impl Engine` block here adds
 //! `dispatch_node` + `on_payload_failure`; the free helpers
-//! (`render_error_chain`, `truncate_tail`, `node_response_ok`) stay
+//! (`render_error_chain`, `node_response_ok`) stay
 //! module-private and get their unit coverage in the test submodule
 //! below. `DispatchOutcome` is `pub(super)` so `Engine::run` in
 //! `mod.rs` can destructure it.
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::events::redactor::Keep;
 use crate::events::{Event, NodeFailure};
 use crate::execution::context::Context;
 use crate::node::{NodeResponse, kind_str, render_request};
@@ -160,9 +161,10 @@ impl Engine {
                 // cap because an LLM transport error can surface a
                 // multi-KB HTML body and a rendered prompt can carry
                 // a secret value.
-                let error = truncate_tail(
-                    &redactor.redact(&render_error_chain(&err)),
+                let error = redactor.redact_bounded(
+                    &render_error_chain(&err),
                     self.config.max_output_bytes,
+                    Keep::Tail,
                 );
                 tracing::warn!(
                     node.id = %node.id,
@@ -201,20 +203,17 @@ impl Engine {
             .get("signal")
             .and_then(Value::as_i64)
             .and_then(|s| i32::try_from(s).ok());
-        let stderr_tail = resp.output.get("stderr").and_then(Value::as_str).map(|s| {
-            redactor
-                .redact(&truncate_tail(s, self.config.max_output_bytes))
-                .into_owned()
-        });
+        let max = self.config.max_output_bytes;
+        let stderr_tail = resp
+            .output
+            .get("stderr")
+            .and_then(Value::as_str)
+            .map(|s| redactor.redact_bounded(s, max, Keep::Tail));
         let stdout_tail = if self.config.verbose {
             resp.output
                 .get("stdout")
                 .and_then(Value::as_str)
-                .map(|s| {
-                    redactor
-                        .redact(&truncate_tail(s, self.config.max_output_bytes))
-                        .into_owned()
-                })
+                .map(|s| redactor.redact_bounded(s, max, Keep::Tail))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -259,22 +258,6 @@ fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// Keep the **last** `max_bytes` of a string, on a UTF-8 boundary.
-/// Last bytes win because the trailing fragment of a tool's stderr
-/// is almost always where the actionable error sits — earlier output
-/// is setup noise. Returns the input unchanged when it already fits.
-fn truncate_tail(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let cut = s.len() - max_bytes;
-    let mut start = cut;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &s[start..])
-}
-
 /// Classify a successful `NodeResponse` against the originating node kind.
 /// Only shell nodes treat their payload's `exit_code` as a failure signal;
 /// agent and any future kinds default to success when `execute` returns `Ok`
@@ -308,6 +291,7 @@ fn node_response_ok(kind: &NodeKind, resp: &NodeResponse) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::truncate_tail;
     use crate::pipeline::schema::{AgentNode, ShellNode};
     use serde_json::json;
 

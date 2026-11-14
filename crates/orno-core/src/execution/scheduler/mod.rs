@@ -89,7 +89,7 @@ pub struct EngineConfig {
     /// draining the pipe to /dev/null so the child does not block on a
     /// full PIPE buffer. When a stream is truncated, an
     /// [`Event::NodeOutputTruncated`] envelope is emitted with the
-    /// `captured_bytes` total. Default 8 MiB — large enough for typical
+    /// `total_bytes` count. Default 8 MiB — large enough for typical
     /// build output, small enough to keep a single hostile node from
     /// exhausting RAM. Distinct from `max_output_bytes` (which caps
     /// log-line excerpts at 2 KB).
@@ -269,11 +269,8 @@ impl Engine {
             // diagnostic agents); the wire-format `NodeFailure` only
             // carries a bounded tail, the unbounded form lives here.
             if let Some(output) = node_output {
-                let output = if redactor.is_noop() {
-                    output
-                } else {
-                    redactor.redact_json(&output)
-                };
+                let mut output = output;
+                redactor.redact_json(&mut output);
                 context.record_node_output(&node.id, output);
             }
             if !node_ok {
@@ -494,6 +491,56 @@ mod tests {
             Some(false),
             "aggregate run must surface ok:false when any node fails",
         );
+    }
+
+    #[tokio::test]
+    async fn stderr_tail_redacts_secret_cut_by_truncation_window() {
+        use crate::node::shell::ShellExecutor;
+
+        let secret = "supersecretvalue";
+        let mut node = shell_node("leaky", "sh", &[]);
+        if let NodeKind::Shell(shell) = &mut node.kind {
+            shell.args = vec![
+                "-c".to_string(),
+                format!("printf '%050d%s' 0 {secret} >&2; exit 1"),
+            ];
+        }
+        let sink = Arc::new(InMemorySink::new());
+        let mut reg = NodeRegistry::new();
+        reg.register("shell", Arc::new(ShellExecutor::default()));
+        let config = EngineConfig {
+            // The 10-byte tail window starts inside the secret.
+            max_output_bytes: 10,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(
+            sink.clone(),
+            Arc::new(reg),
+            Arc::new(TemplateEngine::new()),
+            config,
+        );
+        let inputs = RunInputs {
+            secrets: BTreeMap::from([("TOKEN".to_string(), secret.to_string())]),
+            ..RunInputs::default()
+        };
+
+        engine
+            .run("run_test", &pipeline_of(vec![node]), inputs)
+            .await
+            .expect("run completes with a failed node");
+
+        let tail = sink
+            .snapshot()
+            .iter()
+            .find_map(|e| match &e.event {
+                Event::NodeFinished {
+                    failure: Some(NodeFailure::NodePayloadFailure { stderr_tail, .. }),
+                    ..
+                } => stderr_tail.clone(),
+                _ => None,
+            })
+            .expect("payload failure with stderr tail");
+        assert!(!tail.contains("ecretvalue"), "secret tail leaked: {tail}");
     }
 
     #[tokio::test]

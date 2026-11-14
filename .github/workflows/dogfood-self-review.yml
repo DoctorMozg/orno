@@ -20,8 +20,9 @@ name: dogfood-self-review
 #   5. `OPENROUTER_API_KEY` is delivered via `--secrets-file` so the value
 #      lives only inside orno's secret store, gets redacted from every
 #      event, and never reaches a tool's environment. `GH_TOKEN` is in the
-#      step env; the `post_comment` shell node hands it to `gh` through its
-#      `env:` map because the shell executor clears the inherited env.
+#      step env; the pipeline declares it under `secrets:` (so it is read
+#      from the process env and redacted) and the `post_comment` shell node
+#      hands it to `gh` through its `env:` map.
 
 on:
   pull_request:
@@ -105,10 +106,9 @@ jobs:
           PR_REPO: ${{ github.workspace }}/pr-head
           TRUSTED_ROOT: ${{ github.workspace }}/trusted-master
           GH_REPO: ${{ github.repository }}
-          # GH_TOKEN is listed in the pipeline's `pass_env:` block so it
-          # becomes available as `{{ env.GH_TOKEN }}` in templates.
-          # The `post_comment` node delivers it to `gh` via its `env:` map
-          # because the shell executor clears the inherited process env.
+          # GH_TOKEN is declared under the pipeline's `secrets:`; orno reads
+          # it from this env and the `post_comment` node passes it to `gh`
+          # via its `env:` map.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           version: v0.2.0

@@ -25,7 +25,7 @@ pub use bundle::{
 };
 pub use dummy::DummyTransport;
 pub use dummy::ScriptedTransport;
-pub use genai::GenAiTransport;
+pub use genai::{GenAiTransport, provider_api_key_env};
 pub use recording::RecordingTransport;
 pub use replay::ReplayTransport;
 

@@ -96,7 +96,8 @@ impl ToolHandler for SetStateHandler {
         // Redact secret leaves before storage so downstream template
         // renders never re-materialize a secret that happened to be in
         // the written payload.
-        let redacted = self.redactor.redact_json(&value);
+        let mut redacted = value;
+        self.redactor.redact_json(&mut redacted);
 
         let handle = inv.state_handle.ok_or_else(|| ToolError::Invocation {
             name: TOOL_NAME.to_string(),

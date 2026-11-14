@@ -10,7 +10,7 @@ Every event is wrapped in:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 4,
   "seq": 0,
   "timestamp": "2026-04-21T15:30:00.123456789Z",
   "event": { "type": "...", ... }
@@ -19,7 +19,7 @@ Every event is wrapped in:
 
 | Field            | Type        | Description                                                                                          |
 | ---------------- | ----------- | ---------------------------------------------------------------------------------------------------- |
-| `schema_version` | integer     | Currently `3`. Bumped on backwards-incompatible event-schema changes.                                |
+| `schema_version` | integer     | Currently `4`. Bumped on backwards-incompatible event-schema changes.                                |
 | `seq`            | integer     | Monotonic emission order, starting at `0` for `run_started`. Use this as the strict-ordering key.    |
 | `timestamp`      | string      | RFC 3339 UTC instant (`time::serde::rfc3339`). Joinable with stderr `tracing` lines on wall clock.   |
 | `event`          | object      | Internally-tagged variant — `event.type` discriminates.                                              |
@@ -135,7 +135,7 @@ Emitted when a `kind: shell` node's captured `stdout` or `stderr` exceeded the e
   "node_id": "noisy_build",
   "node_kind": "shell",
   "stream": "stdout",
-  "captured_bytes": 12582912,
+  "total_bytes": 12582912,
   "cap_bytes": 8388608
 }
 ```
@@ -145,10 +145,10 @@ Emitted when a `kind: shell` node's captured `stdout` or `stderr` exceeded the e
 | `node_id`        | string  | The shell node whose stream overflowed.                                                    |
 | `node_kind`      | string  | Always `"shell"` today. Carried for symmetry with the rest of the per-node envelopes.      |
 | `stream`         | string  | `"stdout"` or `"stderr"`.                                                                  |
-| `captured_bytes` | integer | Total bytes the child wrote on the stream before exiting. Always `>= cap_bytes`.           |
+| `total_bytes`    | integer | Total bytes the child wrote on the stream before exiting. Always `>= cap_bytes`.           |
 | `cap_bytes`      | integer | The cap that fired. Echoes `EngineConfig.max_node_output_bytes` for the run.               |
 
-Added in `schema_version: 3`.
+Added in `schema_version: 3`. The `total_bytes` field was named `captured_bytes` before `schema_version: 4`.
 
 ## Agent-loop events
 

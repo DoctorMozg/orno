@@ -18,7 +18,8 @@
 # at the policy level and `roots` jailed to the PR-head checkout. Even if a
 # PR rewrites the files at `roots`, the agent cannot exfiltrate secrets — the
 # secrets namespace is rendered only into templates that explicitly reference
-# `{{ secrets.* }}`, and this trusted YAML never does.
+# `{{ secrets.* }}`, and the only such reference is the `post_comment` node's
+# `env:` map, which no agent output reaches.
 #
 # Inputs (env, set by the workflow)
 # ---------------------------------
@@ -26,20 +27,19 @@
 #   PR_REPO       — absolute path to the PR-head checkout (`roots` for Read)
 #   TRUSTED_ROOT  — absolute path to the trusted-master checkout
 #   GH_REPO       — owner/name string for `gh pr comment --repo`
-#   GH_TOKEN      — listed in `pass_env:` so it is available as
-#                   `{{ env.GH_TOKEN }}` in templates. Delivered to the
-#                   `post_comment` shell node via its `env:` map; not in
-#                   `secrets:` because it is not an LLM-provider key and
-#                   does not need to be redacted from event output.
 #
-# Secrets (via `--secrets-file`)
-# ------------------------------
+# Secrets (read from the process env, or via `--secrets-file`)
+# ------------------------------------------------------------
 #   OPENROUTER_API_KEY — provider key auto-discovered by the LLM transport.
+#   GH_TOKEN           — declared as a secret so it is redacted from every
+#                        event. Delivered to the `post_comment` shell node
+#                        through its `env:` map as `{{ secrets.GH_TOKEN }}`.
 
 version: 1
 
 secrets:
   - OPENROUTER_API_KEY
+  - GH_TOKEN
 
 vars:
   pr_number: "{{ env.PR_NUMBER }}"
@@ -55,7 +55,6 @@ pass_env:
   - PR_REPO
   - TRUSTED_ROOT
   - GH_REPO
-  - GH_TOKEN
 
 agents:
   reviewer:
@@ -165,8 +164,7 @@ nodes:
     # `gh pr comment` reads GH_TOKEN from the child's environment. The
     # shell executor clears the inherited process env; GH_TOKEN is
     # delivered explicitly via this node's `env:` map, rendered from
-    # the `{{ env.GH_TOKEN }}` template variable (populated via
-    # `pass_env:` from the workflow step's `env:` block).
+    # `{{ secrets.GH_TOKEN }}` (read from the workflow step's `env:` block).
     kind: shell
     needs: [save_verdict]
     command: gh
@@ -179,4 +177,4 @@ nodes:
       - "--body-file"
       - "{{ vars.verdict_path }}"
     env:
-      GH_TOKEN: "{{ env.GH_TOKEN }}"
+      GH_TOKEN: "{{ secrets.GH_TOKEN }}"

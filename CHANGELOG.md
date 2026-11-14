@@ -9,6 +9,23 @@ once the first tagged release ships.
 
 ### Security
 
+- Redaction runs before truncation for node stderr/stdout tails and agent
+  tool output, so a secret cut by the size cap no longer leaks its tail.
+- The redactor also matches uppercase hex, unpadded base64, base64 of a
+  secret embedded at byte offset 1 or 2, percent-encoded and JSON-escaped
+  forms, and each long line of a multi-line secret; `redact_json` redacts
+  object keys too.
+- Provider API keys read from the process env (`OPENAI_API_KEY`, ...) are
+  redacted for the providers a pipeline uses, even when not declared under
+  `secrets:`.
+- `--record-bundle` scrubs every literal MCP `env` value, `headers` value
+  and `auth` token/password, not only HTTP bearer tokens.
+- `{{ secrets.* }}` / `{{ env.* }}` in `mcp_servers` (url, command, env,
+  headers, auth) are now rendered; before, the template text was sent
+  literally. A name listed in both `pass_env` and `secrets` fails
+  validation, and the `self-review` example moves `GH_TOKEN` to `secrets:`.
+- Dotenv parse errors and `-e` errors no longer echo the offending line,
+  and `Debug` output of MCP auth, `env` and `headers` config hides values.
 - `Read` / `Write` / `Edit` no longer follow a symlinked directory out
   of the root when the target does not exist yet (`link/new.txt` with
   `link -> /elsewhere`), and relative paths resolve against the root
@@ -21,6 +38,10 @@ once the first tagged release ships.
 
 ### Changed
 
+- **Breaking (wire):** `schema_version` is now `4`.
+  `node_output_truncated.captured_bytes` is renamed `total_bytes`
+  (it always held the total the child wrote), and `Event::BudgetExceeded`
+  stays removed; see `docs/reference/events.md`.
 - **Breaking:** an agent that lists `Bash` together with a non-empty
   `allowed_domains` or `roots` now fails validation, because a shell
   escapes both limits. Add `unconfined_shell: true` to the agent's
@@ -35,6 +56,9 @@ once the first tagged release ships.
 
 ### Fixed
 
+- A tape or bundle flush failure no longer leaks MCP child processes or
+  hides the engine error; the bundle records the pipeline text loaded at
+  startup instead of re-reading the file.
 - `Read`, `Write` and `Edit` reject FIFOs, devices and directories
   instead of hanging, and run their file I/O off the async workers.
 - `Write` and `Edit` keep the target's permissions (a 0755 script stays

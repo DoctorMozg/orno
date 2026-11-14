@@ -19,6 +19,23 @@ use crate::llm::{OrnoChatMessage, OrnoChatTool, Usage};
 /// Providers known in v0.1. Kept explicit so a typo in a pipeline YAML
 /// surfaces as `ConfigError` at run start, not a confusing genai
 /// adapter-mapping error mid-run.
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Env var a provider's API key is resolved from, or `None` for keyless
+/// providers (and unknown names). The CLI uses it to redact keys that
+/// were never declared under `secrets:`.
+#[must_use]
+pub fn provider_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(OPENAI_KEY_ENV),
+        "anthropic" => Some(ANTHROPIC_KEY_ENV),
+        "openrouter" => Some(OPENROUTER_KEY_ENV),
+        _ => None,
+    }
+}
+
 pub(super) const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "ollama", "openrouter"];
 
 /// Hard cap on the body bytes preserved on `LlmError::ApiError.body`.
@@ -127,7 +144,7 @@ pub(super) fn build_client(
 ) -> Result<Client, LlmError> {
     match provider {
         "openai" => {
-            let auth = resolve_auth("OPENAI_API_KEY", secrets);
+            let auth = resolve_auth(OPENAI_KEY_ENV, secrets);
             Ok(Client::builder()
                 .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
                     move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -141,7 +158,7 @@ pub(super) fn build_client(
                 .build())
         },
         "anthropic" => {
-            let auth = resolve_auth("ANTHROPIC_API_KEY", secrets);
+            let auth = resolve_auth(ANTHROPIC_KEY_ENV, secrets);
             Ok(Client::builder()
                 .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
                     move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
@@ -171,7 +188,7 @@ pub(super) fn build_client(
                 .build())
         },
         "openrouter" => {
-            let auth = resolve_auth("OPENROUTER_API_KEY", secrets);
+            let auth = resolve_auth(OPENROUTER_KEY_ENV, secrets);
             Ok(Client::builder()
                 .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
                     move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {

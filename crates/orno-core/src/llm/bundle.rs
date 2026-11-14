@@ -267,67 +267,97 @@ pub fn write_bundle(
     Ok(())
 }
 
-/// Replace literal MCP bearer tokens in `pipeline_yaml` with
-/// `<REDACTED>` so a shared bundle does not leak production credentials.
+/// Replace literal MCP credentials in `pipeline_yaml` with `<REDACTED>`
+/// so a shared bundle does not leak production secrets.
 ///
-/// The pipeline is parsed first to discover whether any HTTP server is
-/// configured with a literal (non-templated) bearer token. When the
-/// answer is no, the input is returned verbatim so comments and
-/// whitespace round-trip byte-for-byte for human inspection of the
-/// bundle. When the answer is yes, the YAML body is parsed into a
-/// generic `serde_yaml_ng::Value` tree and walked structurally:
-/// string leaves under a credential-shaped key are replaced with the
-/// redaction placeholder, then the tree is re-serialized. This avoids
-/// the failure modes of a naive `str::replace` loop — which could
-/// corrupt unrelated text that happened to share a token's bytes — at
-/// the cost of dropping comments and re-normalizing whitespace on the
-/// scrub-required path.
-///
-/// Template values (`{{ secrets.X }}`) are detected at every level and
-/// preserved verbatim, because they are placeholders the runtime
-/// renderer resolves, not the secret itself. If the structural walk
-/// fails (parse error on an otherwise-loadable pipeline body), the
-/// scrubber falls back to a literal-token Aho-Corasick replacement so
-/// the bundle is still emitted with the credentials redacted.
+/// The YAML is always parsed into a generic tree and walked
+/// structurally. When something was scrubbed the tree is re-serialized
+/// (comments and whitespace are lost); otherwise the input comes back
+/// verbatim. String
+/// leaves under a credential-shaped key are replaced, and so is every
+/// literal value under an MCP server's `env`, every `headers` value and
+/// the `token` / `password` of its `auth` block. Template values
+/// (`{{ secrets.X }}`) are kept verbatim because the runtime resolves
+/// them; they are placeholders, not the secret. If the generic parse
+/// fails on an otherwise-loadable pipeline, the literal credentials are
+/// replaced by an Aho-Corasick scan of the raw text instead.
 pub fn scrub_pipeline_secrets(pipeline_yaml: &str) -> Result<String, BundleError> {
     let pipeline: Pipeline = serde_yaml_ng::from_str(pipeline_yaml)
         .map_err(|e| BundleError::PipelineParse(e.to_string()))?;
 
-    let mut tokens: Vec<String> = Vec::new();
-    for server in pipeline.mcp_servers.values() {
-        if let McpServerConfig::Http(http) = server
-            && let Some(McpAuthConfig::Bearer { token }) = &http.auth
-        {
-            // Template placeholders are not literal secrets — skip
-            // them so the rendered YAML still resolves at replay time.
-            if token.contains("{{") || token.is_empty() {
-                continue;
-            }
-            tokens.push(token.clone());
-        }
-    }
-
-    if tokens.is_empty() {
-        return Ok(pipeline_yaml.to_string());
-    }
-
     match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(pipeline_yaml) {
         Ok(mut value) => {
+            let original = value.clone();
             scrub_yaml_value(&mut value);
+            scrub_mcp_servers(&mut value);
+            // Untouched input keeps its comments and formatting.
+            if value == original {
+                return Ok(pipeline_yaml.to_string());
+            }
             serde_yaml_ng::to_string(&value).map_err(|e| BundleError::PipelineParse(e.to_string()))
         },
         Err(parse_err) => {
-            // The pipeline parsed as `Pipeline` above, so a generic
-            // `Value` parse should not normally fail. If it does, fall
-            // back to the literal-token path so the bundle still ships
-            // with the credentials redacted — the alternative would be
-            // emitting plaintext tokens.
+            // Shipping plaintext credentials is worse than a degraded scrub.
             tracing::warn!(
                 error = %parse_err,
-                "bundle scrub: generic YAML parse failed; falling back to literal-token replacement",
+                "bundle scrub: generic YAML parse failed; falling back to literal replacement",
             );
-            Ok(scrub_yaml_with_tokens(pipeline_yaml, &tokens))
+            Ok(scrub_yaml_with_tokens(
+                pipeline_yaml,
+                &literal_mcp_credentials(&pipeline),
+            ))
         },
+    }
+}
+
+fn is_literal(value: &str) -> bool {
+    !value.is_empty() && !value.contains("{{")
+}
+
+fn literal_mcp_credentials(pipeline: &Pipeline) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for server in pipeline.mcp_servers.values() {
+        match server {
+            McpServerConfig::Stdio(stdio) => out.extend(stdio.env.values().cloned()),
+            McpServerConfig::Http(http) => {
+                out.extend(http.headers.values().cloned());
+                match &http.auth {
+                    Some(McpAuthConfig::Bearer { token }) => out.push(token.clone()),
+                    Some(McpAuthConfig::Basic { password, .. }) => out.push(password.clone()),
+                    _ => {},
+                }
+            },
+        }
+    }
+    out.retain(|v| is_literal(v));
+    out
+}
+
+/// Replace every literal string under MCP `env`, `headers` and the
+/// credential fields of `auth`, whatever the key is called.
+fn scrub_mcp_servers(root: &mut serde_yaml_ng::Value) {
+    use serde_yaml_ng::Value;
+    let Some(servers) = root.get_mut("mcp_servers").and_then(Value::as_mapping_mut) else {
+        return;
+    };
+    let scrub_leaf = |leaf: &mut Value| {
+        if matches!(leaf, Value::String(t) if is_literal(t)) {
+            *leaf = Value::String(BEARER_REDACTION_PLACEHOLDER.to_string());
+        }
+    };
+    for (_, server) in servers.iter_mut() {
+        for section in ["env", "headers"] {
+            if let Some(map) = server.get_mut(section).and_then(Value::as_mapping_mut) {
+                map.iter_mut().for_each(|(_, v)| scrub_leaf(v));
+            }
+        }
+        if let Some(auth) = server.get_mut("auth").and_then(Value::as_mapping_mut) {
+            for field in ["token", "password"] {
+                if let Some(v) = auth.get_mut(field) {
+                    scrub_leaf(v);
+                }
+            }
+        }
     }
 }
 
@@ -759,6 +789,41 @@ nodes:
             "bundle YAML must contain the redaction placeholder: {}",
             read.pipeline_yaml,
         );
+    }
+
+    #[test]
+    fn stdio_env_headers_and_basic_password_are_scrubbed() {
+        let yaml_body = "\
+version: 1
+mcp_servers:
+  local:
+    transport: stdio
+    command: [srv]
+    env:
+      API_THING: literal-env-value
+  remote:
+    transport: http
+    url: https://mcp.example.com
+    headers:
+      Authorization: Bearer literal-header-value
+    auth:
+      kind: basic
+      user: bob
+      password: literal-basic-pw
+nodes:
+  - id: n
+    kind: shell
+    command: \"true\"
+";
+        let scrubbed = scrub_pipeline_secrets(yaml_body).expect("scrub");
+        for leaked in [
+            "literal-env-value",
+            "literal-header-value",
+            "literal-basic-pw",
+        ] {
+            assert!(!scrubbed.contains(leaked), "{leaked} leaked: {scrubbed}");
+        }
+        assert!(scrubbed.contains("bob"), "username is not a credential");
     }
 
     #[test]

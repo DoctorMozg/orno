@@ -17,31 +17,42 @@ use std::fmt;
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use serde_json::Value;
+
+use super::{truncate_excerpt, truncate_tail};
+
+/// Derived patterns (embedded base64, per-line, escaped forms) shorter
+/// than this are dropped; a short fragment would over-redact ordinary text.
+const MIN_DERIVED_PATTERN_LEN: usize = 8;
+
+const MARKER: &str = "***";
+
+/// Which end of an over-long string survives bounding.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Keep {
+    Head,
+    Tail,
+}
 
 /// Replaces every occurrence of a known secret value with `"***"`.
 ///
 /// Build once per run from the resolved secret map and share across
-/// the engine's emission sites. Empty-valued secrets are dropped — an
+/// the engine's emission sites. Empty-valued secrets are dropped; an
 /// empty-string match would replace every zero-width position in the
 /// haystack, which is worse than not redacting at all.
 ///
-/// Each secret is registered alongside its base64 (standard and URL-safe
-/// no-padding) and lowercase hex encodings so an LLM cannot bypass
-/// redaction by encoding a secret before exfiltrating it. The expanded
-/// pattern set is fed into an Aho-Corasick automaton so a single pass
-/// over the haystack catches every match regardless of how many secrets
-/// are registered. `MatchKind::LeftmostLongest` preserves the "longest
-/// pattern wins" behavior in the rare case where two patterns overlap.
+/// Each secret is registered alongside the encodings an LLM could use to
+/// smuggle it out: base64 (standard, no-pad, URL-safe; also at byte
+/// offsets 1 and 2 so a secret embedded in a larger blob matches),
+/// lower/upper hex, percent-encoding and the JSON-escaped form. Each
+/// line of a multi-line secret is its own pattern. All patterns feed one
+/// Aho-Corasick automaton with `LeftmostLongest` semantics.
 #[derive(Default)]
 pub struct Redactor {
-    /// Patterns registered with the automaton — the raw secrets plus
-    /// their base64/hex encodings. Retained for `Clone` reconstruction
-    /// (the automaton itself does not expose its source patterns).
+    /// Patterns registered with the automaton, kept so `Clone` can rebuild it.
     values: Vec<String>,
-    /// Compiled multi-pattern matcher. `None` when no secrets were
-    /// registered so the no-op path costs nothing.
+    /// `None` when no secrets were registered so the no-op path costs nothing.
     ac: Option<AhoCorasick>,
 }
 
@@ -49,64 +60,58 @@ impl Redactor {
     /// Build a redactor from the run's `secrets.*` namespace. Duplicate
     /// values collapse to one entry; empty values are dropped because a
     /// zero-width match would corrupt every position in the haystack.
-    /// Every retained secret also contributes its base64 and hex
-    /// encodings to the pattern set.
     #[must_use]
     pub fn new(secrets: &BTreeMap<String, String>) -> Self {
-        let raw: Vec<String> = secrets
+        let raw: Vec<&str> = secrets
             .values()
+            .map(String::as_str)
             .filter(|v| !v.is_empty())
-            .cloned()
             .collect();
-        Self::from_values(Self::expand_encodings(raw))
+        Self::from_values(Self::expand_encodings(&raw))
     }
 
-    /// Expand each raw secret into its literal form plus base64
-    /// (standard and URL-safe-no-pad) and lowercase-hex encodings, then
-    /// sort and dedup so the automaton sees each unique pattern once.
-    fn expand_encodings(raw: Vec<String>) -> Vec<String> {
-        let mut patterns: Vec<String> = Vec::with_capacity(raw.len() * 4);
+    fn expand_encodings(raw: &[&str]) -> Vec<String> {
+        let mut patterns: Vec<String> = Vec::with_capacity(raw.len() * 16);
         for v in raw {
+            patterns.push((*v).to_string());
             let bytes = v.as_bytes();
-            let b64_standard = STANDARD.encode(bytes);
-            let b64_url = URL_SAFE_NO_PAD.encode(bytes);
-            let hex_val = hex::encode(bytes);
-            patterns.push(v);
-            // Encodings of an empty input produce empty strings; the
-            // earlier non-empty filter on `raw` makes this unreachable
-            // for real input, but the guard keeps the contract local.
-            if !b64_standard.is_empty() {
-                patterns.push(b64_standard);
+            patterns.push(STANDARD.encode(bytes));
+            patterns.push(STANDARD_NO_PAD.encode(bytes));
+            patterns.push(URL_SAFE_NO_PAD.encode(bytes));
+            let hex_lower = hex::encode(bytes);
+            patterns.push(hex_lower.to_uppercase());
+            patterns.push(hex_lower);
+
+            for offset in 0..=2 {
+                patterns.extend(embedded_base64(bytes, offset));
             }
-            if !b64_url.is_empty() {
-                patterns.push(b64_url);
+
+            let mut derived = vec![percent_encode(v, false), percent_encode(v, true)];
+            if let Ok(json) = serde_json::to_string(v) {
+                derived.push(json[1..json.len() - 1].to_string());
             }
-            if !hex_val.is_empty() {
-                patterns.push(hex_val);
+            if v.contains('\n') {
+                derived.extend(v.lines().map(|l| l.trim().to_string()));
             }
+            patterns.extend(
+                derived
+                    .into_iter()
+                    .filter(|p| p.len() >= MIN_DERIVED_PATTERN_LEN || p == v),
+            );
         }
+        patterns.retain(|p| !p.is_empty());
         patterns.sort();
         patterns.dedup();
         patterns
     }
 
-    /// Compile an `AhoCorasick` automaton over `values`. Pulled out so
-    /// `Clone` can rebuild the automaton from the retained pattern list
-    /// without re-deriving the constructor's deduplication step.
     fn from_values(values: Vec<String>) -> Self {
         let ac = if values.is_empty() {
             None
         } else {
-            // `LeftmostLongest` preserves the legacy semantics: when two
-            // secrets overlap at the same start position, the longer one
-            // wins so a shorter substring secret never slices a longer
-            // one mid-token.
-            //
-            // `expect` here is acceptable: the only documented failure
-            // mode of `AhoCorasick::new` over a non-empty `&[String]`
-            // input is exhausting the internal state-id space, which
-            // requires far more than the handful of secrets a real
-            // pipeline registers.
+            // Longest-wins keeps a shorter substring secret from slicing a
+            // longer one mid-token. Build only fails on state-id exhaustion,
+            // far beyond a pipeline's handful of secrets.
             Some(
                 AhoCorasick::builder()
                     .match_kind(MatchKind::LeftmostLongest)
@@ -123,50 +128,111 @@ impl Redactor {
         self.values.is_empty()
     }
 
-    /// Replace every occurrence of any known secret with `"***"`.
-    /// Returns `Borrowed` when nothing changes so no-op callers pay no
-    /// allocation.
+    /// Replace every occurrence of any known secret with `"***"` in a
+    /// single scan. Returns `Borrowed` when nothing matched.
     #[must_use]
     pub fn redact<'a>(&self, s: &'a str) -> Cow<'a, str> {
         let Some(ac) = self.ac.as_ref() else {
             return Cow::Borrowed(s);
         };
-        if !ac.is_match(s) {
+        let mut matches = ac.find_iter(s).peekable();
+        if matches.peek().is_none() {
             return Cow::Borrowed(s);
         }
         let mut out = String::with_capacity(s.len());
         let mut last = 0;
-        for mat in ac.find_iter(s) {
+        for mat in matches {
             out.push_str(&s[last..mat.start()]);
-            out.push_str("***");
+            out.push_str(MARKER);
             last = mat.end();
         }
         out.push_str(&s[last..]);
         Cow::Owned(out)
     }
 
-    /// Recursively redact string leaves inside a JSON value. Numbers,
-    /// booleans, and nulls pass through unchanged; objects and arrays
-    /// rebuild themselves with redacted children.
+    /// Redact first, then bound the length. Bounding first could cut a
+    /// secret in half and leave its tail unmatched by every pattern.
     #[must_use]
-    pub fn redact_json(&self, v: &Value) -> Value {
-        match v {
-            Value::String(s) => Value::String(self.redact(s).into_owned()),
-            Value::Array(items) => {
-                Value::Array(items.iter().map(|i| self.redact_json(i)).collect())
-            },
-            Value::Object(map) => {
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (k, val) in map {
-                    out.insert(k.clone(), self.redact_json(val));
-                }
-                Value::Object(out)
-            },
-            // Non-string primitives cannot carry a secret by themselves —
-            // return unchanged so the caller skips any allocation.
-            other => other.clone(),
+    pub(crate) fn redact_bounded(&self, s: &str, max_bytes: usize, keep: Keep) -> String {
+        let redacted = self.redact(s);
+        match keep {
+            Keep::Head => truncate_excerpt(&redacted, max_bytes),
+            Keep::Tail => truncate_tail(&redacted, max_bytes),
         }
     }
+
+    /// Recursively redact string leaves and object keys in place.
+    /// Numbers, booleans and nulls are left untouched, and nothing is
+    /// allocated when no secret matches.
+    pub fn redact_json(&self, v: &mut Value) {
+        if self.ac.is_none() {
+            return;
+        }
+        match v {
+            Value::String(s) => {
+                if let Cow::Owned(redacted) = self.redact(s) {
+                    *s = redacted;
+                }
+            },
+            Value::Array(items) => items.iter_mut().for_each(|i| self.redact_json(i)),
+            Value::Object(map) => {
+                let leaking: Vec<String> = map
+                    .keys()
+                    .filter(|k| matches!(self.redact(k), Cow::Owned(_)))
+                    .cloned()
+                    .collect();
+                for key in leaking {
+                    if let Some(val) = map.remove(&key) {
+                        map.insert(self.redact(&key).into_owned(), val);
+                    }
+                }
+                map.values_mut().for_each(|val| self.redact_json(val));
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Base64 forms of `bytes` as they appear inside a larger blob when
+/// `offset` (0..=2) bytes precede them. Only characters fully determined
+/// by the secret's own bits are kept; the boundary characters depend on
+/// the adjacent bytes.
+fn embedded_base64(bytes: &[u8], offset: usize) -> Vec<String> {
+    let mut padded = vec![0u8; offset];
+    padded.extend_from_slice(bytes);
+    let skip = (offset * 8).div_ceil(6);
+    let full = padded.len() * 8 / 6;
+    if full <= skip {
+        return Vec::new();
+    }
+    [
+        STANDARD_NO_PAD.encode(&padded),
+        URL_SAFE_NO_PAD.encode(&padded),
+    ]
+    .into_iter()
+    .map(|enc| enc[skip..full].to_string())
+    .filter(|p| p.len() >= MIN_DERIVED_PATTERN_LEN)
+    .collect()
+}
+
+/// RFC 3986 percent-encoding of everything except unreserved characters.
+fn percent_encode(s: &str, lowercase_hex: bool) -> String {
+    let digits = if lowercase_hex {
+        b"0123456789abcdef"
+    } else {
+        b"0123456789ABCDEF"
+    };
+    let mut out = String::with_capacity(s.len() * 3);
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push(char::from(digits[usize::from(b >> 4)]));
+            out.push(char::from(digits[usize::from(b & 0x0f)]));
+        }
+    }
+    out
 }
 
 // `AhoCorasick` is not `Debug`, so we omit it from the printed form and
@@ -259,13 +325,13 @@ mod tests {
         // booleans, and nulls cannot carry a secret by themselves so they
         // must pass through bit-for-bit.
         let r = redactor_with(&[("k", "topsecret")]);
-        let value = json!({
+        let mut out = json!({
             "field": "leak topsecret here",
             "count": 42,
             "flag": true,
             "missing": null,
         });
-        let out = r.redact_json(&value);
+        r.redact_json(&mut out);
         assert_eq!(out["field"], json!("leak *** here"));
         assert_eq!(out["count"], json!(42));
         assert_eq!(out["flag"], json!(true));
@@ -310,11 +376,11 @@ mod tests {
         // booleans flow through unchanged; only string leaves get the
         // redaction marker.
         let r = redactor_with(&[("k", "topsecret")]);
-        let value = json!({
+        let mut out = json!({
             "outer": { "inner": "topsecret" },
             "list": ["topsecret", 42, true],
         });
-        let out = r.redact_json(&value);
+        r.redact_json(&mut out);
         assert_eq!(out["outer"]["inner"], json!("***"));
         assert_eq!(out["list"][0], json!("***"));
         assert_eq!(out["list"][1], json!(42));
@@ -359,5 +425,76 @@ mod tests {
         let r = redactor_with(&[("k", "hunter2")]);
         let out = r.redact("hex: 68756e74657232 end").into_owned();
         assert_eq!(out, "hex: *** end");
+    }
+
+    #[test]
+    fn redacts_uppercase_hex_and_no_pad_base64() {
+        let r = redactor_with(&[("k", "hunter2")]);
+        assert_eq!(r.redact("x 68756E74657232 y"), "x *** y");
+        // `aHVudGVyMg` is the no-pad form; the padded form is covered above.
+        assert_eq!(r.redact("x aHVudGVyMg y"), "x *** y");
+    }
+
+    #[test]
+    fn redacts_base64_of_secret_embedded_at_every_offset() {
+        let secret = "s3cr3t-token-value";
+        let r = redactor_with(&[("k", secret)]);
+        for prefix in ["", "A", "AB"] {
+            let blob = format!("{prefix}{secret}trailing-bytes");
+            for enc in [STANDARD.encode(&blob), URL_SAFE_NO_PAD.encode(&blob)] {
+                let text = format!("data={enc}");
+                let out = r.redact(&text);
+                assert!(
+                    out.contains(MARKER),
+                    "offset {} not redacted: {out}",
+                    prefix.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn redacts_percent_encoded_secret() {
+        let r = redactor_with(&[("k", "p@ss word/1234")]);
+        assert_eq!(r.redact("q=p%40ss%20word%2F1234&x=1"), "q=***&x=1");
+        assert_eq!(r.redact("q=p%40ss%20word%2f1234"), "q=***");
+    }
+
+    #[test]
+    fn redacts_json_escaped_secret() {
+        let r = redactor_with(&[("k", "line\"quoted\"secret")]);
+        assert_eq!(
+            r.redact(r#"{"a":"line\"quoted\"secret"}"#),
+            r#"{"a":"***"}"#
+        );
+    }
+
+    #[test]
+    fn multiline_secret_redacts_each_long_line() {
+        let r = redactor_with(&[(
+            "k",
+            "-----BEGIN KEY-----\nabcdefghijkl\nshort\n-----END KEY-----",
+        )]);
+        let out = r.redact("leak: abcdefghijkl and short");
+        assert_eq!(out, "leak: *** and short");
+    }
+
+    #[test]
+    fn redact_json_redacts_object_keys() {
+        let r = redactor_with(&[("k", "topsecret")]);
+        let mut v = json!({"topsecret": 1, "ok": {"topsecret": "x"}});
+        r.redact_json(&mut v);
+        assert_eq!(v, json!({"***": 1, "ok": {"***": "x"}}));
+    }
+
+    #[test]
+    fn redact_bounded_redacts_secret_straddling_the_cut() {
+        let r = redactor_with(&[("k", "supersecretvalue")]);
+        let input = "0123456789supersecretvalue";
+        // A 10-byte tail window would start mid-secret ("ecretvalue").
+        let tail = r.redact_bounded(input, 10, Keep::Tail);
+        assert!(!tail.contains("ecretvalue"), "{tail}");
+        let head = r.redact_bounded(input, 18, Keep::Head);
+        assert!(!head.contains("supersecret"), "{head}");
     }
 }

@@ -66,6 +66,14 @@ impl EventEnvelope {
 
 /// Wire-format version.
 ///
+/// **3 → 4.** Two breaking changes shipped together:
+///
+/// 1. `Event::NodeOutputTruncated.captured_bytes` is renamed to
+///    `total_bytes`; it always carried the total the child wrote, not
+///    the retained prefix.
+/// 2. `Event::BudgetExceeded` was removed; budget breaches surface as
+///    a failed node with a typed `NodeFailure`.
+///
 /// **2 → 3 (PR #3, pre-opensource hardening pass).** Adds
 /// `Event::NodeOutputTruncated`, emitted when a `kind: shell` node's
 /// captured `stdout` or `stderr` exceeded the engine's new
@@ -86,7 +94,7 @@ impl EventEnvelope {
 ///    field. On Unix, a process killed by a signal now reports
 ///    `signal = Some(n)` and `exit_code = None` — previously
 ///    `exit_code` was rolled to `-1` and the signal was lost.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Keep the leading `max_bytes` of a string on a UTF-8 boundary,
 /// suffixed with `"…"` when truncation occurred. HTTP error bodies put
@@ -108,4 +116,18 @@ pub(crate) fn truncate_excerpt(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// Keep the trailing `max_bytes` of a string on a UTF-8 boundary,
+/// prefixed with `"…"` when truncation occurred. The cause of a failed
+/// process sits at the end of its stderr, so the tail is what matters.
+pub(crate) fn truncate_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
 }

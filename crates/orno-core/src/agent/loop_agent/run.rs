@@ -16,6 +16,7 @@ use tracing::{instrument, warn};
 
 use crate::agent::{Agent, AgentOutput, AgentRequest};
 use crate::error::AgentError;
+use crate::events::redactor::Keep;
 use crate::events::{BudgetKind, Event, LlmFailure};
 use crate::llm::{LlmRequest, OrnoChatMessage, OrnoChatTool};
 use crate::tool::net_guard::DomainRules;
@@ -31,28 +32,6 @@ use super::{LoopAgent, SUBAGENT_PREFIX, wire_name_from_yaml};
 /// gigabyte of output gets truncated to this cap before it reaches the
 /// LLM transport.
 const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
-
-/// Truncate a tool-result string to at most `cap` bytes (head-keep), and
-/// append a one-character ellipsis marker if truncation happened. Used
-/// before the result is pushed onto the conversation history so a single
-/// runaway tool call cannot drag the next LLM request past the
-/// provider's prompt-size ceiling. Splits on a UTF-8 char boundary so
-/// the marker concatenation is always safe.
-fn truncate_tool_output(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
-        return s.to_string();
-    }
-    // Walk back from `cap` to the previous UTF-8 boundary. `is_char_boundary(0)`
-    // is always true so the loop terminates.
-    let mut end = cap;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = String::with_capacity(end + '…'.len_utf8());
-    out.push_str(&s[..end]);
-    out.push('…');
-    out
-}
 
 /// Approximate byte cost of a single conversation message. Used by the
 /// history-cap check so the loop does not need to serialize the full
@@ -571,21 +550,18 @@ impl Agent for LoopAgent {
                     .policy
                     .max_tool_output_bytes
                     .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
-                let truncated = truncate_tool_output(&result_content, cap);
-                // Redact `secrets.*` leaves before the result enters the
-                // conversation history. The handler may have read a
-                // secret-bearing file or echoed an env var, and the
-                // history is replayed verbatim on the next LLM request —
-                // without this hop, a secret would leave the host on the
-                // outbound prompt even though every other wire-format
-                // field already runs through `redactor`.
-                let redacted = self.config.redactor.redact(&truncated);
+                // Redact before bounding so a secret straddling the cap is
+                // still matched; the history is replayed on the next request.
+                let redacted =
+                    self.config
+                        .redactor
+                        .redact_bounded(&result_content, cap, Keep::Head);
                 // INVARIANT: messages must have refcount 1 here — no transport may retain
                 // an Arc clone across the await point. If violated, make_mut deep-clones
                 // the entire history on every iteration (O(n²)). See LlmTransport contract.
                 Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
-                    content: redacted.into_owned(),
+                    content: redacted,
                 });
                 if let Some(cap) = req.policy.max_message_history_bytes {
                     enforce_message_history_cap(Arc::make_mut(&mut messages), cap);

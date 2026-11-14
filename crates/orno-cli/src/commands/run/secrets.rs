@@ -82,14 +82,40 @@ pub(super) fn resolve_inputs(pipeline: &Pipeline, flags: &RunFlags) -> Result<Ru
 fn parse_inline_env(s: &str) -> Result<(String, String)> {
     let (k, v) = s
         .split_once('=')
-        .ok_or_else(|| anyhow!("expected `KEY=VAL`, got `{s}`"))?;
+        .ok_or_else(|| anyhow!("`-e` argument is not in `KEY=VAL` form"))?;
     if k.is_empty() {
-        bail!("empty key in `-e {s}`");
+        bail!("empty key in `-e` argument");
     }
     if v.is_empty() {
         tracing::warn!(key = %k, "empty value for `-e {k}=` — did you mean to unset this variable?");
     }
     Ok((k.to_string(), v.to_string()))
+}
+
+/// Declared secrets plus the API keys of the providers this pipeline uses,
+/// read from the process env, so keys that were never listed under
+/// `secrets:` are still redacted. Used for redaction only, never for
+/// template rendering.
+pub(super) fn redaction_values(
+    pipeline: &Pipeline,
+    secrets: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let providers = pipeline.agents.values().map(|a| a.provider.as_str());
+    provider_key_values(secrets, providers, |name| std::env::var(name).ok())
+}
+
+fn provider_key_values<'a>(
+    secrets: &BTreeMap<String, String>,
+    providers: impl Iterator<Item = &'a str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    let mut out = secrets.clone();
+    for env_name in providers.filter_map(orno_core::llm::provider_api_key_env) {
+        if let Some(value) = lookup(env_name) {
+            out.entry(env_name.to_string()).or_insert(value);
+        }
+    }
+    out
 }
 
 /// Dotenv parser supporting the dialect features common to bash-style
@@ -148,10 +174,9 @@ pub(super) fn parse_dotenv(path: &Path) -> Result<Vec<(String, String)>> {
         let body = line.strip_prefix("export ").unwrap_or(line).trim_start();
         let (k, raw_value) = body.split_once('=').ok_or_else(|| {
             anyhow!(
-                "`{}` line {}: expected `KEY=VAL`, got `{}`",
+                "`{}` line {}: expected `KEY=VAL`",
                 path.display(),
                 lineno + 1,
-                line,
             )
         })?;
         let key = k.trim();
@@ -188,7 +213,7 @@ fn parse_dotenv_value(raw: &str) -> Result<String> {
         let value = &rest[..end];
         let tail = rest[end + 1..].trim_start();
         if !tail.is_empty() && !tail.starts_with('#') {
-            bail!("trailing content after closing double-quote: `{tail}`");
+            bail!("trailing content after closing double-quote");
         }
         return Ok(value.to_string());
     }
@@ -199,7 +224,7 @@ fn parse_dotenv_value(raw: &str) -> Result<String> {
         let value = &rest[..end];
         let tail = rest[end + 1..].trim_start();
         if !tail.is_empty() && !tail.starts_with('#') {
-            bail!("trailing content after closing single-quote: `{tail}`");
+            bail!("trailing content after closing single-quote");
         }
         return Ok(value.to_string());
     }
@@ -342,6 +367,14 @@ mod parse_dotenv_tests {
     }
 
     #[test]
+    fn parse_errors_never_echo_file_content() {
+        for body in ["hunter2-no-equals\n", "FOO=\"value\" hunter2-tail\n"] {
+            let msg = format!("{:#}", parse(body).expect_err("must error"));
+            assert!(!msg.contains("hunter2"), "secret content leaked: {msg}");
+        }
+    }
+
+    #[test]
     fn empty_key_is_rejected() {
         let err = parse("=value\n").expect_err("must error");
         let msg = format!("{err:#}");
@@ -387,6 +420,31 @@ mod parse_dotenv_tests {
         assert!(
             msg.contains("chmod") || msg.contains("permission") || msg.contains("readable"),
             "error must mention the permission problem, got: {msg}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_key_tests {
+    use super::*;
+
+    #[test]
+    fn env_keys_of_used_providers_join_the_redaction_set() {
+        let lookup = |n: &str| match n {
+            "OPENAI_API_KEY" => Some("sk-from-env".to_string()),
+            "ANTHROPIC_API_KEY" => Some("unused-provider-key".to_string()),
+            _ => None,
+        };
+        let declared = BTreeMap::from([("OWN".to_string(), "own-secret".to_string())]);
+        let out = provider_key_values(&declared, ["openai", "ollama"].into_iter(), lookup);
+        assert_eq!(
+            out.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-from-env")
+        );
+        assert_eq!(out.get("OWN").map(String::as_str), Some("own-secret"));
+        assert!(
+            !out.contains_key("ANTHROPIC_API_KEY"),
+            "only used providers"
         );
     }
 }

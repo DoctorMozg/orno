@@ -226,7 +226,7 @@ async fn emit_truncation(
     warn!(
         node.id = %id,
         stream = stream,
-        captured_bytes = total,
+        total_bytes = total,
         cap_bytes = cap,
         "shell node output truncated to cap",
     );
@@ -235,7 +235,7 @@ async fn emit_truncation(
         node_id: id.to_string(),
         node_kind: "shell".to_string(),
         stream: stream.to_string(),
-        captured_bytes: total as u64,
+        total_bytes: total as u64,
         cap_bytes: cap as u64,
     })
     .await;
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(resp.output["exit_code"], json!(0));
 
         // One NodeOutputTruncated envelope, stream=stdout,
-        // captured_bytes=64 KiB, cap=16 KiB.
+        // total_bytes=64 KiB, cap=16 KiB.
         let envs = sink.snapshot();
         let trunc = envs
             .iter()
@@ -539,10 +539,10 @@ mod tests {
                 Event::NodeOutputTruncated {
                     node_id,
                     stream,
-                    captured_bytes,
+                    total_bytes,
                     cap_bytes,
                     ..
-                } => Some((node_id.clone(), stream.clone(), *captured_bytes, *cap_bytes)),
+                } => Some((node_id.clone(), stream.clone(), *total_bytes, *cap_bytes)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -550,7 +550,7 @@ mod tests {
         let (node_id, stream, captured, cap_reported) = &trunc[0];
         assert_eq!(node_id, "noisy");
         assert_eq!(stream, "stdout");
-        assert_eq!(*captured, 65536, "captured_bytes must echo total");
+        assert_eq!(*captured, 65536, "total_bytes must echo total");
         assert_eq!(*cap_reported, cap as u64);
     }
 

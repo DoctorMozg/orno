@@ -32,6 +32,7 @@ use crate::error::LlmError;
 use crate::pipeline::AgentConfig;
 
 use super::{LlmRequest, LlmResponse, LlmTransport, OrnoChatToolCall};
+pub use convert::provider_api_key_env;
 use convert::{
     KNOWN_PROVIDERS, build_client, convert_usage, is_transient_genai_error, map_genai_error,
     orno_msg_to_genai, orno_tool_to_genai,

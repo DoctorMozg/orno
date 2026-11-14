@@ -34,7 +34,8 @@ mod run;
 
 use std::sync::Arc;
 
-use crate::events::{EventSink, Redactor, truncate_excerpt};
+use crate::events::redactor::Keep;
+use crate::events::{EventSink, Redactor};
 use crate::llm::LlmTransport;
 use crate::tool::ToolHandler;
 use crate::tool::net_guard::{HostResolver, SystemResolver};
@@ -120,10 +121,9 @@ impl LoopAgent {
     /// prompts lead with the instruction and responses lead with the
     /// answer.
     fn excerpt_for_wire(&self, s: &str) -> String {
-        truncate_excerpt(
-            self.config.redactor.redact(s).as_ref(),
-            self.config.body_excerpt_max_bytes,
-        )
+        self.config
+            .redactor
+            .redact_bounded(s, self.config.body_excerpt_max_bytes, Keep::Head)
     }
 
     /// Locate the handler for a tool by its YAML-facing name. Returns

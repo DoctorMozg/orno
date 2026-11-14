@@ -60,6 +60,19 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
         return Err(PipelineError::Validation("pipeline has no nodes".into()));
     }
 
+    // A name in both lists would put the same value in the unredacted
+    // `env.*` namespace as well as `secrets.*`.
+    if let Some(name) = pipeline
+        .pass_env
+        .iter()
+        .find(|n| pipeline.secrets.contains(n))
+    {
+        return Err(PipelineError::Validation(format!(
+            "`{name}` is listed in both `pass_env` and `secrets`; keep it in `secrets` only \
+             so it stays redacted",
+        )));
+    }
+
     // Reject MCP server declarations that would fail (or be unsafe) at run
     // start. Stdio: an empty argv would surface as an opaque "no such
     // file" at spawn. HTTP: only http/https are allowed; bare `http://` is
@@ -413,6 +426,20 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             nodes,
         }
+    }
+
+    #[test]
+    fn name_in_both_pass_env_and_secrets_is_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.pass_env = vec!["GH_TOKEN".to_string(), "HOME".to_string()];
+        p.secrets = vec!["GH_TOKEN".to_string()];
+        let Err(PipelineError::Validation(msg)) = validate(&p) else {
+            panic!("expected Validation error on pass_env/secrets overlap");
+        };
+        assert!(
+            msg.contains("GH_TOKEN") && msg.contains("pass_env"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! assertions happen inside agent tooling rather than as sibling kinds.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -229,7 +230,7 @@ pub enum McpServerConfig {
     Http(McpHttpConfig),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpStdioConfig {
     /// argv vector. Not passed through a shell.
     pub command: Vec<String>,
@@ -240,7 +241,7 @@ pub struct McpStdioConfig {
     pub call_timeout_secs: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpHttpConfig {
     pub url: String,
     #[serde(default)]
@@ -255,11 +256,96 @@ pub struct McpHttpConfig {
 /// MCP HTTP authentication. `bearer` takes a single token; `basic`
 /// takes `user`/`password`; `none` is the absence-of-auth sentinel and
 /// is equivalent to omitting the `auth` block.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum McpAuthConfig {
     Bearer { token: String },
     Basic { user: String, password: String },
     None,
+}
+
+/// Prints map keys but hides values, which carry credentials for MCP
+/// `env` and `headers`.
+struct RedactedValues<'a>(&'a BTreeMap<String, String>);
+
+impl fmt::Debug for RedactedValues<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.keys().map(|k| (k, "<redacted>")))
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpStdioConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpStdioConfig")
+            .field("command", &self.command)
+            .field("env", &RedactedValues(&self.env))
+            .field("call_timeout_secs", &self.call_timeout_secs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpHttpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpHttpConfig")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("headers", &RedactedValues(&self.headers))
+            .field("call_timeout_secs", &self.call_timeout_secs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for McpAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("token", &"<redacted>")
+                .finish(),
+            Self::Basic { user, .. } => f
+                .debug_struct("Basic")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::None => f.write_str("None"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_hides_every_credential_value() {
+        let cfg = McpHttpConfig {
+            url: "https://mcp.example".to_string(),
+            auth: Some(McpAuthConfig::Basic {
+                user: "bob".to_string(),
+                password: "pw-secret".to_string(),
+            }),
+            headers: BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer hdr-secret".to_string(),
+            )]),
+            call_timeout_secs: None,
+        };
+        let stdio = McpStdioConfig {
+            command: vec!["srv".to_string()],
+            env: BTreeMap::from([("TOKEN".to_string(), "env-secret".to_string())]),
+            call_timeout_secs: None,
+        };
+        let bearer = McpAuthConfig::Bearer {
+            token: "tok-secret".to_string(),
+        };
+        let out = format!("{cfg:?} {stdio:?} {bearer:?}");
+        for leaked in ["pw-secret", "hdr-secret", "env-secret", "tok-secret"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(out.contains("<redacted>"));
+        assert!(out.contains("Authorization"));
+    }
 }

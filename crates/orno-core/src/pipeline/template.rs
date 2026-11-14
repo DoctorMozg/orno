@@ -21,6 +21,8 @@ use serde_json::{Value, json};
 
 use crate::error::PipelineError;
 
+use super::schema::McpServerConfig;
+
 /// Maximum number of bytes accepted for a single template source string.
 /// Templates above this threshold are rejected at render time rather than
 /// at parse time so the cap is enforced even when the template comes from
@@ -163,6 +165,34 @@ pub fn render_pipeline_vars(
         );
     }
     Ok(out)
+}
+
+/// Render every string of an MCP server declaration (url, argv, env and
+/// header values, auth fields) against the `{ env, secrets }` namespace,
+/// the same context nodes get. Rendered values are never logged here;
+/// errors carry only the server name and the template error.
+///
+/// Errors: `PipelineError::Template` when a string fails to render.
+pub fn render_mcp_server(
+    tmpl: &TemplateEngine,
+    server_name: &str,
+    config: &McpServerConfig,
+    env: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, String>,
+) -> Result<McpServerConfig, PipelineError> {
+    let ctx = json!({ "env": env, "secrets": secrets });
+    let raw = serde_json::to_value(config).map_err(|e| {
+        PipelineError::Validation(format!(
+            "mcp_servers.`{server_name}`: not serializable: {e}"
+        ))
+    })?;
+    let rendered = render_value(tmpl, &format!("mcp_servers.{server_name}"), &raw, &ctx)?;
+    // The serde error is dropped on purpose: it can quote a rendered value.
+    serde_json::from_value(rendered).map_err(|_| {
+        PipelineError::Validation(format!(
+            "mcp_servers.`{server_name}`: rendered config does not match the schema"
+        ))
+    })
 }
 
 /// Walk a `Value` tree and emit a `tracing::warn!` for every `secrets.X`
@@ -636,5 +666,64 @@ mod tests {
             json!("the-real-value"),
             "render must resolve the declared secret",
         );
+    }
+
+    #[test]
+    fn mcp_server_config_renders_secrets_in_every_string_field() {
+        use crate::pipeline::schema::{McpAuthConfig, McpHttpConfig, McpStdioConfig};
+
+        let tmpl = TemplateEngine::new();
+        let env = env_from(&[("HOST", "mcp.example.com")]);
+        let secrets = env_from(&[("T", "real-token")]);
+
+        let http = McpServerConfig::Http(McpHttpConfig {
+            url: "https://{{ env.HOST }}/mcp".to_string(),
+            auth: Some(McpAuthConfig::Bearer {
+                token: "{{ secrets.T }}".to_string(),
+            }),
+            headers: BTreeMap::from([("X-Key".to_string(), "k-{{ secrets.T }}".to_string())]),
+            call_timeout_secs: Some(5),
+        });
+        let rendered = render_mcp_server(&tmpl, "h", &http, &env, &secrets).expect("render");
+        let McpServerConfig::Http(cfg) = rendered else {
+            panic!("transport must survive the round trip");
+        };
+        assert_eq!(cfg.url, "https://mcp.example.com/mcp");
+        assert!(matches!(cfg.auth, Some(McpAuthConfig::Bearer { token }) if token == "real-token"));
+        assert_eq!(cfg.headers["X-Key"], "k-real-token");
+        assert_eq!(cfg.call_timeout_secs, Some(5));
+
+        let stdio = McpServerConfig::Stdio(McpStdioConfig {
+            command: vec!["srv".to_string(), "--token={{ secrets.T }}".to_string()],
+            env: BTreeMap::from([("TOKEN".to_string(), "{{ secrets.T }}".to_string())]),
+            call_timeout_secs: None,
+        });
+        let McpServerConfig::Stdio(cfg) =
+            render_mcp_server(&tmpl, "s", &stdio, &env, &secrets).expect("render")
+        else {
+            panic!("transport must survive the round trip");
+        };
+        assert_eq!(cfg.command[1], "--token=real-token");
+        assert_eq!(cfg.env["TOKEN"], "real-token");
+    }
+
+    #[test]
+    fn mcp_server_render_fails_on_undeclared_secret() {
+        use crate::pipeline::schema::McpStdioConfig;
+
+        let stdio = McpServerConfig::Stdio(McpStdioConfig {
+            command: vec!["srv".to_string()],
+            env: BTreeMap::from([("TOKEN".to_string(), "{{ secrets.MISSING }}".to_string())]),
+            call_timeout_secs: None,
+        });
+        let err = render_mcp_server(
+            &TemplateEngine::new(),
+            "s",
+            &stdio,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect_err("strict undefined must fail");
+        assert!(matches!(err, PipelineError::Template { .. }));
     }
 }

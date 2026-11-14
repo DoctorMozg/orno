@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 
 fn orno() -> Command {
@@ -780,4 +781,183 @@ nodes:
             && stdout.contains(r#""<interrupted>""#),
         "expected run_finished+ok:false+<interrupted>: {stdout}",
     );
+}
+
+#[test]
+fn validate_rejects_name_in_both_pass_env_and_secrets() {
+    let file = write_pipeline(
+        r#"
+version: 1
+pass_env: [GH_TOKEN]
+secrets: [GH_TOKEN]
+nodes:
+  - id: n
+    kind: shell
+    command: "true"
+"#,
+    );
+    orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("GH_TOKEN").and(contains("pass_env")));
+}
+
+#[test]
+fn validates_self_review_example() {
+    orno()
+        .args(["validate", "../../examples/self-review/pipeline.yaml"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn provider_key_from_env_is_redacted_in_events() {
+    // The key is never declared under `secrets:`; the CLI must still
+    // redact it because the pipeline uses the `openai` provider.
+    let key = "sk-live-provider-key-0123456789";
+    let yaml = r#"
+version: 1
+agents:
+  a:
+    model: gpt-5
+    provider: openai
+    system: "s"
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: n
+    kind: agent
+    agent: a
+    initial_prompt: "hi"
+"#;
+    let pipeline = write_pipeline(yaml);
+    let tape = write_pipeline(&format!(
+        r#"[{{"content": "the key is {key}", "finish_reason": "stop"}}]"#
+    ));
+    let assert = orno()
+        .env("ORNO_TEST_LLM_TRANSPORT", "scripted")
+        .env("ORNO_TEST_SCRIPTED_TAPE", tape.path())
+        .env("OPENAI_API_KEY", key)
+        .args(["run", pipeline.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(key), "provider key leaked: {stdout}");
+    assert!(stdout.contains("the key is ***"), "stdout: {stdout}");
+}
+
+/// Minimal stdio MCP server that records the `TOKEN` env var it was
+/// spawned with, then answers the handshake.
+#[cfg(unix)]
+const ENV_RECORDING_MCP: &str = r#"
+import sys, json, os
+with open(sys.argv[1], "w") as f:
+    f.write(os.environ.get("TOKEN", "<unset>"))
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    m, mid = msg.get("method", ""), msg.get("id")
+    if m == "initialize":
+        res = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "f", "version": "0"}}
+    elif m == "tools/list":
+        res = {"tools": []}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}), flush=True)
+"#;
+
+#[cfg(unix)]
+#[test]
+fn mcp_stdio_env_secret_template_reaches_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("server.py");
+    let out = dir.path().join("token.txt");
+    std::fs::write(&script, ENV_RECORDING_MCP).expect("write script");
+    let yaml = format!(
+        r#"
+version: 1
+secrets: [MCP_TOKEN]
+mcp_servers:
+  fake:
+    transport: stdio
+    command: ["python3", "{}", "{}"]
+    env:
+      TOKEN: "{{{{ secrets.MCP_TOKEN }}}}"
+nodes:
+  - id: n
+    kind: shell
+    command: "true"
+"#,
+        script.display(),
+        out.display()
+    );
+    let pipeline = write_pipeline(&yaml);
+    let assert = orno()
+        .env("MCP_TOKEN", "real-mcp-token-value")
+        .args(["run", pipeline.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("real-mcp-token-value"), "stdout: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("server recorded its env"),
+        "real-mcp-token-value",
+        "the server must receive the rendered secret, not the template",
+    );
+}
+
+#[test]
+fn bundle_records_the_pipeline_loaded_at_startup() {
+    // The node rewrites the pipeline file mid-run; the bundle must still
+    // carry the original text.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("p.yaml");
+    let bundle = dir.path().join("out.bundle");
+    let yaml = format!(
+        "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: sh\n    args: [\"-c\", \"echo EDIT''ED >> {}\"]\n",
+        path.display()
+    );
+    std::fs::write(&path, &yaml).expect("write pipeline");
+    orno()
+        .args([
+            "run",
+            path.to_str().unwrap(),
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("EDITED"),
+        "node must have edited the file"
+    );
+    let recorded = std::fs::read_to_string(&bundle).expect("bundle");
+    assert!(!recorded.contains("EDITED"), "bundle: {recorded}");
+}
+
+#[test]
+fn flush_failure_after_successful_run_fails_the_command() {
+    // A directory at the bundle path makes the post-run bundle write fail.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle_dir = dir.path().join("bundle");
+    std::fs::create_dir(&bundle_dir).expect("mkdir");
+    let assert = orno_with_dummy_transport()
+        .args([
+            "run",
+            "../../examples/hello/pipeline.yaml",
+            "--record-bundle",
+            bundle_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("writing bundle"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains(r#""type":"run_finished""#), "{stdout}");
 }
