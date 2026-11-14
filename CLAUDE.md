@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## About orno
 
-Orno is a CI-native runner for **strict agentic loops** (Rust workspace) at v0.2.0. The agent loop, tool handlers (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`, `SubagentHandler`, `McpHandler`), LLM transport (via `genai`), MCP client (via `rmcp`), execution scheduler, and record/replay are all implemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
+Orno is a CI-native runner for **strict agentic loops** (Rust workspace) at v0.3.0. The agent loop, tool handlers (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`, `SubagentHandler`, `McpHandler`), LLM transport (via `genai`), MCP client (via `rmcp`), execution scheduler, and record/replay are all implemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
 
 "Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style), not peer-to-peer messaging between agents.
 
@@ -92,7 +92,7 @@ Parallel tool calls are executed **serially** in declaration order. Parallelism 
 
 ## Pipeline wire format
 
-User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.2.0):
+User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.3.0):
 
 - `version: u32` — schema version.
 - `vars: Map<String, Value>` — template variables (MiniJinja).
@@ -105,7 +105,7 @@ Two distinct serde tag conventions are intentional:
 - `Event` uses `#[serde(tag = "type")]` — lifecycle events.
 - `NodeKind` / `NodeRequest` use `#[serde(tag = "kind")]` — pipeline node discriminator.
 
-Both are `#[non_exhaustive]`. v0.2.0 node kinds are `agent` and `shell`. `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
+Both are `#[non_exhaustive]`. v0.3.0 node kinds are `agent` and `shell`. `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
 
 Execution model: `Engine::run` drives a generator-style `DagWalker` (`execution::walker`) over the pipeline's DAG, dispatches each ready node through `NodeRegistry::get(kind_str).execute(id, req)` against a per-node `Context` (`execution::context`), and on node failure emits `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` for every transitively-dependent node. Disjoint branches keep running.
 

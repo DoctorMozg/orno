@@ -18,7 +18,7 @@ This page is the operator-facing checklist for cutting an orno release. The rele
    git push origin v<X.Y.Z>
    ```
    Pre-release? Use `v<X.Y.Z>-rc.1` (or similar `-` suffix). The release workflow auto-detects pre-releases via `contains(github.ref, '-')`.
-   The tag must equal `workspace.package.version` in the root `Cargo.toml`; the workflow fails otherwise. Also bump the pinned `v0.2.0` in the README install command to the new tag.
+   The tag must equal `workspace.package.version` in the root `Cargo.toml`; the workflow fails otherwise. Also bump the pinned version in the README install command and examples to the new tag.
 3. **Wait for the draft release.** The `release` workflow creates the GitHub Release as a **draft** first, then runs the `upload-assets` matrix. If any platform build fails, `fail-fast: true` aborts the rest and the draft stays in place for you to triage. **Do not retry by re-tagging** — fix the source, delete the draft, retag.
 4. **Verify all assets attached.** On the draft release page, confirm:
    - `orno-v<X.Y.Z>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`)
