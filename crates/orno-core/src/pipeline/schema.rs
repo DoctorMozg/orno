@@ -194,6 +194,12 @@ pub struct AgentPolicy {
     /// and tight enough to prevent multi-gigabyte prompt payloads.
     #[serde(default = "default_max_message_history_bytes")]
     pub max_message_history_bytes: Option<usize>,
+    /// Acknowledges that `Bash` escapes `allowed_domains` and `roots`:
+    /// a shell can open any connection and touch any path orno cannot
+    /// see. Pipeline validation rejects an agent that lists `Bash`
+    /// next to either confinement unless this is `true`.
+    #[serde(default)]
+    pub unconfined_shell: bool,
 }
 
 fn default_max_message_history_bytes() -> Option<usize> {

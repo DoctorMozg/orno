@@ -1,16 +1,19 @@
 //! `WebFetch` tool — HTTP GET a URL. Requires `allow_network`.
-//! Domain policy is enforced by `LoopAgent` before dispatch.
+//! `LoopAgent` gates the first URL; this handler gates every redirect hop.
 
-use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::instrument;
 
+use super::net_guard::{
+    DomainRules, DomainVerdict, GuardedDns, SystemResolver, is_blocked_ip, literal_ip,
+};
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::agent::loop_agent::policy::{is_blocked_ipv4, is_blocked_ipv6};
 use crate::error::ToolError;
 
 /// Cap on the number of redirects this client will follow. Lower than
@@ -18,12 +21,6 @@ use crate::error::ToolError;
 /// burn the per-request timeout before the gate's IP block-list has a
 /// chance to interrupt it.
 const MAX_REDIRECTS: usize = 5;
-
-/// Hard timeout on the blocking DNS resolution issued for each
-/// redirect host. A hostile resolver can otherwise stall a worker
-/// thread for the full system-DNS timeout (multiple seconds), and we
-/// already have a per-request timeout governing total latency.
-const REDIRECT_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Response bodies above this cap are truncated before being returned to
 // the agent. Keeps a runaway page from blowing out the LLM context
@@ -53,158 +50,80 @@ fn arg_field_names(args: &Value) -> String {
 
 /// HTTP GET handler with a shared `reqwest::Client` reused across calls.
 ///
-/// The client is built once at construction time so every invocation
-/// reuses the same connection pool and TLS session cache. A per-call
-/// `timeout_secs` argument overrides the client's default timeout via
-/// `RequestBuilder::timeout` without rebuilding the client.
-///
-/// `allowed_domains` and `blocked_domains` are stored on the struct
-/// and enforced by an explicit redirect loop in `invoke`. The agent's
-/// policy gate already enforces these on the *initial* URL; the loop
-/// re-applies them on every hop, plus resolves the redirect host's
-/// DNS records and blocks any hop whose A/AAAA records resolve to a
-/// private/loopback/link-local/CGNAT/metadata IP. Suffix matching
-/// mirrors `LoopAgent::policy::host_matches` so
-/// `blocked_domains: ["evil.com"]` also denies `sub.evil.com`. The
-/// underlying `reqwest::Client` is built with `redirect::Policy::none()`
-/// so reqwest never follows a hop without going through our checks —
-/// the previous `redirect::Policy::custom` callback was synchronous and
-/// could only inspect literal-IP hosts, leaving a hostname `CNAMEd` to a
-/// metadata IP undefended.
+/// The client follows no redirects itself: `invoke` walks each hop and
+/// applies the calling agent's domain lists (`ToolInvocation::domains`)
+/// plus the literal-IP block list before the next GET. Hostnames are
+/// vetted at connect time by [`GuardedDns`], so the address that passes
+/// the block list is the one dialed. Proxies are disabled because a
+/// proxy resolves the destination itself and would sidestep both checks.
 #[derive(Debug, Clone)]
 pub struct WebFetchHandler {
     client: reqwest::Client,
     default_timeout: Duration,
-    allowed_domains: Vec<String>,
-    blocked_domains: Vec<String>,
-}
-
-/// Outcome of evaluating a redirect hop's host against the handler's
-/// domain policy. Returned by [`evaluate_redirect_host`] so the matching
-/// rules stay testable without driving the surrounding async loop.
-#[derive(Debug, PartialEq, Eq)]
-enum RedirectDomainDecision {
-    /// Host passes both lists (or neither list applies); follow.
-    Allow,
-    /// Host matches `blocked_domains`; deny with the captured host name.
-    DenyBlocked(String),
-    /// `allowed_domains` is non-empty and host matches none of it; deny.
-    DenyOutsideAllowed(String),
-}
-
-/// Suffix-match a host against a single domain entry: `host == d` or
-/// `host` ends with `.d`. Mirrors `LoopAgent::policy::host_matches` so
-/// the redirect-loop call site and the initial-URL gate apply the same rule.
-fn host_matches_domain(host: &str, domain: &str) -> bool {
-    host == domain || host.ends_with(&format!(".{domain}"))
-}
-
-/// Apply the domain policy to a redirect hop's host. Pure function so
-/// the redirect-loop call site stays a thin shim over testable logic.
-fn evaluate_redirect_host(
-    host: &str,
-    allowed_domains: &[String],
-    blocked_domains: &[String],
-) -> RedirectDomainDecision {
-    if blocked_domains.iter().any(|d| host_matches_domain(host, d)) {
-        return RedirectDomainDecision::DenyBlocked(host.to_string());
-    }
-    if !allowed_domains.is_empty() && !allowed_domains.iter().any(|d| host_matches_domain(host, d))
-    {
-        return RedirectDomainDecision::DenyOutsideAllowed(host.to_string());
-    }
-    RedirectDomainDecision::Allow
-}
-
-/// Predicate over the unified IPv4/IPv6 block list used during
-/// redirect-target validation. Thin wrapper over the address-family
-/// specific predicates in [`crate::agent::loop_agent::policy`] so the
-/// redirect loop reads as `is_private_ip(ip)` regardless of family.
-fn is_private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_blocked_ipv4(v4),
-        IpAddr::V6(v6) => is_blocked_ipv6(v6),
-    }
-}
-
-/// Resolve `host` to its A/AAAA records on a blocking thread, with a
-/// hard 5-second cap. The synchronous `ToSocketAddrs` resolver would
-/// otherwise stall the executor while a hostile DNS server held the
-/// connection open; offloading via `spawn_blocking` keeps the runtime
-/// responsive, and the timeout bounds the worker-thread occupancy.
-async fn resolve_redirect_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
-    let host_owned = host.to_string();
-    let join = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        format!("{host_owned}:0")
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<IpAddr>>())
-    });
-    match tokio::time::timeout(REDIRECT_DNS_TIMEOUT, join).await {
-        Ok(Ok(Ok(addrs))) => Ok(addrs),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(join_err)) => Err(std::io::Error::other(join_err)),
-        Err(_elapsed) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "DNS timed out after 5s",
-        )),
-    }
 }
 
 impl WebFetchHandler {
-    /// Construct a handler with a single shared `reqwest::Client` and
-    /// empty domain lists. Domain enforcement on redirect hops is
-    /// effectively a no-op for instances built this way; use
-    /// [`WebFetchHandler::with_domains`] to bake in the operator's
-    /// `allowed_domains` / `blocked_domains` for redirect-time defense.
+    /// Construct a handler with a single shared `reqwest::Client`.
     ///
     /// `default_timeout` is the timeout applied to a request that does
     /// not supply its own `timeout_secs` argument; passing `None` falls
     /// back to the built-in 30-second default.
     #[must_use]
     pub fn new(default_timeout: Option<Duration>) -> Self {
-        Self::with_domains(default_timeout, Vec::new(), Vec::new())
+        let dns = GuardedDns::new(Arc::new(SystemResolver));
+        Self::build(default_timeout, dns)
     }
 
-    /// Construct a handler whose `invoke` redirect loop rejects hops to
-    /// hosts outside the configured domain policy *and* whose resolved
-    /// A/AAAA records land on a private/loopback/link-local/metadata IP.
-    /// Domain lists are stored on the struct so the async redirect loop
-    /// in `invoke` can read them; the `reqwest::Client` is built with
-    /// `redirect::Policy::none()` so reqwest never follows a hop
-    /// without going through our checks.
-    ///
-    /// Both lists are empty by default; `blocked_domains` always wins
-    /// over `allowed_domains` for hosts that match both.
-    #[must_use]
-    pub fn with_domains(
-        default_timeout: Option<Duration>,
-        allowed_domains: Vec<String>,
-        blocked_domains: Vec<String>,
-    ) -> Self {
+    fn build(default_timeout: Option<Duration>, dns: GuardedDns) -> Self {
         let default_timeout =
             default_timeout.unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
-        // `reqwest::Client::builder().build()` only fails when TLS
-        // backend init fails, which is a startup-fatal misconfiguration;
-        // panic here is the same behavior as `Client::new()`.
-        //
-        // Redirects are disabled at the client level: each hop is
-        // followed manually by the loop in `invoke` so that DNS-bound
-        // hostnames (e.g. a CNAME to `169.254.169.254`) can be resolved
-        // and validated against the IP block list before another GET
-        // is issued. The previous `Policy::custom` callback was
-        // synchronous and could not perform name resolution, leaving
-        // hostname-based SSRF unblocked.
+        // `build()` only fails when TLS backend init fails, which is a
+        // startup-fatal misconfiguration, same as `Client::new()`.
         let client = reqwest::Client::builder()
             .timeout(default_timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(dns)
+            .no_proxy()
             .build()
             .expect("default reqwest client must build");
         Self {
             client,
             default_timeout,
-            allowed_domains,
-            blocked_domains,
+        }
+    }
+
+    /// Handler whose DNS is replaced and unfiltered, so a test can point
+    /// fake hostnames at a loopback server. Literal IPs stay blocked.
+    #[cfg(test)]
+    fn for_test(resolver: Arc<dyn super::net_guard::HostResolver>) -> Self {
+        fn allow_all(_: std::net::IpAddr) -> bool {
+            false
+        }
+        let dns = GuardedDns::with_filter(resolver, allow_all);
+        Self::build(None, dns)
+    }
+
+    /// Reject a URL the handler must not request, whether it is the
+    /// initial one or a redirect target.
+    fn check_url(url: &reqwest::Url, domains: DomainRules<'_>) -> Result<(), ToolError> {
+        let deny = |reason: String| ToolError::Invocation {
+            name: "WebFetch".to_string(),
+            source: Box::new(std::io::Error::other(reason)),
+        };
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(deny(format!("scheme `{scheme}` not permitted")));
+        }
+        if let Some(ip) = literal_ip(url)
+            && is_blocked_ip(ip)
+        {
+            return Err(deny(format!("`{ip}` is a blocked address")));
+        }
+        let host = url.host_str().unwrap_or_default();
+        match domains.check(host) {
+            DomainVerdict::Blocked => Err(deny(format!("`{host}` matches blocked_domains"))),
+            DomainVerdict::NotAllowed => Err(deny(format!("`{host}` is outside allowed_domains"))),
+            _ => Ok(()),
         }
     }
 }
@@ -229,16 +148,12 @@ impl ToolHandler for WebFetchHandler {
     fn effect(&self) -> ToolEffect {
         ToolEffect::Network
     }
-    #[expect(
-        clippy::too_many_lines,
-        reason = "redirect-loop with per-hop DNS resolution, IP block check, and domain validation"
-    )]
-    async fn invoke(&self, _inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
+    #[instrument(skip(self, inv, args), fields(tool.name = "WebFetch", tool.call_id = %inv.call_id))]
+    async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         // Retain the args' field names (not values) so the error message
         // pins the offending field even when serde only reports a
-        // type-level mismatch (e.g. `invalid type: integer …, expected a
-        // string`). Values are omitted to avoid echoing caller-supplied
-        // payloads into the log.
+        // type-level mismatch. Values are omitted to avoid echoing
+        // caller-supplied payloads into the log.
         let fields = arg_field_names(&args);
         let WebFetchArgs { url, timeout_secs } =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArgs {
@@ -248,13 +163,11 @@ impl ToolHandler for WebFetchHandler {
 
         let request_timeout = timeout_secs.map_or(self.default_timeout, Duration::from_secs);
 
-        // Parse the input URL once so subsequent `Location` headers can
-        // be resolved relatively via `Url::join` and so we always have
-        // a canonical absolute URL to issue the next GET against.
         let mut current_url = reqwest::Url::parse(&url).map_err(|e| ToolError::Invocation {
             name: "WebFetch".to_string(),
             source: Box::new(e),
         })?;
+        Self::check_url(&current_url, inv.domains)?;
 
         let mut hops: usize = 0;
         let mut response = loop {
@@ -273,10 +186,6 @@ impl ToolHandler for WebFetchHandler {
                 break response;
             }
 
-            // Redirect path. Each hop is validated against the literal-IP
-            // block list, the resolved A/AAAA records of the host (to
-            // catch CNAMEs into a metadata IP), and the configured
-            // domain allow/block lists before the next GET is issued.
             if hops >= MAX_REDIRECTS {
                 return Err(ToolError::Invocation {
                     name: "WebFetch".to_string(),
@@ -307,68 +216,14 @@ impl ToolHandler for WebFetchHandler {
                     ))),
                 })?;
 
-            if let Some(host) = next_url.host_str() {
-                if let Ok(ip) = host.parse::<IpAddr>() {
-                    if is_private_ip(ip) {
-                        return Err(ToolError::Invocation {
-                            name: "WebFetch".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "redirect to blocked IP `{ip}`"
-                            ))),
-                        });
-                    }
-                } else {
-                    let addrs = match resolve_redirect_host(host).await {
-                        Ok(addrs) => addrs,
-                        Err(e) => {
-                            tracing::warn!(
-                                redirect.host = %host,
-                                error = %e,
-                                "DNS resolution failed for redirect host",
-                            );
-                            return Err(ToolError::Invocation {
-                                name: "WebFetch".to_string(),
-                                source: Box::new(std::io::Error::other(format!(
-                                    "DNS resolution failed for redirect host `{host}`: {e}"
-                                ))),
-                            });
-                        },
-                    };
-                    if let Some(ip) = addrs.into_iter().find(|ip| is_private_ip(*ip)) {
-                        tracing::warn!(
-                            redirect.host = %host,
-                            redirect.ip = %ip,
-                            "redirect host resolves to blocked IP",
-                        );
-                        return Err(ToolError::Invocation {
-                            name: "WebFetch".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "redirect to `{host}` resolves to blocked IP `{ip}`"
-                            ))),
-                        });
-                    }
-                }
-
-                match evaluate_redirect_host(host, &self.allowed_domains, &self.blocked_domains) {
-                    RedirectDomainDecision::Allow => {},
-                    RedirectDomainDecision::DenyBlocked(h) => {
-                        return Err(ToolError::Invocation {
-                            name: "WebFetch".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "redirect to blocked domain `{h}`"
-                            ))),
-                        });
-                    },
-                    RedirectDomainDecision::DenyOutsideAllowed(h) => {
-                        return Err(ToolError::Invocation {
-                            name: "WebFetch".to_string(),
-                            source: Box::new(std::io::Error::other(format!(
-                                "redirect to `{h}` outside allowed_domains"
-                            ))),
-                        });
-                    },
-                }
-            }
+            Self::check_url(&next_url, inv.domains).inspect_err(|err| {
+                tracing::warn!(
+                    redirect.from = %current_url,
+                    redirect.to = %next_url,
+                    error = %err,
+                    "WebFetch redirect denied",
+                );
+            })?;
 
             tracing::debug!(
                 redirect.from = %current_url,
@@ -432,7 +287,10 @@ impl ToolHandler for WebFetchHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::net_guard::HostResolver;
+    use rstest::rstest;
     use serde_json::json;
+    use std::net::IpAddr;
 
     #[tokio::test]
     async fn missing_url_arg_returns_invalid_args() {
@@ -559,162 +417,160 @@ mod tests {
         assert!(out.contains("content-type:"));
     }
 
-    #[test]
-    fn host_matches_domain_exact_and_suffix() {
-        // Exact match.
-        assert!(host_matches_domain("evil.test", "evil.test"));
-        // Suffix match — `.evil.test` boundary must hold.
-        assert!(host_matches_domain("sub.evil.test", "evil.test"));
-        assert!(host_matches_domain("a.b.evil.test", "evil.test"));
-        // Substring without dot boundary must NOT match — closes the
-        // `notevil.test` / `evil.test` footgun.
-        assert!(!host_matches_domain("notevil.test", "evil.test"));
-        // Disjoint hosts.
-        assert!(!host_matches_domain("good.test", "evil.test"));
+    /// Maps every hostname to one fixed address.
+    #[derive(Debug)]
+    struct FixedResolver(IpAddr);
+
+    #[async_trait]
+    impl HostResolver for FixedResolver {
+        async fn resolve(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![self.0])
+        }
     }
 
-    #[test]
-    fn webfetch_redirect_to_blocked_domain_denied() {
-        // F5: the redirect loop must reject hops whose host
-        // suffix-matches `blocked_domains`. Tested via the pure helper
-        // so the matching rules are independent of any HTTP traffic.
-        let blocked = vec!["evil.test".to_string()];
-        let allowed: Vec<String> = Vec::new();
-
-        let decision = evaluate_redirect_host("evil.test", &allowed, &blocked);
-        assert_eq!(
-            decision,
-            RedirectDomainDecision::DenyBlocked("evil.test".to_string())
-        );
-
-        // Subdomain must be denied too — naive equality would let it through.
-        let decision = evaluate_redirect_host("sub.evil.test", &allowed, &blocked);
-        assert_eq!(
-            decision,
-            RedirectDomainDecision::DenyBlocked("sub.evil.test".to_string())
-        );
-
-        // A host that is not a suffix match passes.
-        assert_eq!(
-            evaluate_redirect_host("good.test", &allowed, &blocked),
-            RedirectDomainDecision::Allow,
-        );
+    fn loopback_handler() -> WebFetchHandler {
+        WebFetchHandler::for_test(Arc::new(FixedResolver(IpAddr::from([127, 0, 0, 1]))))
     }
 
-    #[test]
-    fn webfetch_redirect_outside_allowlist_denied() {
-        // F5: when `allowed_domains` is non-empty, any host outside it
-        // must be rejected. Empty allowlist means "no restriction" —
-        // every non-blocked host is allowed.
-        let allowed = vec!["good.test".to_string()];
-        let blocked: Vec<String> = Vec::new();
-
-        // Outside the allowlist → denied.
-        assert_eq!(
-            evaluate_redirect_host("bad.test", &allowed, &blocked),
-            RedirectDomainDecision::DenyOutsideAllowed("bad.test".to_string()),
-        );
-
-        // Exact allowlist match → allowed.
-        assert_eq!(
-            evaluate_redirect_host("good.test", &allowed, &blocked),
-            RedirectDomainDecision::Allow,
-        );
-
-        // Subdomain of allowlist entry → allowed (suffix match).
-        assert_eq!(
-            evaluate_redirect_host("api.good.test", &allowed, &blocked),
-            RedirectDomainDecision::Allow,
-        );
-
-        // Empty allowlist → all hosts pass when not on the blocklist.
-        let empty_allow: Vec<String> = Vec::new();
-        assert_eq!(
-            evaluate_redirect_host("anything.test", &empty_allow, &blocked),
-            RedirectDomainDecision::Allow,
-        );
-    }
-
-    #[test]
-    fn webfetch_redirect_blocklist_takes_precedence_over_allowlist() {
-        // Hosts that match both lists must be denied — `blocked_domains`
-        // wins. Without this, an operator who mistakenly added a domain
-        // to both lists would silently allow it.
-        let allowed = vec!["evil.test".to_string()];
-        let blocked = vec!["evil.test".to_string()];
-        assert_eq!(
-            evaluate_redirect_host("evil.test", &allowed, &blocked),
-            RedirectDomainDecision::DenyBlocked("evil.test".to_string()),
-        );
-    }
-
-    #[test]
-    fn with_domains_constructor_wires_timeout_and_lists() {
-        // Smoke test: the constructor wires the timeout through, the
-        // `reqwest::Client` builds successfully with a non-empty domain
-        // policy, and the domain lists are stored on the struct so the
-        // async redirect loop in `invoke` can read them.
-        let handler = WebFetchHandler::with_domains(
-            Some(Duration::from_secs(11)),
-            vec!["good.test".into()],
-            vec!["evil.test".into()],
-        );
-        assert_eq!(handler.default_timeout, Duration::from_secs(11));
-        assert_eq!(handler.allowed_domains, vec!["good.test".to_string()]);
-        assert_eq!(handler.blocked_domains, vec!["evil.test".to_string()]);
-    }
-
-    #[test]
-    fn default_handler_builds_without_panic() {
-        // Backward-compat: the no-arg `Default` and `new(None)` paths must
-        // succeed with empty domain lists; redirect-time enforcement still
-        // applies the IP block list on every hop.
-        let handler = WebFetchHandler::default();
-        assert!(handler.allowed_domains.is_empty());
-        assert!(handler.blocked_domains.is_empty());
-    }
-
-    #[tokio::test]
-    async fn redirect_loop_terminates_safely_on_redirect_chain() {
-        // Stand up a wiremock server that 302s every request back to its
-        // own /next path. The handler's redirect loop must terminate
-        // with a `ToolError::Invocation`, not loop forever.
-        //
-        // Wiremock binds on 127.0.0.1, so the first redirect's literal-IP
-        // check fires the IPv4 block list before the hop counter reaches
-        // MAX_REDIRECTS. Both terminations are correct safety outcomes —
-        // the assertion accepts whichever fires first. The bug under
-        // test is "redirect loop runs forever"; either error proves the
-        // loop bounded itself.
+    /// Server that 302s every GET to `location`, with `{port}` replaced
+    /// by the server's own port.
+    async fn server_redirecting_to(location: &str) -> wiremock::MockServer {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let server = MockServer::start().await;
-        let next = format!("{}/next", server.uri());
+        let location = location.replace("{port}", &server.address().port().to_string());
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(302).insert_header("Location", next.as_str()))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location))
             .mount(&server)
             .await;
+        server
+    }
 
-        let handler = WebFetchHandler::default();
-        let url = format!("{}/start", server.uri());
-        let err = handler
-            .invoke(
-                ToolInvocation::for_test("call-redirect-loop"),
-                serde_json::json!({ "url": url }),
-            )
-            .await
-            .expect_err("redirect chain must terminate with an error, not Ok");
+    fn failure_message(err: ToolError) -> String {
         match err {
             ToolError::Invocation { name, source } => {
                 assert_eq!(name, "WebFetch");
-                let msg = source.to_string();
-                assert!(
-                    msg.contains("too many redirects") || msg.contains("blocked IP"),
-                    "expected redirect-cap or IP-block message, got: {msg}"
-                );
+                source.to_string()
             },
             other => panic!("expected Invocation, got {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::outside_allowlist("http://other.test/x", &["good.test"], &[], "outside allowed_domains")]
+    #[case::blocked_domain("http://evil.test/x", &["good.test", "evil.test"], &["evil.test"], "blocked_domains")]
+    #[case::blocked_domain_trailing_dot("http://evil.test./x", &[], &["evil.test"], "blocked_domains")]
+    #[case::metadata_ip("http://169.254.169.254/x", &[], &[], "blocked address")]
+    #[case::ipv6_loopback("http://[::1]/x", &[], &[], "blocked address")]
+    #[tokio::test]
+    async fn redirect_from_allowlisted_host_is_denied(
+        #[case] target: &str,
+        #[case] allowed: &[&str],
+        #[case] blocked: &[&str],
+        #[case] expected: &str,
+    ) {
+        let server = server_redirecting_to(target).await;
+        let allowed: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+        let blocked: Vec<String> = blocked.iter().map(ToString::to_string).collect();
+        let mut inv = ToolInvocation::for_test("call-redirect");
+        inv.domains = DomainRules {
+            allowed: &allowed,
+            blocked: &blocked,
+        };
+        // `good.test` is allowlisted; the fake resolver sends it to wiremock.
+        let url = format!("http://good.test:{}/start", server.address().port());
+
+        let err = loopback_handler()
+            .invoke(inv, json!({ "url": url }))
+            .await
+            .expect_err("redirect off the policy must be denied");
+
+        let msg = failure_message(err);
+        assert!(msg.contains(expected), "got: {msg}");
+        let requests = server.received_requests().await.expect("recording is on");
+        assert_eq!(requests.len(), 1, "the redirect target must not be fetched");
+    }
+
+    #[tokio::test]
+    async fn allowlisted_redirect_within_the_allowlist_is_followed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("http://api.good.test:{port}/end")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/end"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("arrived"))
+            .mount(&server)
+            .await;
+
+        let allowed = vec!["good.test".to_string()];
+        let mut inv = ToolInvocation::for_test("call-ok");
+        inv.domains = DomainRules {
+            allowed: &allowed,
+            blocked: &[],
+        };
+        let out = loopback_handler()
+            .invoke(
+                inv,
+                json!({ "url": format!("http://good.test:{port}/start") }),
+            )
+            .await
+            .expect("in-policy redirect must be followed");
+        assert!(
+            out.starts_with("status: 200") && out.contains("arrived"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_chain_stops_at_the_hop_limit() {
+        // Every request 302s to itself, so only MAX_REDIRECTS ends the walk.
+        let server = server_redirecting_to("http://loop.test:{port}/next").await;
+        let url = format!("http://loop.test:{}/start", server.address().port());
+
+        let err = loopback_handler()
+            .invoke(ToolInvocation::for_test("call-loop"), json!({ "url": url }))
+            .await
+            .expect_err("a redirect loop must not return Ok");
+
+        let msg = failure_message(err);
+        assert!(msg.contains("too many redirects"), "got: {msg}");
+        let requests = server.received_requests().await.expect("recording is on");
+        assert_eq!(requests.len(), MAX_REDIRECTS + 1);
+    }
+
+    #[tokio::test]
+    async fn default_resolver_refuses_loopback_hostnames() {
+        // `localhost` passes check_url as a name; only the connect-time
+        // DNS guard can stop it.
+        let err = WebFetchHandler::default()
+            .invoke(
+                ToolInvocation::for_test("call-localhost"),
+                json!({ "url": "http://localhost:9/" }),
+            )
+            .await
+            .expect_err("loopback hostname must not connect");
+        let ToolError::Invocation { source, .. } = err else {
+            panic!("expected Invocation");
+        };
+        let mut chain = source.to_string();
+        let mut cause = source.source();
+        while let Some(c) = cause {
+            chain = format!("{chain} | {c}");
+            cause = c.source();
+        }
+        assert!(
+            chain.contains("resolves only to blocked addresses"),
+            "got: {chain}"
+        );
     }
 }

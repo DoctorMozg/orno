@@ -208,6 +208,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            unconfined_shell: false,
         }
     }
 

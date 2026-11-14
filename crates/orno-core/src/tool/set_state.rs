@@ -208,6 +208,7 @@ mod tests {
 
     use super::*;
     use crate::tool::StateHandle;
+    use crate::tool::net_guard::DomainRules;
 
     fn handler(redactor: Redactor, cap: usize) -> SetStateHandler {
         SetStateHandler::new(Arc::new(redactor), cap)
@@ -226,6 +227,7 @@ mod tests {
             state_handle: Some(StateHandle::new(buf)),
             token_budget_share: None,
             roots: &[],
+            domains: DomainRules::default(),
         }
     }
 
@@ -469,6 +471,7 @@ mod tests {
             state_handle: None,
             token_budget_share: None,
             roots: &[],
+            domains: DomainRules::default(),
         };
         let err = h
             .invoke(inv, json!({ "key": "plan", "value": 1 }))

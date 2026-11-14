@@ -14,6 +14,11 @@ once the first tagged release ships.
 
 ### Changed
 
+- **Breaking:** an agent that lists `Bash` together with a non-empty
+  `allowed_domains` or `roots` now fails validation, because a shell
+  escapes both limits. Add `unconfined_shell: true` to the agent's
+  policy to accept that (the `commit-digest` and `flaky-test-triage`
+  examples do).
 - `policy.roots` entries and shell-node `env:` values are rendered
   through the template engine, so `{{ vars.* }}` / `{{ env.* }}` work
   there.
@@ -39,6 +44,23 @@ once the first tagged release ships.
 
 ### Security
 
+- A call to `subagent.<name>` is now checked against `allowed_tools`
+  like every other tool; an unlisted subagent used to dispatch.
+- `WebFetch` receives the calling agent's `allowed_domains` /
+  `blocked_domains` on every call. Redirect hops were checked against
+  empty lists, so an open redirect on an allowlisted host could reach
+  any domain.
+- `WebFetch` resolves names through a guard that drops blocked
+  addresses at connect time (closing the DNS-rebinding window between
+  the check and the dial) and ignores `HTTP(S)_PROXY`.
+- The blocked-address list now covers `0.0.0.0/8`, `192.0.0.0/24`,
+  `198.18.0.0/15`, multicast and `240.0.0.0/4` for IPv4, and `::`,
+  multicast, documentation, NAT64, 6to4 and Teredo for IPv6, and
+  bracketed IPv6 literals are recognized.
+- `blocked_domains` and `allowed_domains` matching ignores case and a
+  trailing dot, so `evil.com.` no longer slips past `evil.com`.
+- The network gate scans tool arguments recursively for http(s) URLs in
+  any case, not just top-level strings starting with lowercase `http`.
 - Bump `rmcp` to 3.10 (fixes RUSTSEC-2026-0462, unbounded response
   buffering in the streamable HTTP client).
 

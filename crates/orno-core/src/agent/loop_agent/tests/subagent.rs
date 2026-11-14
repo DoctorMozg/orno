@@ -97,6 +97,7 @@ fn child_agent_config() -> AgentConfig {
             roots: Vec::new(),
             on_parse_error: OnParseError::Fail,
             max_message_history_bytes: None,
+            unconfined_shell: false,
         },
     }
 }
@@ -306,5 +307,40 @@ async fn parent_token_budget_breach_on_subagent_overrun() {
             }
         ),
         "expected BudgetExceeded(Tokens), got {err:?}",
+    );
+}
+
+#[rstest::rstest]
+#[case::dotted_yaml_name("subagent.child")]
+#[case::wire_name("subagent_child")]
+#[tokio::test]
+async fn unlisted_subagent_call_terminates_with_unknown_tool(#[case] called: &str) {
+    // `subagent.child` is registered on the agent but absent from
+    // `allowed_tools`, so neither spelling may reach its handler.
+    let transport = ScriptedTransport::new(vec![ScriptedTransport::tool_call_response(
+        "c1",
+        called,
+        serde_json::json!({}),
+    )]);
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(transport),
+        sink: Arc::new(InMemorySink::new()),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![Arc::new(DottedEchoTool)],
+    });
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_subagent_depth = 1;
+    req.allowed_tools = Vec::new();
+
+    let err = agent
+        .run("run_test", "n", req)
+        .await
+        .expect_err("unlisted subagent must terminate the loop");
+    assert!(
+        matches!(&err, AgentError::UnknownToolCalled { name } if name == called),
+        "got {err:?}",
     );
 }

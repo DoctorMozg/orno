@@ -5,6 +5,7 @@ use crate::llm::LlmTransport;
 use crate::llm::{LlmRequest, LlmResponse, OrnoChatMessage};
 use crate::pipeline::{AgentPolicy, OnParseError};
 use crate::tool::ToolHandler;
+use crate::tool::net_guard::HostResolver;
 use crate::tool::{ToolEffect, ToolInvocation};
 use async_trait::async_trait;
 use std::collections::VecDeque;
@@ -52,6 +53,7 @@ pub(super) fn policy() -> AgentPolicy {
         on_parse_error: OnParseError::Fail,
         roots: Vec::new(),
         max_message_history_bytes: None,
+        unconfined_shell: false,
     }
 }
 
@@ -254,5 +256,23 @@ impl ToolHandler for LongOutputTool {
         _args: serde_json::Value,
     ) -> Result<String, ToolError> {
         Ok("a".repeat(self.len))
+    }
+}
+
+/// Resolver that answers every hostname with one fixed public address,
+/// so gate tests never touch real DNS.
+#[derive(Debug)]
+pub(super) struct FixedResolver(pub(super) std::net::IpAddr);
+
+impl FixedResolver {
+    pub(super) fn public() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::net::IpAddr::from([93, 184, 216, 34])))
+    }
+}
+
+#[async_trait]
+impl HostResolver for FixedResolver {
+    async fn resolve(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+        Ok(vec![self.0])
     }
 }

@@ -193,6 +193,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "unconfined_shell": {
+          "description": "Acknowledges that `Bash` escapes `allowed_domains` and `roots`:\na shell can open any connection and touch any path orno cannot\nsee. Pipeline validation rejects an agent that lists `Bash`\nnext to either confinement unless this is `true`.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 
-use crate::agent::loop_agent::policy::{is_blocked_ipv4, is_blocked_ipv6};
 use crate::error::PipelineError;
+use crate::tool::net_guard::{is_blocked_ip, literal_ip};
 
 use super::schema::{McpServerConfig, Pipeline};
 
@@ -100,7 +100,7 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
                     )));
                 }
                 let host = parsed.host_str().unwrap_or("");
-                let host_ip = host.parse::<IpAddr>().ok();
+                let host_ip = literal_ip(&parsed);
                 // `http://` is only safe over loopback. Everything else
                 // (real IPs, public hostnames) must use https so
                 // credentials in `Authorization` headers are not sent in
@@ -128,17 +128,12 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
                 // just permitted).
                 if scheme == "https"
                     && let Some(ip) = host_ip
+                    && is_blocked_ip(ip)
                 {
-                    let blocked = match ip {
-                        IpAddr::V4(v4) => is_blocked_ipv4(v4),
-                        IpAddr::V6(v6) => is_blocked_ipv6(v6),
-                    };
-                    if blocked {
-                        return Err(PipelineError::Validation(format!(
-                            "mcp_servers.`{name}`: url host `{ip}` is in a blocked range \
-                             (loopback / private / link-local / CGNAT / documentation / metadata)",
-                        )));
-                    }
+                    return Err(PipelineError::Validation(format!(
+                        "mcp_servers.`{name}`: url host `{ip}` is in a blocked range \
+                         (loopback / private / link-local / CGNAT / documentation / metadata)",
+                    )));
                 }
             },
             McpServerConfig::Stdio(_) => {},
@@ -223,6 +218,23 @@ pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
     //   compose-down requires the child's effect policy to be no more
     //   permissive than the parent's (compose-down rule).
     for (agent_name, agent_config) in &pipeline.agents {
+        let policy = &agent_config.policy;
+        let confinement = match (policy.allowed_domains.is_empty(), policy.roots.is_empty()) {
+            (false, false) => Some("`allowed_domains` and `roots`"),
+            (false, true) => Some("`allowed_domains`"),
+            (true, false) => Some("`roots`"),
+            (true, true) => None,
+        };
+        if let Some(confinement) = confinement
+            && !policy.unconfined_shell
+            && agent_config.allowed_tools.iter().any(|t| t == "Bash")
+        {
+            return Err(PipelineError::Validation(format!(
+                "agent `{agent_name}` lists `Bash` but declares {confinement}; a shell can reach \
+                 any host and path, so the confinement would not hold. Drop `Bash` or set \
+                 `unconfined_shell: true` to accept that",
+            )));
+        }
         for tool in &agent_config.allowed_tools {
             if let Some(rest) = tool.strip_prefix("mcp.") {
                 let server = rest.split('.').next().unwrap_or("");
@@ -516,6 +528,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            unconfined_shell: false,
         }
     }
 
@@ -799,6 +812,42 @@ mod tests {
             msg.contains("blocked range") || msg.contains("169.254"),
             "error should explain why the IP is blocked: {msg}"
         );
+    }
+
+    #[rstest::rstest]
+    #[case::domains(&["api.test"], &[], false, Some("`allowed_domains`"))]
+    #[case::roots(&[], &["."], false, Some("`roots`"))]
+    #[case::both(&["api.test"], &["."], false, Some("`allowed_domains` and `roots`"))]
+    #[case::acknowledged(&["api.test"], &["."], true, None)]
+    #[case::no_confinement(&[], &[], false, None)]
+    fn bash_next_to_confinement_needs_unconfined_shell(
+        #[case] domains: &[&str],
+        #[case] roots: &[&str],
+        #[case] unconfined_shell: bool,
+        #[case] rejected_for: Option<&str>,
+    ) {
+        let mut policy = base_policy(true, true);
+        policy.allowed_domains = domains.iter().map(ToString::to_string).collect();
+        policy.roots = roots.iter().map(Into::into).collect();
+        policy.unconfined_shell = unconfined_shell;
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "triager".to_string(),
+            agent_config_with_policy(vec!["Bash".to_string()], policy),
+        );
+
+        match (validate(&p), rejected_for) {
+            (Ok(()), None) => {},
+            (Err(PipelineError::Validation(msg)), Some(what)) => {
+                assert!(
+                    msg.contains("`triager`")
+                        && msg.contains(what)
+                        && msg.contains("unconfined_shell"),
+                    "error should name the agent, the confinement and the escape hatch: {msg}",
+                );
+            },
+            (other, expected) => panic!("expected {expected:?}, got {other:?}"),
+        }
     }
 
     #[test]

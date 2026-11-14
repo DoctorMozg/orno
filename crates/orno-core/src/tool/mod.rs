@@ -6,6 +6,7 @@
 pub mod bash;
 pub mod edit;
 pub mod mcp_handler;
+pub mod net_guard;
 mod path_guard;
 pub mod read;
 pub mod record;
@@ -24,6 +25,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ToolError;
+use net_guard::DomainRules;
 
 pub use bash::BashHandler;
 pub use edit::EditHandler;
@@ -104,6 +106,10 @@ pub struct ToolInvocation<'a> {
     /// File handlers reject paths that escape `roots[0]`; non-file
     /// handlers ignore this field entirely.
     pub roots: &'a [PathBuf],
+    /// The calling agent's `allowed_domains` / `blocked_domains`.
+    /// `WebFetch` re-applies them to every redirect hop, since the
+    /// policy gate only sees the first URL. Empty outside a `LoopAgent`.
+    pub domains: DomainRules<'a>,
 }
 
 /// Borrow-scoped pointer to a single node's `state` buffer. Held for
@@ -143,6 +149,7 @@ impl<'a> ToolInvocation<'a> {
             state_handle: None,
             token_budget_share: None,
             roots: &[],
+            domains: DomainRules::default(),
         }
     }
 
@@ -158,6 +165,7 @@ impl<'a> ToolInvocation<'a> {
             state_handle: None,
             token_budget_share: None,
             roots,
+            domains: DomainRules::default(),
         }
     }
 }

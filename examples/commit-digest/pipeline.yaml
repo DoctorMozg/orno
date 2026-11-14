@@ -94,6 +94,8 @@ agents:
         - raw.githubusercontent.com
       roots:
         - "."
+      # Bash can reach any host and path, so the domain and root limits do not bind it.
+      unconfined_shell: true
       on_parse_error: retry_once
 
   contributor_vibes:

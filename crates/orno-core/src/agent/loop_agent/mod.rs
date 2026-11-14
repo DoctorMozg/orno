@@ -37,6 +37,7 @@ use std::sync::Arc;
 use crate::events::{EventSink, Redactor, truncate_excerpt};
 use crate::llm::LlmTransport;
 use crate::tool::ToolHandler;
+use crate::tool::net_guard::{HostResolver, SystemResolver};
 
 /// Default cap on the body excerpt captured into `LlmFailure::ApiError`
 /// when the agent was constructed without a caller-supplied bound.
@@ -77,12 +78,24 @@ pub struct LoopAgentConfig {
 
 pub struct LoopAgent {
     config: LoopAgentConfig,
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl LoopAgent {
     #[must_use]
     pub fn new(config: LoopAgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolver: Arc::new(SystemResolver),
+        }
+    }
+
+    /// Swap the DNS used by the network policy gate for a fake.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Convenience constructor for embedders and tests that do not

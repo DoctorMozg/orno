@@ -18,6 +18,7 @@ use crate::agent::{Agent, AgentOutput, AgentRequest};
 use crate::error::AgentError;
 use crate::events::{BudgetKind, Event, LlmFailure};
 use crate::llm::{LlmRequest, OrnoChatMessage, OrnoChatTool};
+use crate::tool::net_guard::DomainRules;
 use crate::tool::{StateHandle, ToolInvocation};
 
 use super::{LoopAgent, SUBAGENT_PREFIX, wire_name_from_yaml};
@@ -452,9 +453,7 @@ impl Agent for LoopAgent {
                 // `.unwrap_or_else` fallback lets an unallowed wire name
                 // reach `find_handler`, which searches ALL registered handlers.
                 // Enforce the allowlist boundary before any dispatch.
-                if !yaml_name.starts_with(SUBAGENT_PREFIX)
-                    && !req.allowed_tools.iter().any(|n| n == &yaml_name)
-                {
+                if !req.allowed_tools.iter().any(|n| n == &yaml_name) {
                     return Err(AgentError::UnknownToolCalled {
                         name: tool_call.fn_name.clone(),
                     });
@@ -501,6 +500,10 @@ impl Agent for LoopAgent {
                             state_handle: Some(state_handle),
                             token_budget_share: Some(Arc::clone(&token_counter)),
                             roots: &req.policy.roots,
+                            domains: DomainRules {
+                                allowed: &req.policy.allowed_domains,
+                                blocked: &req.policy.blocked_domains,
+                            },
                         };
                         self.invoke_with_parse_retry(
                             handler,
@@ -526,6 +529,10 @@ impl Agent for LoopAgent {
                         state_handle: Some(state_handle),
                         token_budget_share: Some(Arc::clone(&token_counter)),
                         roots: &req.policy.roots,
+                        domains: DomainRules {
+                            allowed: &req.policy.allowed_domains,
+                            blocked: &req.policy.blocked_domains,
+                        },
                     };
                     self.invoke_with_parse_retry(
                         handler,
