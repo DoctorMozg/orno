@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/orno-core", "crates/orno-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
@@ -12,7 +12,7 @@ authors = ["Stanislav Gonorovskii"]
 
 [workspace.dependencies]
 # Intra-workspace
-orno-core = { path = "crates/orno-core", version = "0.2.0" }
+orno-core = { path = "crates/orno-core", version = "0.3.0" }
 
 # Errors
 thiserror = "2"
@@ -82,11 +82,11 @@ genai = "0.6.0-beta.17"
 # pools are needed for a simple GET.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
-# MCP stack. Pinned to 1.x; the 1.0 release (2026-03) stabilised
-# the API. Access goes only through McpClient (orno-core types never
+# MCP stack. Pinned to 3.x (>= 3.9 fixes RUSTSEC-2026-0462).
+# Access goes only through McpClient (orno-core types never
 # re-export rmcp items). Features enumerated explicitly per
 # default-features = false discipline; exact names verified at build time.
-rmcp = { version = "1.5", default-features = false, features = [
+rmcp = { version = "3.10", default-features = false, features = [
     "client",
     "transport-child-process",
     # Streamable HTTP client + reqwest backend wire MCP's HTTP
@@ -114,21 +114,24 @@ aho-corasick = { version = "1", default-features = false, features = ["std", "pe
 # an LLM cannot bypass redaction by encoding a secret before exfiltrating
 # it. `base64 0.22` is already pulled transitively by `genai`, `reqwest`,
 # and `hyper-util`, so adding a direct dep does not multiply versions.
-# `hex 0.4` is a fresh direct dep — small, std-only, no transitive
-# competitors in the lock file.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
-hex    = { version = "0.4", default-features = false, features = ["std"] }
 
 # LRU eviction cache for `TemplateEngine`. Caps the number of compiled
 # MiniJinja templates so a long-lived engine cannot grow without bound.
 # `default-features = false` keeps the hashbrown backend in place and
 # omits the optional `serde` support that orno does not need.
-lru = { version = "0.12", default-features = false }
+lru = { version = "0.18", default-features = false }
 
-# Tape I/O for `RecordingTransport` / `ReplayTransport` tests. Used from
-# integration tests and from round-trip unit tests — pulled at workspace
-# level so both crates share the same version.
+# Atomic writes in the file tools and bundle temp paths in the CLI; also
+# used by tests in both crates.
 tempfile = "3"
+
+# `#[async_trait]` on every trait seam; dyn-compatible async needs it.
+async-trait = "0.1"
+
+# Process-group SIGKILL for `ChildGuard`; `unsafe_code = "forbid"` rules out
+# raw libc. Already in the tree via tempfile.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
 
 # Testing
 assert_cmd = "2"

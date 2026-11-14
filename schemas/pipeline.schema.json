@@ -54,6 +54,7 @@
       "minimum": 0
     }
   },
+  "additionalProperties": false,
   "required": [
     "nodes"
   ],
@@ -90,28 +91,11 @@
           "default": null
         }
       },
+      "additionalProperties": false,
       "required": [
         "model",
         "provider",
         "policy"
-      ]
-    },
-    "AgentNode": {
-      "description": "Agent node — references a named entry in `Pipeline.agents`. Inline\nagent configuration at the node level is a v0.2+ convenience and is\nnot in the v0.1 schema (see `docs/yaml-spec.md`).",
-      "type": "object",
-      "properties": {
-        "agent": {
-          "description": "Name of an entry in the top-level `agents` map.",
-          "type": "string"
-        },
-        "initial_prompt": {
-          "description": "First user message sent to the agent loop. Rendered with the\n`nodes.<id>.*` / `vars.*` / `env.*` template context.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "agent",
-        "initial_prompt"
       ]
     },
     "AgentPolicy": {
@@ -187,14 +171,20 @@
           "$ref": "#/$defs/OnParseError"
         },
         "roots": {
-          "description": "Filesystem roots the `Read` / `Write` / `Edit` builtins are\njailed to. When the agent's `allowed_tools` list contains any\nof those names, this list must be non-empty — `LoopAgent`\nrejects with `AgentError::InvalidPolicy` at run start.\nCurrently only `roots[0]` is consulted; multi-root agents are\na v0.2+ extension.",
+          "description": "Filesystem roots the `Read` / `Write` / `Edit` builtins are\njailed to. When the agent's `allowed_tools` list contains any\nof those names, this list must be non-empty — `LoopAgent`\nrejects with `AgentError::InvalidPolicy` at run start.\nCurrently only `roots[0]` is consulted; multi-root agents are\na v0.2+ extension.\n\nEach entry is rendered through the template engine at dispatch\ntime (the same context as `initial_prompt` and `system`), so\n`\"{{ env.WORKSPACE }}\"` is valid and resolves to the current\nvalue of that variable.",
           "type": "array",
           "default": [],
           "items": {
             "type": "string"
           }
+        },
+        "unconfined_shell": {
+          "description": "Acknowledges that `Bash` escapes `allowed_domains` and `roots`:\na shell can open any connection and touch any path orno cannot\nsee. Pipeline validation rejects an agent that lists `Bash`\nnext to either confinement unless this is `true`.",
+          "type": "boolean",
+          "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "max_iterations",
         "max_total_tokens",
@@ -219,6 +209,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "token"
@@ -238,6 +229,7 @@
               "type": "string"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind",
             "user",
@@ -252,39 +244,11 @@
               "const": "none"
             }
           },
+          "additionalProperties": false,
           "required": [
             "kind"
           ]
         }
-      ]
-    },
-    "McpHttpConfig": {
-      "type": "object",
-      "properties": {
-        "auth": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/McpAuthConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null
-        },
-        "headers": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "url": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "url"
       ]
     },
     "McpServerConfig": {
@@ -293,107 +257,193 @@
         {
           "type": "object",
           "properties": {
+            "call_timeout_secs": {
+              "description": "Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
+            },
+            "command": {
+              "description": "argv vector. Not passed through a shell.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "transport": {
               "type": "string",
               "const": "stdio"
             }
           },
-          "$ref": "#/$defs/McpStdioConfig",
+          "additionalProperties": false,
           "required": [
-            "transport"
+            "transport",
+            "command"
           ]
         },
         {
           "type": "object",
           "properties": {
+            "auth": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/McpAuthConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "call_timeout_secs": {
+              "description": "Per-call `tools/call` timeout in seconds. Defaults to 30 when omitted.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
+            },
+            "headers": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
             "transport": {
               "type": "string",
               "const": "http"
+            },
+            "url": {
+              "type": "string"
             }
           },
-          "$ref": "#/$defs/McpHttpConfig",
+          "additionalProperties": false,
           "required": [
-            "transport"
+            "transport",
+            "url"
           ]
         }
-      ]
-    },
-    "McpStdioConfig": {
-      "type": "object",
-      "properties": {
-        "command": {
-          "description": "argv vector. Not passed through a shell.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "env": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        }
-      },
-      "required": [
-        "command"
       ]
     },
     "Node": {
-      "description": "Built-in node kinds. v0.1 ships two variants — `Agent` and `Shell`.\nHTTP, parsing, and assertions happen inside agent tooling rather\nthan as sibling kinds.",
       "type": "object",
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "needs": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "timeout": {
-          "description": "Per-node wall-clock budget in seconds. When elapsed\nbefore the executor returns, `Engine::dispatch_node` cancels via\n`tokio::time::timeout`, emits `Event::NodeTimedOut`, and records\n`NodeFailure::TimedOut` on the paired `NodeFinished`. `None` means\nno wall-clock budget on this node.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
       "oneOf": [
         {
+          "description": "Agent node — references a named entry in `Pipeline.agents`. Inline\nagent configuration at the node level is a v0.2+ convenience and is\nnot in the schema.",
           "type": "object",
           "properties": {
+            "agent": {
+              "description": "Name of an entry in the top-level `agents` map.",
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "initial_prompt": {
+              "description": "First user message sent to the agent loop. Rendered with the\n`nodes.<id>.*` / `vars.*` / `env.*` template context.",
+              "type": "string"
+            },
             "kind": {
-              "type": "string",
               "const": "agent"
+            },
+            "needs": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "timeout": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
             }
           },
-          "$ref": "#/$defs/AgentNode",
+          "additionalProperties": false,
           "required": [
-            "kind"
+            "agent",
+            "initial_prompt",
+            "kind",
+            "id"
           ]
         },
         {
           "type": "object",
           "properties": {
+            "args": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "command": {
+              "type": "string"
+            },
+            "env": {
+              "description": "Environment variable overrides for the spawned child. The\nexecutor clears the inherited environment, restores a small\nallowlist of safe variables (`PATH`, `HOME`, etc.), then\napplies these entries on top so per-node values shadow the\nallowlist. Values are rendered through the template engine\n(the same context as `command`, `args`, and `stdin`); keys\nare not rendered — they are identifiers.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {}
+            },
+            "id": {
+              "type": "string"
+            },
             "kind": {
-              "type": "string",
               "const": "shell"
+            },
+            "needs": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "type": "string"
+              }
+            },
+            "stdin": {
+              "description": "Content to pipe into the child's stdin. Rendered through the\nsame template context as `command` and `args`. When `None`,\nstdin is closed (default) — matching the pre-stdin behavior so\nexisting pipelines keep working. When `Some`, even an empty\nstring is delivered so the child sees a pipe that closes at\nEOF rather than a closed handle.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "timeout": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "default": null,
+              "minimum": 0
             }
           },
-          "$ref": "#/$defs/ShellNode",
+          "additionalProperties": false,
           "required": [
-            "kind"
+            "command",
+            "kind",
+            "id"
           ]
         }
-      ],
-      "required": [
-        "id"
       ]
     },
     "OnParseError": {
@@ -409,40 +459,6 @@
           "type": "string",
           "const": "retry_once"
         }
-      ]
-    },
-    "ShellNode": {
-      "type": "object",
-      "properties": {
-        "args": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "command": {
-          "type": "string"
-        },
-        "env": {
-          "description": "Environment variable overrides for the spawned child. The\nexecutor clears the inherited environment, restores a small\nallowlist of safe variables (`PATH`, `HOME`, etc.), then\napplies these entries on top so per-node values shadow the\nallowlist. Operator-supplied — not rendered through the\ntemplate engine.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "stdin": {
-          "description": "Content to pipe into the child's stdin. Rendered through the\nsame template context as `command` and `args`. When `None`,\nstdin is closed (default) — matching the pre-stdin behavior so\nexisting pipelines keep working. When `Some`, even an empty\nstring is delivered so the child sees a pipe that closes at\nEOF rather than a closed handle.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "command"
       ]
     }
   }

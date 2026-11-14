@@ -3,19 +3,48 @@
 use std::io::Write;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use predicates::str::contains;
 
+/// Provider key env vars stripped from every child so no test can reach a
+/// live, billed LLM with the developer's credentials.
+const PROVIDER_KEY_ENVS: [&str; 3] = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"];
+
 fn orno() -> Command {
-    Command::cargo_bin("orno").expect("orno binary should build")
+    let mut cmd = Command::cargo_bin("orno").expect("orno binary should build");
+    for name in PROVIDER_KEY_ENVS {
+        cmd.env_remove(name);
+    }
+    cmd
 }
 
-/// Build an `orno` command with the test-only `DummyTransport` env var
-/// set. Needed for any test that drives an `agent` node without a real
-/// LLM API key — otherwise the run hits the live provider. The var
-/// name mirrors `run.rs::TEST_TRANSPORT_ENV`.
+/// Without the feature the binary ignores `ORNO_TEST_LLM_TRANSPORT`, so fail
+/// with the fix instead of a confusing missing-key error.
+#[cfg(not(feature = "test-transport"))]
+fn require_test_transport() {
+    panic!(
+        "this test needs the fake LLM transport: run with `--features test-transport` (or `--all-features`)"
+    );
+}
+
+#[cfg(feature = "test-transport")]
+fn require_test_transport() {}
+
+/// `orno` with the deterministic `DummyTransport`; the var name mirrors
+/// `run.rs::TEST_TRANSPORT_ENV`.
 fn orno_with_dummy_transport() -> Command {
+    require_test_transport();
     let mut cmd = orno();
     cmd.env("ORNO_TEST_LLM_TRANSPORT", "dummy");
+    cmd
+}
+
+/// `orno` with `ScriptedTransport` answering from the JSON array at `tape`.
+fn orno_with_scripted_transport(tape: &std::path::Path) -> Command {
+    require_test_transport();
+    let mut cmd = orno();
+    cmd.env("ORNO_TEST_LLM_TRANSPORT", "scripted")
+        .env("ORNO_TEST_SCRIPTED_TAPE", tape);
     cmd
 }
 
@@ -136,7 +165,7 @@ nodes:
     command: "false"
 "#;
     let file = write_pipeline(yaml);
-    // After WU-2.4 the CLI exits non-zero whenever the run reports
+    // The CLI exits non-zero whenever the run reports
     // `ok: false`, so a downstream `orno run … && next-step` short-
     // circuits without inspecting NDJSON. The stream-level `ok:false`
     // assertions still hold.
@@ -174,7 +203,7 @@ nodes:
     needs: [fail_node]
 "#;
     let file = write_pipeline(yaml);
-    // WU-2.4: any failed node propagates to a non-zero process exit.
+    // Any failed node propagates to a non-zero process exit.
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
         .assert()
@@ -223,20 +252,20 @@ nodes:
 }
 
 #[test]
-fn run_template_syntax_error_fails_node_and_run() {
-    // A malformed template expression must not panic or silently render
-    // — `dispatch_node` surfaces `PipelineError::Template` as a node
-    // failure. Verifies the render-error branch of the engine's
-    // dispatch logic end-to-end.
+fn run_template_render_error_fails_node_and_run() {
+    // A template that compiles but cannot render (unset env var) must not
+    // panic or silently render — `dispatch_node` surfaces
+    // `PipelineError::Template` as a node failure. Syntax errors never get
+    // this far: load-time validation rejects them.
     let yaml = r#"
 version: 1
 nodes:
   - id: bad_template
     kind: shell
-    command: "{{ invalid syntax ]}"
+    command: "{{ env.ORNO_TEST_UNSET_VAR }}"
 "#;
     let file = write_pipeline(yaml);
-    // WU-2.4: template render failure surfaces as a non-zero process
+    // Template render failure surfaces as a non-zero process
     // exit (not just a stream-level `ok:false`).
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
@@ -412,6 +441,152 @@ fn record_bundle_then_replay_exits_success() {
     assert!(
         stdout.contains(r#""type":"run_finished""#),
         "expected run_finished after replay: {stdout}",
+    );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one record-then-replay scenario with its inline pipeline and tape"
+)]
+fn replay_keeps_recorded_mutation_policy_without_touching_the_host() {
+    // A recorded Write must replay as allowed (not denied) so the next LLM
+    // request hashes to the recorded key, yet replay must not write the file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("out.txt");
+    let yaml = format!(
+        r#"
+version: 1
+agents:
+  a:
+    model: openai/gpt-5
+    provider: openrouter
+    allowed_tools: [Write]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 2
+      max_subagent_depth: 0
+      allow_mutations: true
+      allow_network: false
+      roots: ["{root}"]
+      on_parse_error: fail
+nodes:
+  - id: n
+    kind: agent
+    agent: a
+    initial_prompt: "write it"
+"#,
+        root = dir.path().display()
+    );
+    let pipeline = write_pipeline(&yaml);
+    let tape = write_pipeline(
+        &serde_json::json!([
+            {
+                "content": "",
+                "finish_reason": "tool_calls",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "tool_calls": [{"call_id": "c1", "fn_name": "Write",
+                    "fn_arguments": {"path": target.to_str().unwrap(), "content": "hello"}}]
+            },
+            {"content": "done", "finish_reason": "stop",
+             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+        ])
+        .to_string(),
+    );
+    let bundle = dir.path().join("bundle.ndjson");
+
+    orno_with_scripted_transport(tape.path())
+        .args([
+            "run",
+            pipeline.path().to_str().unwrap(),
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+    std::fs::remove_file(&target).unwrap();
+
+    let assert = orno()
+        .args(["replay", bundle.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains(r#""type":"tool_denied""#),
+        "stdout: {stdout}"
+    );
+    assert!(!target.exists(), "replay must answer Write from the tape");
+}
+
+const ENV_AND_SECRET_PIPELINE: &str = r#"
+version: 1
+vars:
+  region: "{{ env.REGION }}"
+secrets: [API_TOKEN]
+agents:
+  a:
+    model: openai/gpt-5
+    provider: openrouter
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: ask
+    kind: agent
+    agent: a
+    initial_prompt: "region={{ vars.region }} stage={{ env.STAGE }} token={{ secrets.API_TOKEN }}"
+"#;
+
+#[test]
+fn replay_renders_env_vars_and_secret_prompts_without_the_original_env() {
+    // `vars` and the prompt read `env.*` and `secrets.*`; replay runs in
+    // a bare environment and must still hit the recorded LLM entry,
+    // which was keyed with the secret already masked.
+    let pipeline = write_pipeline(ENV_AND_SECRET_PIPELINE);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle = dir.path().join("bundle.ndjson");
+
+    orno_with_dummy_transport()
+        .env("API_TOKEN", "tok-secret-value-123")
+        .args([
+            "run",
+            pipeline.path().to_str().unwrap(),
+            "-e",
+            "REGION=eu-west",
+            "-e",
+            "STAGE=prod",
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let recorded = std::fs::read_to_string(&bundle).expect("bundle");
+    assert!(
+        !recorded.contains("tok-secret-value-123"),
+        "bundle leaks the secret: {recorded}"
+    );
+
+    let assert = orno()
+        .args(["replay", bundle.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"run_finished""#) && stdout.contains(r#""ok":true"#),
+        "replay must finish ok: {stdout}",
+    );
+    assert!(
+        stdout.contains("region=eu-west stage=prod token=***"),
+        "replayed prompt must be rendered from the recorded namespaces: {stdout}",
     );
 }
 
@@ -714,7 +889,7 @@ nodes:
 #[cfg(unix)]
 #[test]
 fn run_sigint_exits_130_and_emits_run_finished() {
-    // WU-2.5: SIGINT must produce exit 130, a `RunFinished {ok:false,
+    // SIGINT must produce exit 130, a `RunFinished {ok:false,
     // failed_nodes:["<interrupted>"]}` envelope on stdout, and no
     // panic. `sleep 30` keeps the shell child alive long enough to be
     // interrupted; the SIGINT is delivered via the platform `kill`
@@ -780,4 +955,239 @@ nodes:
             && stdout.contains(r#""<interrupted>""#),
         "expected run_finished+ok:false+<interrupted>: {stdout}",
     );
+}
+
+#[test]
+fn validate_rejects_name_in_both_pass_env_and_secrets() {
+    let file = write_pipeline(
+        r#"
+version: 1
+pass_env: [GH_TOKEN]
+secrets: [GH_TOKEN]
+nodes:
+  - id: n
+    kind: shell
+    command: "true"
+"#,
+    );
+    orno()
+        .args(["validate", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("GH_TOKEN").and(contains("pass_env")));
+}
+
+#[test]
+fn validates_self_review_example() {
+    orno()
+        .args(["validate", "../../examples/self-review/pipeline.yaml"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn provider_key_from_env_is_redacted_in_events() {
+    // The key is never declared under `secrets:`; the CLI must still
+    // redact it because the pipeline uses the `openai` provider.
+    let key = "sk-live-provider-key-0123456789";
+    let yaml = r#"
+version: 1
+agents:
+  a:
+    model: gpt-5
+    provider: openai
+    system: "s"
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: n
+    kind: agent
+    agent: a
+    initial_prompt: "hi"
+"#;
+    let pipeline = write_pipeline(yaml);
+    let tape = write_pipeline(&format!(
+        r#"[{{"content": "the key is {key}", "finish_reason": "stop"}}]"#
+    ));
+    let assert = orno_with_scripted_transport(tape.path())
+        .env("OPENAI_API_KEY", key)
+        .args(["run", pipeline.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(key), "provider key leaked: {stdout}");
+    assert!(stdout.contains("the key is ***"), "stdout: {stdout}");
+}
+
+/// Minimal stdio MCP server that records the `TOKEN` env var it was
+/// spawned with, then answers the handshake.
+#[cfg(unix)]
+const ENV_RECORDING_MCP: &str = r#"
+import sys, json, os
+with open(sys.argv[1], "w") as f:
+    f.write(os.environ.get("TOKEN", "<unset>"))
+for raw in sys.stdin:
+    msg = json.loads(raw)
+    m, mid = msg.get("method", ""), msg.get("id")
+    if m == "initialize":
+        res = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "f", "version": "0"}}
+    elif m == "tools/list":
+        res = {"tools": []}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": mid, "result": res}), flush=True)
+"#;
+
+#[cfg(unix)]
+#[test]
+fn mcp_stdio_env_secret_template_reaches_the_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("server.py");
+    let out = dir.path().join("token.txt");
+    std::fs::write(&script, ENV_RECORDING_MCP).expect("write script");
+    let yaml = format!(
+        r#"
+version: 1
+secrets: [MCP_TOKEN]
+mcp_servers:
+  fake:
+    transport: stdio
+    command: ["python3", "{}", "{}"]
+    env:
+      TOKEN: "{{{{ secrets.MCP_TOKEN }}}}"
+nodes:
+  - id: n
+    kind: shell
+    command: "true"
+"#,
+        script.display(),
+        out.display()
+    );
+    let pipeline = write_pipeline(&yaml);
+    let assert = orno()
+        .env("MCP_TOKEN", "real-mcp-token-value")
+        .args(["run", pipeline.path().to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("real-mcp-token-value"), "stdout: {stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&out).expect("server recorded its env"),
+        "real-mcp-token-value",
+        "the server must receive the rendered secret, not the template",
+    );
+}
+
+#[test]
+fn bundle_records_the_pipeline_loaded_at_startup() {
+    // The node rewrites the pipeline file mid-run; the bundle must still
+    // carry the original text.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("p.yaml");
+    let bundle = dir.path().join("out.bundle");
+    let yaml = format!(
+        "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: sh\n    args: [\"-c\", \"echo EDIT''ED >> {}\"]\n",
+        path.display()
+    );
+    std::fs::write(&path, &yaml).expect("write pipeline");
+    orno()
+        .args([
+            "run",
+            path.to_str().unwrap(),
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("EDITED"),
+        "node must have edited the file"
+    );
+    let recorded = std::fs::read_to_string(&bundle).expect("bundle");
+    assert!(!recorded.contains("EDITED"), "bundle: {recorded}");
+}
+
+#[test]
+fn flush_failure_after_successful_run_fails_the_command() {
+    // A directory at the bundle path makes the post-run bundle write fail.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle_dir = dir.path().join("bundle");
+    std::fs::create_dir(&bundle_dir).expect("mkdir");
+    let assert = orno_with_dummy_transport()
+        .args([
+            "run",
+            "../../examples/hello/pipeline.yaml",
+            "--record-bundle",
+            bundle_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("writing bundle"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains(r#""type":"run_finished""#), "{stdout}");
+}
+
+const UNDECLARED_AGENT_PIPELINE: &str = r#"
+version: 1
+nodes:
+  - id: side_effect
+    kind: shell
+    command: echo
+    args: ["ran"]
+  - id: ask
+    kind: agent
+    agent: ghost
+    needs: [side_effect]
+    initial_prompt: "hi"
+"#;
+
+#[test]
+fn run_rejects_undeclared_agent_before_any_node_starts() {
+    let file = write_pipeline(UNDECLARED_AGENT_PIPELINE);
+    let assert = orno()
+        .args(["run", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("undeclared agent `ghost`"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("node_started"),
+        "no node may start when validation fails: {stdout}"
+    );
+}
+
+#[test]
+fn plan_rejects_undeclared_agent() {
+    let file = write_pipeline(UNDECLARED_AGENT_PIPELINE);
+    orno()
+        .args(["plan", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("undeclared agent `ghost`"));
+}
+
+#[test]
+fn run_rejects_template_syntax_error_before_any_node_starts() {
+    let yaml = r#"
+version: 1
+nodes:
+  - id: bad_template
+    kind: shell
+    command: "{{ invalid syntax ]}"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["run", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("bad_template"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("node_started"), "{stdout}");
 }

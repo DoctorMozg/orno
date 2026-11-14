@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn unknown_tool_in_allowed_list_is_rejected_before_any_call() {
-    // Phase 5 cross-checks `allowed_tools` against registered handlers at the
+    // `run` cross-checks `allowed_tools` against registered handlers at the
     // top of `run`. A name absent from the handler set terminates with
     // `UnknownToolCalled` before the LLM is even contacted.
     let sink = Arc::new(InMemorySink::new());

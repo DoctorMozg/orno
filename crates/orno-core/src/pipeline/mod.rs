@@ -1,5 +1,7 @@
 //! Pipeline schema, loading, and template rendering.
 
+pub mod checks;
+pub mod graph;
 pub mod load;
 pub mod schema;
 pub mod template;

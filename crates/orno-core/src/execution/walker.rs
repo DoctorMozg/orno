@@ -3,14 +3,15 @@
 //! pre-built ordered list. Branch failure skips every transitive
 //! descendant and the walker surfaces those skips in causal order.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
 
 use crate::error::PipelineError;
 use crate::events::SkipReason;
+use crate::pipeline::graph::DepGraph;
 use crate::pipeline::{Node, Pipeline};
 
-/// Per-node lifecycle state. Internal to the walker; tests read it
-/// through [`DagWalker::statuses`].
+/// Per-node lifecycle state tracked by the walker.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum NodeState {
@@ -24,7 +25,7 @@ pub enum NodeState {
 
 /// Generator-style DAG walker.
 ///
-/// Construction validates the graph (cycles, unknown `needs:` targets)
+/// Construction validates the graph (duplicate ids, cycles, unknown `needs:` targets)
 /// and fails fast with [`PipelineError::InvalidGraph`]. After that, the
 /// walker answers [`DagWalker::next_ready`] until the DAG drains. Every
 /// [`DagWalker::complete`] call may cascade skips through transitive
@@ -41,57 +42,32 @@ pub struct DagWalker<'p> {
     // Remaining unmet dependency count per node; decremented as
     // each upstream succeeds.
     waiting_on: Vec<usize>,
-    // LIFO of ready node indices. Seeded in reverse source order so
-    // `pop()` yields source order, which is the documented
-    // tie-breaker for independent siblings.
-    ready_queue: Vec<usize>,
+    // Min-heap on source index, so ties among ready nodes run in YAML
+    // source order even when a completion promotes an earlier node.
+    ready_queue: BinaryHeap<Reverse<usize>>,
 }
 
 impl<'p> DagWalker<'p> {
     /// Build a walker over the pipeline. Validates the DAG; returns
-    /// [`PipelineError::InvalidGraph`] on unknown `needs:` targets or
-    /// cycles.
-    ///
-    /// Duplicate ids are treated as a validator bug — the walker
-    /// trusts that [`crate::pipeline::load::validate`] has already
-    /// rejected them — and panic here rather than return an error.
+    /// [`PipelineError::InvalidGraph`] on duplicate ids, unknown
+    /// `needs:` targets or cycles.
     #[must_use = "walker errors must be propagated"]
     pub fn new(pipeline: &'p Pipeline) -> Result<Self, PipelineError> {
+        let graph = DepGraph::build(&pipeline.nodes)?;
         let nodes: Vec<&Node> = pipeline.nodes.iter().collect();
         let n = nodes.len();
-
-        let mut by_id: BTreeMap<String, usize> = BTreeMap::new();
-        for (idx, node) in nodes.iter().enumerate() {
-            assert!(
-                by_id.insert(node.id.clone(), idx).is_none(),
-                "duplicate node id `{}` reached walker — validator bug",
-                node.id,
-            );
-        }
-
-        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut waiting_on: Vec<usize> = vec![0; n];
-        for (idx, node) in nodes.iter().enumerate() {
-            for dep in &node.needs {
-                let Some(&dep_idx) = by_id.get(dep) else {
-                    return Err(PipelineError::InvalidGraph {
-                        reason: format!("node `{}` depends on unknown `{dep}`", node.id),
-                    });
-                };
-                dependents[dep_idx].push(idx);
-                waiting_on[idx] += 1;
-            }
-        }
-
-        Self::detect_cycle(&nodes, &dependents, &waiting_on)?;
+        let DepGraph {
+            by_id,
+            dependents,
+            in_degree: waiting_on,
+        } = graph;
 
         let mut state: Vec<NodeState> = vec![NodeState::Pending; n];
-        let mut ready_queue: Vec<usize> = Vec::new();
-        // Iterate in reverse so that LIFO `pop()` yields source order.
-        for idx in (0..n).rev() {
+        let mut ready_queue = BinaryHeap::new();
+        for idx in 0..n {
             if waiting_on[idx] == 0 {
                 state[idx] = NodeState::Ready;
-                ready_queue.push(idx);
+                ready_queue.push(Reverse(idx));
             }
         }
 
@@ -105,48 +81,14 @@ impl<'p> DagWalker<'p> {
         })
     }
 
-    /// Run Kahn's algorithm over a scratch copy of the in-degree
-    /// array. When the popped count is short of `n`, at least one
-    /// residual node is on a cycle; name the lowest-indexed such
-    /// node in the error so the message is deterministic.
-    fn detect_cycle(
-        nodes: &[&Node],
-        dependents: &[Vec<usize>],
-        waiting_on: &[usize],
-    ) -> Result<(), PipelineError> {
-        let n = nodes.len();
-        let mut scratch: Vec<usize> = waiting_on.to_vec();
-        let mut queue: VecDeque<usize> = (0..n).filter(|&i| scratch[i] == 0).collect();
-        let mut popped = 0usize;
-        while let Some(idx) = queue.pop_front() {
-            popped += 1;
-            for &dep in &dependents[idx] {
-                scratch[dep] -= 1;
-                if scratch[dep] == 0 {
-                    queue.push_back(dep);
-                }
-            }
-        }
-        if popped < n {
-            let residual = (0..n)
-                .find(|&i| scratch[i] > 0)
-                .expect("cycle detected but no residual node — arithmetic bug");
-            return Err(PipelineError::InvalidGraph {
-                reason: format!("cycle detected involving `{}`", nodes[residual].id),
-            });
-        }
-        Ok(())
-    }
-
     /// Return the next node the scheduler should execute, or `None`
     /// when no ready nodes remain. Marks the returned node as
     /// `Running`.
     ///
-    /// A `None` return does **not** imply the DAG is drained —
-    /// nodes may still be `Running` elsewhere in a future parallel
-    /// scheduler. Use [`DagWalker::is_done`] to check termination.
+    /// A `None` return does not imply the DAG is drained: a future
+    /// parallel scheduler may still have nodes `Running`.
     pub fn next_ready(&mut self) -> Option<&'p Node> {
-        let idx = self.ready_queue.pop()?;
+        let Reverse(idx) = self.ready_queue.pop()?;
         self.state[idx] = NodeState::Running;
         Some(self.nodes[idx])
     }
@@ -189,7 +131,7 @@ impl<'p> DagWalker<'p> {
                 self.waiting_on[dep] -= 1;
                 if self.waiting_on[dep] == 0 && matches!(self.state[dep], NodeState::Pending) {
                     self.state[dep] = NodeState::Ready;
-                    self.ready_queue.push(dep);
+                    self.ready_queue.push(Reverse(dep));
                 }
             }
             return Vec::new();
@@ -221,7 +163,7 @@ impl<'p> DagWalker<'p> {
         // scanning it per-skip.
         if !skipped.is_empty() {
             self.ready_queue
-                .retain(|&i| !matches!(self.state[i], NodeState::Skipped { .. }));
+                .retain(|&Reverse(i)| !matches!(self.state[i], NodeState::Skipped { .. }));
         }
 
         skipped
@@ -230,6 +172,7 @@ impl<'p> DagWalker<'p> {
     /// True when every node has reached a terminal state
     /// (`Succeeded`, `Failed`, or `Skipped`). A `Ready` or `Running`
     /// node keeps the walker live.
+    #[cfg(test)]
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.state.iter().all(|s| {
@@ -240,8 +183,8 @@ impl<'p> DagWalker<'p> {
         })
     }
 
-    /// Snapshot per-node state keyed by id. Used by tests; the
-    /// scheduler does not consume this in v0.1.
+    /// Snapshot per-node state keyed by id.
+    #[cfg(test)]
     #[must_use]
     pub fn statuses(&self) -> BTreeMap<String, NodeState> {
         self.by_id
@@ -288,6 +231,19 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             nodes,
         }
+    }
+
+    #[test]
+    fn ties_run_in_source_order_even_when_a_completion_unblocks_an_earlier_node() {
+        let pipeline = pipeline_with_shell_nodes(&[("a", &[]), ("b", &[]), ("c", &["a"])]);
+        let mut walker = DagWalker::new(&pipeline).expect("valid DAG");
+
+        let mut order = Vec::new();
+        while let Some(node) = walker.next_ready() {
+            order.push(node.id.clone());
+            walker.complete(&node.id, true);
+        }
+        assert_eq!(order, ["a", "b", "c"]);
     }
 
     #[test]

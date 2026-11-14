@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
+use orno_core::events::{Event, EventSink, StreamingSink};
+use orno_core::execution::scheduler::RunOutcome;
+
 pub mod completions;
 pub mod plan;
 pub mod replay;
@@ -45,8 +51,48 @@ pub async fn sigint_with_warning() {
     // is suppressed only if the future itself returns an error, which
     // is the right behavior.
     if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = ?e, "SIGINT handler install failed");
+        tracing::warn!(error = %e, "SIGINT handler install failed");
         return;
     }
     tracing::warn!("SIGINT received, attempting graceful shutdown");
+}
+
+/// Sentinel in `RunFinished.failed_nodes` on SIGINT, so a stream reader
+/// can tell an interrupted run from a node failure without the exit code.
+const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
+
+/// Emit the `RunFinished` that closes the stream of an interrupted run.
+pub(crate) async fn emit_interrupted(sink: &Arc<dyn EventSink>, run_id: &str) {
+    sink.record(Event::RunFinished {
+        run_id: run_id.to_string(),
+        ok: false,
+        failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
+        skipped_nodes: Vec::new(),
+    })
+    .await;
+}
+
+/// Map the engine outcome and the sink's broken state to the process
+/// result. `command` ("run" or "replay") names the subcommand in errors.
+/// The sink swallows write errors mid-run so one EPIPE does not poison
+/// every later `record`, but a broken sink still owes a non-zero exit.
+pub(crate) fn finalize_run(
+    streaming_sink: &StreamingSink,
+    outcome: &RunOutcome,
+    command: &str,
+) -> Result<()> {
+    if streaming_sink.is_broken() {
+        bail!("event stream write failed (downstream closed?); {command} output is incomplete");
+    }
+    // Skipped nodes are visible as `node_skipped` envelopes, so only the
+    // failed ones are listed here.
+    if !outcome.ok {
+        let names = if outcome.failed_nodes.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            outcome.failed_nodes.join(", ")
+        };
+        bail!("{command} failed: nodes [{names}] reported ok:false");
+    }
+    Ok(())
 }

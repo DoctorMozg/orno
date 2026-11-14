@@ -19,6 +19,23 @@ use crate::llm::{OrnoChatMessage, OrnoChatTool, Usage};
 /// Providers known in v0.1. Kept explicit so a typo in a pipeline YAML
 /// surfaces as `ConfigError` at run start, not a confusing genai
 /// adapter-mapping error mid-run.
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Env var a provider's API key is resolved from, or `None` for keyless
+/// providers (and unknown names). The CLI uses it to redact keys that
+/// were never declared under `secrets:`.
+#[must_use]
+pub fn provider_api_key_env(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(OPENAI_KEY_ENV),
+        "anthropic" => Some(ANTHROPIC_KEY_ENV),
+        "openrouter" => Some(OPENROUTER_KEY_ENV),
+        _ => None,
+    }
+}
+
 pub(super) const KNOWN_PROVIDERS: &[&str] = &["openai", "anthropic", "ollama", "openrouter"];
 
 /// Hard cap on the body bytes preserved on `LlmError::ApiError.body`.
@@ -98,97 +115,66 @@ fn warn_if_ollama_remote(host: Option<&str>) {
         .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
     if !is_loopback {
         tracing::warn!(
-            ollama_host = %raw,
+            llm.ollama_host = %raw,
             "OLLAMA_HOST points to a non-loopback address; \
              prompts and tool-call payloads will leave this machine in cleartext",
         );
     }
 }
 
-/// Adapter-pinning resolver: every client holds a closure that fixes
-/// the `AdapterKind` (and, for openrouter, the endpoint + auth env)
-/// regardless of what genai's prefix detection would otherwise pick.
-/// This is what makes `provider: anthropic + model: gpt-5` fail at the
-/// provider rather than silently routing to `OpenAI`.
-///
-/// Each auth'd closure captures its `AuthData` by move so the genai
-/// resolver has no reason to consult `std::env` at request time when
-/// the CLI already resolved the secret. `AuthData::clone()` returns
-/// a fresh owned value per call; the capture stays `Fn`, not `FnMut`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single dispatch table over the four supported providers; \
-              splitting per-provider helpers would obscure the side-by-side \
-              comparison that catches drift between adapter wirings"
-)]
+/// Build a client pinned to one adapter and endpoint, so `provider:
+/// anthropic` with `model: gpt-5` fails at the provider instead of
+/// silently routing to `OpenAI` by genai's prefix detection. The auth is
+/// captured by clone, so the resolver never consults `std::env` at
+/// request time.
+fn pinned_client(endpoint: &Endpoint, auth: &AuthData, adapter: AdapterKind) -> Client {
+    let (endpoint, auth) = (endpoint.clone(), auth.clone());
+    Client::builder()
+        .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+            move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                Ok(ServiceTarget {
+                    endpoint: endpoint.clone(),
+                    auth: auth.clone(),
+                    model: ModelIden::new(adapter, st.model.model_name),
+                })
+            },
+        ))
+        .build()
+}
+
 pub(super) fn build_client(
     provider: &str,
     secrets: &BTreeMap<String, String>,
 ) -> Result<Client, LlmError> {
-    match provider {
-        "openai" => {
-            let auth = resolve_auth("OPENAI_API_KEY", secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://api.openai.com/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
-        },
-        "anthropic" => {
-            let auth = resolve_auth("ANTHROPIC_API_KEY", secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://api.anthropic.com/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::Anthropic, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
-        },
+    Ok(match provider {
+        "openai" => pinned_client(
+            &Endpoint::from_static("https://api.openai.com/v1/"),
+            &resolve_auth(OPENAI_KEY_ENV, secrets),
+            AdapterKind::OpenAI,
+        ),
+        "anthropic" => pinned_client(
+            &Endpoint::from_static("https://api.anthropic.com/v1/"),
+            &resolve_auth(ANTHROPIC_KEY_ENV, secrets),
+            AdapterKind::Anthropic,
+        ),
         "ollama" => {
             let host_env = std::env::var("OLLAMA_HOST").ok();
             warn_if_ollama_remote(host_env.as_deref());
-            let endpoint = ollama_endpoint(host_env.as_deref());
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_owned(endpoint.clone()),
-                            auth: AuthData::None,
-                            model: ModelIden::new(AdapterKind::Ollama, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
+            let endpoint = Endpoint::from_owned(ollama_endpoint(host_env.as_deref()));
+            pinned_client(&endpoint, &AuthData::None, AdapterKind::Ollama)
         },
-        "openrouter" => {
-            let auth = resolve_auth("OPENROUTER_API_KEY", secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://openrouter.ai/api/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
+        "openrouter" => pinned_client(
+            &Endpoint::from_static("https://openrouter.ai/api/v1/"),
+            &resolve_auth(OPENROUTER_KEY_ENV, secrets),
+            AdapterKind::OpenAI,
+        ),
+        other => {
+            return Err(LlmError::ConfigError(format!(
+                "unknown provider `{other}`; known: {}",
+                KNOWN_PROVIDERS.join(", "),
+            )));
         },
-        other => Err(LlmError::ConfigError(format!(
-            "unknown provider `{other}`; known: {}",
-            KNOWN_PROVIDERS.join(", "),
-        ))),
-    }
+    })
 }
 
 /// Classify a `genai::Error` as transient (worth retrying) vs
@@ -247,10 +233,12 @@ pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) ->
             status_to_error(provider, model, status.as_u16(), &body)
         },
         G::RequiresApiKey { .. } | G::NoAuthData { .. } | G::NoAuthResolver { .. } => {
-            LlmError::AuthFailed {
-                provider: provider.to_string(),
-            }
+            missing_api_key(provider, None)
         },
+        G::Resolver {
+            resolver_error: genai::resolver::Error::ApiKeyEnvNotFound { env_name },
+            ..
+        } => missing_api_key(provider, Some(&env_name)),
         G::ChatResponseGeneration { cause, .. } => LlmError::ParseError(cause),
         G::NoChatResponse { .. } => {
             LlmError::ParseError("provider returned no chat response".to_string())
@@ -261,12 +249,29 @@ pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) ->
     }
 }
 
+/// A request that never had a credential to send. `env_name` is the
+/// variable genai looked for; otherwise the provider's conventional one.
+fn missing_api_key(provider: &str, env_name: Option<&str>) -> LlmError {
+    let hint = match env_name.or_else(|| provider_api_key_env(provider)) {
+        Some(env) => format!("set `{env}` in the environment or declare it under `secrets:`"),
+        None => "provide credentials for it".to_string(),
+    };
+    LlmError::ConfigError(format!("no API key for provider `{provider}`; {hint}"))
+}
+
+/// Providers word a bad model name differently, but all of them say
+/// "model" in the 404 body. A 404 without it is a wrong endpoint, such
+/// as a mistyped `OLLAMA_HOST`.
+fn is_model_not_found_body(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("model")
+}
+
 fn status_to_error(provider: &str, model: &str, status: u16, body: &str) -> LlmError {
     match status {
         401 | 403 => LlmError::AuthFailed {
             provider: provider.to_string(),
         },
-        404 => LlmError::ModelNotFound {
+        404 if is_model_not_found_body(body) => LlmError::ModelNotFound {
             provider: provider.to_string(),
             model: model.to_string(),
         },
@@ -503,14 +508,36 @@ mod tests {
     }
 
     #[test]
-    fn status_404_maps_to_model_not_found() {
-        match status_to_error("anthropic", "claude-9001", 404, "") {
+    fn status_404_with_model_body_maps_to_model_not_found() {
+        let body =
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-9001"}}"#;
+        match status_to_error("anthropic", "claude-9001", 404, body) {
             LlmError::ModelNotFound { provider, model } => {
                 assert_eq!(provider, "anthropic");
                 assert_eq!(model, "claude-9001");
             },
             other => panic!("expected ModelNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_404_without_model_body_is_an_api_error() {
+        // A wrong `OLLAMA_HOST` answers 404 from some unrelated server.
+        match status_to_error("ollama", "llama3", 404, "404 page not found") {
+            LlmError::ApiError { status, body, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(body, "404 page not found");
+            },
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_api_key_names_the_env_var() {
+        let msg = missing_api_key("anthropic", None).to_string();
+        assert!(msg.contains("ANTHROPIC_API_KEY"), "{msg}");
+        let msg = missing_api_key("custom", Some("MY_KEY")).to_string();
+        assert!(msg.contains("MY_KEY"), "{msg}");
     }
 
     #[test]

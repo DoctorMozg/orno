@@ -5,7 +5,9 @@
 
 pub mod bash;
 pub mod edit;
+mod fs_util;
 pub mod mcp_handler;
+pub mod net_guard;
 mod path_guard;
 pub mod read;
 pub mod record;
@@ -18,19 +20,22 @@ pub mod write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::agent::BudgetScope;
 use crate::error::ToolError;
+use crate::events::Redactor;
+use crate::pipeline::template::RenderScope;
+use net_guard::DomainRules;
 
 pub use bash::BashHandler;
 pub use edit::EditHandler;
-pub use mcp_handler::{McpToolHandler, McpToolHandlerConfig, ReplayMcpStubHandler};
+pub use mcp_handler::{McpToolHandler, McpToolHandlerConfig};
 pub use read::ReadHandler;
 pub use record::{RecordingToolHandler, ToolTapeEntry};
-pub use replay::ReplayToolHandler;
+pub use replay::{ReplayMcpStubHandler, ReplayToolHandler};
 pub use set_state::SetStateHandler;
 pub use subagent::SubagentHandler;
 pub use web_fetch::WebFetchHandler;
@@ -58,6 +63,67 @@ pub enum ToolEffect {
     ContextSelf,
 }
 
+impl ToolEffect {
+    /// True when the effect needs `AgentPolicy.allow_mutations`.
+    #[must_use]
+    pub fn requires_mutations(self) -> bool {
+        matches!(self, Self::Mutations | Self::MutationsAndNetwork)
+    }
+
+    /// True when the effect needs `AgentPolicy.allow_network`.
+    #[must_use]
+    pub fn requires_network(self) -> bool {
+        matches!(self, Self::Network | Self::MutationsAndNetwork)
+    }
+
+    /// True when the effect needs `AgentPolicy.allow_context_writes`.
+    #[must_use]
+    pub fn requires_context_writes(self) -> bool {
+        self == Self::ContextSelf
+    }
+}
+
+/// Every builtin tool name with its declared effect. Pipeline validation
+/// reads this table; [`builtin_handlers`] must stay in step with it, which
+/// a unit test enforces.
+pub const BUILTIN_TOOLS: &[(&str, ToolEffect)] = &[
+    ("Bash", ToolEffect::MutationsAndNetwork),
+    ("Read", ToolEffect::ReadOnly),
+    ("Write", ToolEffect::Mutations),
+    ("Edit", ToolEffect::Mutations),
+    ("WebFetch", ToolEffect::Network),
+    ("SetState", ToolEffect::ContextSelf),
+];
+
+/// Declared effect of the builtin named `name`, or `None` when it is not a builtin.
+#[must_use]
+pub fn builtin_effect(name: &str) -> Option<ToolEffect> {
+    BUILTIN_TOOLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, effect)| *effect)
+}
+
+/// One handler per [`BUILTIN_TOOLS`] entry. `SetState` shares the run-level
+/// redactor so `secrets.*` leaves are scrubbed before state reaches the wire.
+#[must_use]
+pub fn builtin_handlers(
+    redactor: &Arc<Redactor>,
+    body_excerpt_max_bytes: usize,
+) -> Vec<Arc<dyn ToolHandler>> {
+    vec![
+        Arc::new(BashHandler),
+        Arc::new(ReadHandler),
+        Arc::new(WriteHandler),
+        Arc::new(EditHandler),
+        Arc::new(WebFetchHandler::default()),
+        Arc::new(SetStateHandler::new(
+            Arc::clone(redactor),
+            body_excerpt_max_bytes,
+        )),
+    ]
+}
+
 /// Per-call context threaded from `LoopAgent` into `ToolHandler::invoke`.
 /// Bundled into a struct so the handler surface stays below the project's
 /// four-parameter threshold and so additions (tracing spans, cancellation
@@ -82,21 +148,19 @@ pub struct ToolInvocation<'a> {
     /// `N` agent dispatches the child at depth `N + 1`, bounded by
     /// `AgentPolicy.max_subagent_depth`.
     pub depth: u32,
-    /// Writable handle to the current node's `state` buffer.
-    /// `Some` only when the node's `allow_context_writes` policy is set
-    /// and the handler is dispatched through `LoopAgent`. `SetState`
-    /// reaches for this; every other handler leaves it alone.
+    /// Writable handle to the current node's `state` buffer. `Some` for
+    /// every `LoopAgent` dispatch; `SetState` is gated by
+    /// `allow_context_writes` before it runs, so other handlers never
+    /// reach for it. `None` outside a `LoopAgent` (unit tests).
     pub state_handle: Option<StateHandle<'a>>,
-    /// Shared handle to the calling loop's per-call token counter.
-    /// `SubagentHandler` forwards this into its child `AgentRequest` as
-    /// `parent_token_counter` so the child loop bumps the parent's
-    /// counter on every LLM response — the parent's
-    /// `policy.max_total_tokens` budget transitively covers any
-    /// subagent loop spend. `None` when the handler is dispatched
-    /// outside a `LoopAgent` (unit tests, future direct-handler call
-    /// sites). Adding this field is why `ToolInvocation` is `Clone` but
-    /// no longer `Copy` — `Arc` is not trivially copyable.
-    pub token_budget_share: Option<Arc<AtomicU64>>,
+    /// Budget scope of the calling loop. `SubagentHandler` hands it to
+    /// the child loop so child and grandchild spend count against every
+    /// ancestor's token and tool-call limits. `None` outside a
+    /// `LoopAgent` (unit tests).
+    pub budget: Option<Arc<BudgetScope>>,
+    /// Template scope the calling node was rendered under, used by
+    /// `SubagentHandler` to render the child's `system` and `roots`.
+    pub render_scope: Option<&'a RenderScope>,
     /// Filesystem roots the file builtins (`Read` / `Write` / `Edit`)
     /// are jailed to. Borrowed from the agent's `AgentPolicy.roots`.
     /// Empty when the calling agent did not declare any root or when
@@ -104,6 +168,10 @@ pub struct ToolInvocation<'a> {
     /// File handlers reject paths that escape `roots[0]`; non-file
     /// handlers ignore this field entirely.
     pub roots: &'a [PathBuf],
+    /// The calling agent's `allowed_domains` / `blocked_domains`.
+    /// `WebFetch` re-applies them to every redirect hop, since the
+    /// policy gate only sees the first URL. Empty outside a `LoopAgent`.
+    pub domains: DomainRules<'a>,
 }
 
 /// Borrow-scoped pointer to a single node's `state` buffer. Held for
@@ -141,8 +209,10 @@ impl<'a> ToolInvocation<'a> {
             call_id,
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
+            domains: DomainRules::default(),
         }
     }
 
@@ -156,8 +226,10 @@ impl<'a> ToolInvocation<'a> {
             call_id,
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots,
+            domains: DomainRules::default(),
         }
     }
 }
@@ -196,7 +268,7 @@ pub trait ToolHandler: Send + Sync {
     /// tool in `allowed_tools` returns `true` here and `policy.roots` is
     /// empty. Override this on every handler that performs filesystem I/O
     /// relative to `roots`; the default of `false` keeps third-party
-    /// handlers compatible (BS3).
+    /// handlers compatible.
     fn requires_jail(&self) -> bool {
         false
     }
@@ -207,4 +279,20 @@ pub trait ToolHandler: Send + Sync {
     ///
     /// Must not check policy — callers are already cleared to call this.
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError>;
+}
+
+#[cfg(test)]
+mod builtin_table_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn handlers_match_the_builtin_table() {
+        let redactor = Arc::new(Redactor::new(&BTreeMap::new()));
+        let handlers = builtin_handlers(&redactor, 1024);
+        let actual: Vec<(&str, ToolEffect)> =
+            handlers.iter().map(|h| (h.name(), h.effect())).collect();
+        assert_eq!(actual, BUILTIN_TOOLS);
+    }
 }

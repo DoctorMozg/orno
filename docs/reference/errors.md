@@ -1,8 +1,8 @@
 # Error reference
 
-orno's public error surface is a fixed set of `thiserror` enums in `orno-core::error`. Every enum is `#[non_exhaustive]` — consumers must accept that new variants may appear in future releases without that being a breaking change.
+orno's public error surface is a fixed set of `thiserror` enums in `orno-core::error`. Every enum is `#[non_exhaustive]`, so new variants can appear in future releases without that counting as a breaking change. Consumers must allow for them.
 
-This page enumerates each enum's variants and the conditions that produce them. Failures that surface on the user-facing event log are typed in [`events.md`](events.md) — `NodeFailure` and `LlmFailure` mirror these enums for wire emission.
+This page enumerates each enum's variants and the conditions that produce them. Failures that surface on the user-facing event log are typed in [`events.md`](events.md). `NodeFailure` and `LlmFailure` mirror these enums for wire emission.
 
 ## `CoreError`
 
@@ -21,89 +21,96 @@ The crate-level umbrella enum. Wraps each subsystem error so callers can match o
 
 Failures discovered while loading or validating a pipeline YAML.
 
-| Variant         | Fields                                                | Cause                                                                                                                                  |
-| --------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `Io`            | `#[from] std::io::Error`                              | Filesystem error reading the pipeline file.                                                                                            |
-| `Parse`         | `#[from] serde_yaml_ng::Error`                        | YAML did not parse against the pipeline schema.                                                                                        |
-| `Validation`    | `message: String`                                     | Pipeline parsed but failed semantic checks (unknown agent reference, child agent more permissive than parent, malformed tool name…).   |
-| `Template`      | `name: String`, `#[source] minijinja::Error`          | A templated string (`initial_prompt`, MCP `command`, etc.) failed to render against the available context.                             |
-| `InvalidGraph`  | `message: String`                                     | The DAG declared by `nodes[*].needs` is malformed — a cycle, a self-loop, or an edge to an undefined node.                             |
-| `UnknownAgent`  | `name: String`                                        | A `nodes[*].agent` value or a `subagent.<name>` allowed-tool entry referenced an agent not declared in `agents:`.                       |
+| Variant        | Fields                                                  | Cause                                                                                                                                         |
+| -------------- | ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Io`           | `path: String`, `#[source] std::io::Error`              | Filesystem error reading the pipeline file.                                                                                                   |
+| `Parse`        | `#[source] serde_yaml_ng::Error` (tuple variant)        | YAML did not parse against the pipeline schema, including unknown keys (`additionalProperties: false`).                                       |
+| `Validation`   | `String` (tuple variant)                                | Pipeline parsed but failed semantic checks. Several problems are reported at once as `N errors:` with one bullet each. See [validation](pipeline-yaml.md#validation). |
+| `Template`     | `name: String`, `#[source] minijinja::Error`            | A templated string (`initial_prompt`, shell `args`, an MCP `url`, etc.) failed to compile or render against the available context.            |
+| `InvalidGraph` | `reason: String`                                        | The DAG declared by `nodes[*].needs` is malformed: a cycle, a self-loop, or an edge to an undefined node.                                      |
+| `UnknownAgent` | `name: String`                                          | A node referenced an agent missing from `agents:`. `validate()` rejects this first; the render path reports it for pipelines built in code.    |
 
-`PipelineError` always surfaces at load or `orno validate` time — never mid-run.
+`orno run`, `orno plan`, `orno replay` and `orno validate` all run the same validation, so a `PipelineError` surfaces before the first node starts.
 
 ## `NodeError`
 
-Failures from the node executor's dispatch path. Surface as `NodeFailure::ExecutorError` on the event log.
+Failures from the node executor's dispatch path. They surface as `NodeFailure::ExecutorError` on the event log.
 
-| Variant          | Fields                                              | Cause                                                                                                                          |
-| ---------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `UnknownKind`    | `kind: String`                                      | A pipeline node has a `kind:` value with no registered executor. Surfaces as `NodeFailure::NoExecutorRegistered` on the wire.   |
-| `NotImplemented` | `kind: String`                                      | An executor accepted dispatch but its handler is not yet available in this build.                                              |
-| `UnsupportedYet` | `feature: String`                                   | A node feature exists in the schema but is not supported by the installed engine.                                              |
-| `Execution`      | `kind: String`, `#[source] anyhow::Error`           | The executor's body returned `Err` (process spawn failed, transport error, etc.).                                              |
+| Variant          | Fields                                                              | Cause                                                                                                         |
+| ---------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `NotImplemented` | `id: String`                                                        | A node reached a skeleton stub executor.                                                                      |
+| `Execution`      | `id: String`, `#[source] Box<dyn Error + Send + Sync>`              | The executor's body returned `Err` (process spawn failed, agent loop error, transport error, etc.).           |
+| `ReplayRefused`  | `id: String`                                                        | `orno replay` met a `kind: shell` node. Shell side effects are not recorded in a bundle, so they cannot be replayed. |
 
 ## `AgentError`
 
-Failures from the agent loop. Each variant maps to one of the [five strictness dimensions](../glossary.md#the-five-strictness-dimensions) or to a tool/LLM-source failure surfaced through the loop.
+Failures from the agent loop. Each variant maps to one of the [five strictness dimensions](../glossary.md#the-five-strictness-dimensions) or to a tool or LLM failure surfaced through the loop.
 
-| Variant                  | Fields                                                 | Cause                                                                                                                                                        |
-| ------------------------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `InvalidPolicy`          | `message: String`                                      | The `AgentPolicy` was rejected before the loop entered (e.g. `max_iterations: 0`).                                                                           |
-| `UnsupportedYet`         | `feature: String`                                      | Loop entered but a referenced feature is not supported in this build.                                                                                        |
-| `IterationLimitExceeded` | `max_iterations: u32`                                  | The loop reached `policy.max_iterations` without converging on a `stop` finish reason. Bounded-iteration breach.                                              |
-| `UnknownToolCalled`      | `name: String`                                         | The model emitted a tool-call turn for a name not in `allowed_tools`. Bounded-tool-surface breach. Terminates immediately — no retry.                         |
-| `BudgetExceeded`         | `kind: BudgetKind`, `used: u64`, `limit: u64`          | A running budget breached: `Tokens` (cumulative `max_total_tokens`) or `ToolCalls` (`max_tool_calls`). Bounded-resources breach.                              |
-| `SubagentDepthExceeded`  | `attempted: u32`, `max_depth: u32`                     | A `subagent.<name>` call attempted while the parent agent's `max_subagent_depth` budget was already exhausted. Non-terminal: surfaces as a denial back to the model. |
-| `ParseFailed`            | `message: String`                                      | The model returned malformed JSON for a tool-call argument and `policy.on_parse_error: fail` (or the retry was already consumed).                              |
-| `Tool`                   | `#[from] ToolError`                                    | A tool dispatch returned `ToolError`. The loop's behavior depends on the variant — `InvalidArgs` is fed back as a denial; `Invocation` is terminal.            |
-| `Llm`                    | `#[from] LlmError`                                     | The transport returned `LlmError`. Terminates the node.                                                                                                       |
+| Variant                  | Fields                                              | Cause                                                                                                                                                                  |
+| ------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `InvalidPolicy`          | `String` (tuple variant)                            | The policy was rejected before the first LLM call (e.g. `max_iterations: 0`, or Read/Write/Edit listed with empty `roots`).                                            |
+| `IterationLimitExceeded` | `max: u32`                                          | The loop reached `policy.max_iterations` without a `stop` finish reason. Bounded-iteration breach.                                                                     |
+| `UnknownToolCalled`      | `name: String`                                      | The model called a tool not in `allowed_tools`, or an `allowed_tools` entry has no registered handler. Bounded-tool-surface breach. Terminates immediately, no retry.   |
+| `BudgetExceeded`         | `kind: BudgetKind`                                  | `Tokens` (`max_total_tokens`) or `ToolCalls` (`max_tool_calls`) breached. Both budgets cover the whole subagent tree. Bounded-resources breach.                        |
+| `ParseFailed`            | `tool: String`, `error: String`                     | A tool's arguments failed to parse and `on_parse_error: fail` was set, or `retry_once` was already spent for that call.                                                |
+| `Tool`                   | `name: String`, `#[source] ToolError`               | A tool handler returned a terminal `ToolError`. Recoverable errors never reach this variant; they are fed back to the model.                                           |
+| `Llm`                    | `#[from] LlmError` (tuple variant)                  | The transport returned `LlmError`. Terminates the node.                                                                                                                |
 
 ## `LlmError`
 
-Failures from the `LlmTransport` seam. Mirror to `LlmFailure` on the event wire (`Event::LlmRequestFailed`).
+Failures from the `LlmTransport` seam. Mirrored to `LlmFailure` on the event wire (`Event::LlmRequestFailed`).
 
-| Variant           | Fields                                                                      | Cause                                                                                                       |
-| ----------------- | --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `NotImplemented`  | `provider: String`                                                          | A request reached a provider that has no transport adapter built in.                                         |
-| `Rejected`        | `String`                                                                    | The transport refused the request before it left the process (e.g. content filter on the adapter).           |
-| `AuthFailed`      | `provider: String`                                                          | HTTP 401/403 or pre-flight `RequiresApiKey` / `NoAuthData`. Wire form: `LlmFailure::AuthFailed`.             |
-| `RateLimited`     | `provider: String`                                                          | HTTP 429. Wire form: `LlmFailure::RateLimited`. v0.1 does not retry.                                         |
-| `ModelNotFound`   | `provider: String`, `model: String`                                         | HTTP 404 on the chat endpoint — usually a model-name typo. Wire form: `LlmFailure::ModelNotFound`.           |
-| `ApiError`        | `provider: String`, `status: u16`, `body: String`                           | Any other HTTP failure. Wire form: `LlmFailure::ApiError { status, body_excerpt }` (head-truncated).         |
-| `Transport`       | `#[source] anyhow::Error`                                                   | Network/timeout/transport problem from the underlying client. Wire form: `LlmFailure::Transport`.            |
-| `ConfigError`     | `String`                                                                    | Pre-flight misconfiguration caught before any network call. Wire form: `LlmFailure::ConfigError`.            |
-| `ParseError`      | `String`                                                                    | Provider returned a payload the adapter could not parse. Wire form: `LlmFailure::ParseError`.                |
-| `ReplayMiss`      | `key: String`                                                               | Replay tape miss — the caller is running against a tape from a different pipeline, or the tape is incomplete. Wire form: `LlmFailure::ReplayMiss`. |
+| Variant         | Fields                                                          | Cause                                                                                                                                     |
+| --------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `Rejected`      | `String` (tuple variant)                                        | The transport refused the request before it left the process. Wire form: `LlmFailure::Other`.                                             |
+| `AuthFailed`    | `provider: String`                                              | HTTP 401/403. Wire form: `LlmFailure::AuthFailed`. A missing API key is a `ConfigError` instead.                                          |
+| `RateLimited`   | `provider: String`                                              | HTTP 429. Not retried. Wire form: `LlmFailure::RateLimited`.                                                                              |
+| `ModelNotFound` | `provider: String`, `model: String`                             | HTTP 404 whose body mentions the model. Any other 404 is an `ApiError`. Wire form: `LlmFailure::ModelNotFound`.                           |
+| `ApiError`      | `provider: String`, `status: u16`, `body: String`               | Any other HTTP failure. The in-memory body is capped at 512 bytes. Wire form: `LlmFailure::ApiError { status, body_excerpt }`.            |
+| `Transport`     | `#[source] Box<dyn Error + Send + Sync>` (tuple variant)        | Network, timeout or other transport problem. Each attempt is cut off after 5 minutes and a timed-out attempt is not retried. Wire form: `LlmFailure::Transport`. |
+| `ConfigError`   | `String` (tuple variant)                                        | Misconfiguration caught before any network call: unknown provider, or a missing API key (the message names the env var to set). Wire form: `LlmFailure::ConfigError`. |
+| `ParseError`    | `String` (tuple variant)                                        | The provider returned a payload the adapter could not parse. Wire form: `LlmFailure::ParseError`.                                         |
+| `ReplayMiss`    | `key: String`                                                   | Replay tape miss. The run is replaying a tape from a different pipeline, or the tape is incomplete. Never falls through to a live call. Wire form: `LlmFailure::ReplayMiss`. |
 
 ## `ToolError`
 
-Failures from a `ToolHandler::invoke` call.
+Failures from a `ToolHandler::invoke` call. `ToolError::is_recoverable()` decides what the agent loop does next: recoverable errors are fed back to the model as an `error: <message>` tool result and the loop continues. Every other variant terminates the node as `AgentError::Tool`.
 
-| Variant         | Fields                                                              | Cause                                                                                                                                                    |
-| --------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Invocation`    | `name: String`, `#[source] Box<dyn Error>`                          | The tool's body returned `Err`. Process spawn failure, network failure, file-not-found, MCP transport error, etc.                                         |
-| `InvalidArgs`   | `name: String`, `message: String`                                   | The model's argument JSON did not match the tool's schema. Fed back to the model as a tool-result string; loop continues.                                 |
-| `StateTooLarge` | `name: String`, `bytes: usize`, `cap: usize`                        | A `SetState` write would push the node's serialized `state` past `EngineConfig.max_output_bytes`. The write rolls back; previous state survives intact.   |
-| `NotImplemented`| `name: String`                                                      | The tool exists in the registry but its handler body is not yet built.                                                                                   |
+| Variant         | Fields                                                              | Recoverable | Cause                                                                                                                                              |
+| --------------- | ------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Recoverable`   | `name: String`, `kind: RecoverableKind`, `message: String`          | yes         | The tool ran and failed in a way the model can act on. `kind` is listed below.                                                                     |
+| `NotImplemented`| `name: String`, `feature: String`                                   | yes         | The tool declared a feature its handler does not implement yet. Reported to the model as `error: tool ... not yet implemented: ...`.               |
+| `Invocation`    | `name: String`, `#[source] Box<dyn Error + Send + Sync>`            | no          | The underlying I/O or API call failed in a way the model cannot fix (spawn failure, WebFetch URL, redirect or address denial, Bash `cwd` outside the root, MCP transport error). |
+| `InvalidArgs`   | `name: String`, `message: String`                                   | no          | The argument JSON did not match the tool's schema. With `on_parse_error: retry_once` the first one per call is fed back to the model; otherwise it becomes `AgentError::ParseFailed`. |
+| `StateTooLarge` | `name: String`, `bytes: usize`, `cap: usize`                        | no          | A `SetState` write would push `nodes.<self>.state` past `EngineConfig.max_output_bytes`. The write is rejected and the previous state is kept.     |
+| `Denied`        | `reason: String`                                                    | no          | A runtime safety check inside the handler refused the call: a path escaping `roots`, empty `roots` for Read/Write/Edit, Bash `cwd` without `roots`, a rendered subagent root outside the parent's roots. Distinct from the effect-class gate, which feeds a `denied: ...` result back to the model and never terminates. |
+
+### `RecoverableKind`
+
+Serialized as snake_case. The tapes match on it, so a replayed recoverable failure keeps its kind.
+
+| Kind            | Raised by                                                                                       |
+| --------------- | ----------------------------------------------------------------------------------------------- |
+| `not_found`     | A path the model named does not exist (`Read`, `Edit`).                                         |
+| `invalid_data`  | A file exists but its content cannot be used as asked.                                          |
+| `timeout`       | `Bash` hit its `timeout_secs` (the message includes partial output) or `WebFetch` timed out.    |
+| `no_match`      | `Edit`'s `old_string` matched zero or several places.                                           |
+| `tool_reported` | An MCP tool returned `isError: true`.                                                           |
 
 ## `McpError`
 
 Failures from the MCP client.
 
-| Variant                | Fields                                                                          | Cause                                                                                                                  |
-| ---------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `SpawnFailed`          | `server: String`, `#[source] std::io::Error`                                    | The MCP server subprocess failed to start (stdio transport).                                                            |
-| `HandshakeFailed`      | `server: String`, `message: String`                                             | The `initialize` + `tools/list` handshake failed (HTTP transport: bad URL or auth; stdio: process exited mid-handshake). |
-| `CallFailed`           | `server: String`, `tool: String`, `#[source] Box<dyn Error>`                    | A `tools/call` request failed (transport-level — connection drop, timeout).                                             |
-| `ToolError`            | `server: String`, `tool: String`, `message: String`                             | The server reported a tool-level error in the `tools/call` response (the response said `is_error: true`).               |
-| `ServerCrashed`        | `server: String`, `reason: String`                                              | The server exited mid-run unexpectedly. Surfaces on `Event::McpServerCrashed`.                                          |
-| `UnsupportedTransport` | `server: String`, `kind: String`                                                | The server's `transport:` value names a kind orno does not implement (e.g. `kind: basic` HTTP auth in v0.1).            |
-| `ShutdownTimeout`      | `server: String`                                                                | The server did not exit cleanly within the shutdown deadline at run end.                                                |
-| `UnknownTool`          | `server: String`, `tool: String`                                                | The agent's `allowed_tools` referenced `mcp.<server>.<tool>` for a tool the server's `tools/list` did not advertise.    |
+| Variant                | Fields                                                              | Cause                                                                                                                  |
+| ---------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `SpawnFailed`          | `server: String`, `#[source] Box<dyn Error + Send + Sync>`          | The MCP server subprocess failed to start (stdio transport).                                                           |
+| `HandshakeFailed`      | `server: String`, `#[source] Box<dyn Error + Send + Sync>`          | The `initialize` + `tools/list` handshake failed (HTTP: bad URL, headers or auth; stdio: process exited mid-handshake). |
+| `CallFailed`           | `server: String`, `tool: String`, `#[source] Box<dyn Error + Send + Sync>` | A `tools/call` request failed at the transport level: connection drop, or no reply within `call_timeout_secs`. |
+| `ToolError`            | `server: String`, `tool: String`, `message: String`                 | The server reported `isError: true`. The agent loop surfaces it to the model as `RecoverableKind::ToolReported`.       |
+| `UnsupportedTransport` | `transport: String`                                                 | The server config names a transport or auth mode this build cannot connect (today, `auth: basic` over HTTP).           |
 
 ## See also
 
-- [Events](events.md) — `NodeFailure` and `LlmFailure` mirror this surface for wire-format emission.
-- [Exit codes](exit-codes.md) — process-level discriminators.
-- [Five strictness dimensions](../glossary.md#the-five-strictness-dimensions) — the contract violations behind most `AgentError` variants.
+- [Events](events.md): `NodeFailure` and `LlmFailure` mirror this surface for wire-format emission.
+- [Exit codes](exit-codes.md): process-level discriminators.
+- [Five strictness dimensions](../glossary.md#the-five-strictness-dimensions): the contract violations behind most `AgentError` variants.

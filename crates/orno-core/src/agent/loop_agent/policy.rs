@@ -1,17 +1,9 @@
 //! Policy gate and parse-error retry for [`LoopAgent`].
 //!
-//! Split out of `run.rs` so the effect-based denial logic and the
-//! parse-error retry wrapper stay readable. Effect-based denials are
-//! *non-terminal* — the denial string is fed back to the model as a
-//! `ToolResult`, and the enclosing loop in `run.rs` continues.
-//!
-//! Visibility: the single entry point `invoke_with_parse_retry` is
-//! `pub(super)` because `run.rs` (a sibling) calls it; the helpers
-//! `check_policy_and_invoke` and `deny` stay private to this file
-//! because they are only reached through the retry wrapper.
+//! Effect-based denials are non-terminal: the denial string goes back
+//! to the model as a `ToolResult` and the loop continues.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -20,100 +12,81 @@ use crate::error::{AgentError, ToolError};
 use crate::events::Event;
 use crate::llm::OrnoChatToolCall;
 use crate::pipeline::AgentPolicy;
+use crate::tool::net_guard::{DomainRules, DomainVerdict, is_blocked_ip, literal_ip};
 use crate::tool::{ToolEffect, ToolHandler, ToolInvocation};
 
-use super::LoopAgent;
+use super::{LoopAgent, SUBAGENT_PREFIX};
 
-/// Block every `IPv4` address an outbound HTTP request must never
-/// reach. Covers loopback, RFC 1918 private, link-local (including
-/// the `169.254.169.254` cloud metadata IP), CGNAT (RFC 6598),
-/// documentation, benchmarking, and broadcast. The full
-/// `127.0.0.0/8` loopback range is checked explicitly because
-/// `Ipv4Addr::is_loopback` is documented as covering only
-/// `127.0.0.1` on some platforms.
-#[must_use]
-pub(crate) fn is_blocked_ipv4(v4: Ipv4Addr) -> bool {
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        // CGNAT 100.64.0.0/10 — RFC 6598; not flagged by is_private.
-        || (u32::from(v4) & 0xffc0_0000) == 0x6440_0000
-        // Full 127.0.0.0/8 loopback range.
-        || v4.octets()[0] == 127
-        || v4.is_documentation()
-        || v4 == Ipv4Addr::BROADCAST
+/// Argument names tools conventionally use for their destination. A
+/// value under one of them is gated whatever its scheme, so `file://`
+/// is denied rather than ignored.
+const URL_KEYS: [&str; 5] = ["url", "endpoint", "uri", "target", "link"];
+
+/// Every http(s) URL in a tool call's arguments, at any nesting depth,
+/// so a tool that hides its destination under an unexpected key or
+/// inside an array still goes through the gate. `Url::parse` lowercases
+/// the scheme, which makes `HTTP://` count too.
+fn extract_network_urls(args: &Value) -> Vec<reqwest::Url> {
+    let mut urls = Vec::new();
+    collect_urls(args, None, &mut urls);
+    urls
 }
 
-/// Block every `IPv6` address an outbound HTTP request must never
-/// reach. Covers loopback, link-local (`fe80::/10`), unique-local
-/// (`fc00::/7`), and any IPv4-mapped or IPv4-compatible address
-/// whose embedded v4 form is itself blocked.
-#[must_use]
-pub(crate) fn is_blocked_ipv6(v6: Ipv6Addr) -> bool {
-    v6.is_loopback()
-        // fe80::/10 link-local.
-        || (v6.segments()[0] & 0xffc0) == 0xfe80
-        // fc00::/7 unique local addresses (RFC 4193).
-        || (v6.segments()[0] & 0xfe00) == 0xfc00
-        // IPv4-mapped (::ffff:0:0/96) — re-check the embedded v4.
-        || v6.to_ipv4_mapped().is_some_and(is_blocked_ipv4)
-        // IPv4-compatible (deprecated, but may still appear).
-        || v6.to_ipv4().is_some_and(is_blocked_ipv4)
-}
-
-/// Extract the network URL from a tool-call's argument bundle.
-/// Tries the conventional argument names first, then falls back to
-/// scanning every string value for an `http(s)://` prefix so a
-/// tool that declares its URL under an unexpected key still routes
-/// through the gate.
-fn extract_network_url(args: &Value) -> Option<reqwest::Url> {
-    for key in &["url", "endpoint", "uri", "target", "link"] {
-        if let Some(url) = args
-            .get(*key)
-            .and_then(Value::as_str)
-            .and_then(|u| reqwest::Url::parse(u).ok())
-        {
-            return Some(url);
-        }
-    }
-    if let Some(obj) = args.as_object() {
-        for val in obj.values() {
-            if let Some(s) = val.as_str()
-                && (s.starts_with("http://") || s.starts_with("https://"))
-                && let Ok(url) = reqwest::Url::parse(s)
+fn collect_urls(value: &Value, key: Option<&str>, out: &mut Vec<reqwest::Url>) {
+    match value {
+        Value::String(s) => {
+            if let Ok(url) = reqwest::Url::parse(s)
+                && (matches!(url.scheme(), "http" | "https")
+                    || key.is_some_and(|k| URL_KEYS.contains(&k)))
             {
-                return Some(url);
+                out.push(url);
             }
-        }
+        },
+        Value::Array(items) => items.iter().for_each(|v| collect_urls(v, key, out)),
+        Value::Object(map) => map.iter().for_each(|(k, v)| collect_urls(v, Some(k), out)),
+        _ => {},
     }
-    None
 }
 
-/// Maximum time allowed for a single DNS resolution. After this deadline the
-/// policy gate treats the host as unresolvable and denies the request. The
-/// blocking resolver thread continues in the background — it cannot be
-/// cancelled — but the tokio runtime is no longer blocked waiting for it.
-const DNS_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// One model-issued tool call with everything the policy gate needs.
+pub(super) struct ToolCall<'a> {
+    pub(super) handler: &'a Arc<dyn ToolHandler>,
+    pub(super) tool_call: &'a OrnoChatToolCall,
+    pub(super) policy: &'a AgentPolicy,
+    pub(super) wire_to_yaml: &'a HashMap<String, String>,
+}
 
-/// Resolve `host` via blocking DNS in a worker thread and return the
-/// list of resolved addresses. `lookup_host` is unavailable without
-/// the `tokio/net` feature, so we offload `std::net::ToSocketAddrs`
-/// to `spawn_blocking` to keep the runtime responsive.
-async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
-    let target = format!("{host}:0");
-    let join = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        target
-            .to_socket_addrs()
-            .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-    });
-    match tokio::time::timeout(DNS_RESOLUTION_TIMEOUT, join).await {
-        Ok(Ok(res)) => res,
-        Ok(Err(join_err)) => Err(std::io::Error::other(join_err)),
-        Err(_elapsed) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("DNS resolution timed out after {DNS_RESOLUTION_TIMEOUT:?}"),
-        )),
+/// Why the policy flags forbid `effect`, or `None` when it may run.
+fn effect_denial(effect: ToolEffect, policy: &AgentPolicy) -> Option<&'static str> {
+    match effect {
+        ToolEffect::Mutations | ToolEffect::MutationsAndNetwork if !policy.allow_mutations => {
+            Some("allow_mutations=false")
+        },
+        ToolEffect::Network | ToolEffect::MutationsAndNetwork if !policy.allow_network => {
+            Some("allow_network=false")
+        },
+        ToolEffect::ContextSelf if !policy.allow_context_writes => {
+            Some("allow_context_writes=false")
+        },
+        _ => None,
+    }
+}
+
+/// Tool-result text for a recoverable failure. The caller's redaction
+/// pass runs on it like on any other tool output.
+fn recoverable_feedback(tool: &str, err: &ToolError) -> String {
+    let kind = match err {
+        ToolError::Recoverable { kind, .. } => kind.to_string(),
+        _ => "not_implemented".to_string(),
+    };
+    // The message can echo user data, so only the kind is logged.
+    tracing::warn!(tool.name = %tool, error.kind = %kind, "tool failed; feeding the error back to the model");
+    match err {
+        ToolError::Recoverable { message, .. } => format!("error: {message}"),
+        ToolError::NotImplemented { name, feature } => {
+            format!("error: tool `{name}` not yet implemented: {feature}")
+        },
+        other => format!("error: {other}"),
     }
 }
 
@@ -148,242 +121,142 @@ impl LoopAgent {
         format!("denied: tool `{yaml_name}` blocked by {reason}")
     }
 
-    /// Apply the effect-based policy gate and invoke the handler. A
-    /// policy denial is *not* a terminal error — it is fed back to the
-    /// model as a `ToolResult` denial string so the model can adapt. A
-    /// handler error still terminates the loop via [`AgentError::Tool`].
-    /// `wire_to_yaml` is the per-`run()` reverse map used by `deny` to
-    /// surface the YAML-form name on every denial event and feed-back
-    /// string.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "policy gate enumerates every ToolEffect variant inline"
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "wire_to_yaml is per-run; threading through deny call sites — see plan WU-W2C"
-    )]
+    /// Apply the domain/SSRF gate for any network-reaching tool call.
+    /// Called from both [`ToolEffect::Network`] and
+    /// [`ToolEffect::MutationsAndNetwork`] arms so domain policy is
+    /// consistently enforced for all network tools, including MCP tools.
+    /// Returns `Some(denial)` when the request should be denied (the
+    /// caller feeds the string back to the model as a `ToolResult`),
+    /// or `None` to allow the call through.
+    async fn gate_network_url(
+        &self,
+        call: &ToolCall<'_>,
+        inv: &ToolInvocation<'_>,
+    ) -> Option<String> {
+        let ToolCall {
+            tool_call,
+            policy,
+            wire_to_yaml,
+            ..
+        } = *call;
+        // A subagent's arguments are a prompt, not a destination; its own
+        // loop gates whatever it calls.
+        if wire_to_yaml
+            .get(&tool_call.fn_name)
+            .is_some_and(|n| n.starts_with(SUBAGENT_PREFIX))
+        {
+            return None;
+        }
+        // Egress with no allowlist means every domain not in
+        // `blocked_domains` is reachable — surface this so an
+        // operator who forgot to populate the allowlist sees it.
+        if policy.allowed_domains.is_empty() {
+            tracing::warn!(
+                tool.name = %tool_call.fn_name,
+                "allow_network=true but allowed_domains is empty; every non-blocked domain is reachable",
+            );
+        }
+        // Missing/unparsable URLs fall through to the handler, which
+        // produces its own error; it cannot reach the network without one.
+        for url in extract_network_urls(&tool_call.fn_arguments) {
+            if let Some(reason) = self.url_denial(&url, policy).await {
+                return Some(
+                    self.deny(inv, &tool_call.fn_name, reason, wire_to_yaml)
+                        .await,
+                );
+            }
+        }
+        None
+    }
+
+    /// Why `url` must not be requested under `policy`, or `None` when it
+    /// may proceed.
+    async fn url_denial(&self, url: &reqwest::Url, policy: &AgentPolicy) -> Option<String> {
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Some(format!(
+                "scheme `{scheme}` not permitted; only http and https are allowed"
+            ));
+        }
+        let host = url.host_str()?;
+        // Literal IPs are rejected before the domain lists so a blocked
+        // address never costs a DNS round-trip.
+        let literal = literal_ip(url);
+        if let Some(ip) = literal
+            && is_blocked_ip(ip)
+        {
+            return Some(format!("IP `{ip}` is not a routable public address"));
+        }
+        let verdict = DomainRules {
+            allowed: &policy.allowed_domains,
+            blocked: &policy.blocked_domains,
+        }
+        .check(host);
+        match verdict {
+            DomainVerdict::Blocked => return Some(format!("blocked_domains contains `{host}`")),
+            DomainVerdict::NotAllowed => {
+                return Some(format!("allowed_domains does not contain `{host}`"));
+            },
+            _ => {},
+        }
+        if literal.is_some() {
+            return None;
+        }
+        // Pre-resolve so the denial names the offending address. Open
+        // egress fails closed on DNS errors; an allowlisted host is
+        // trusted by the operator and its lookup failure only warns (the
+        // connect-time guard still filters what is dialed).
+        match self.resolver.resolve(host).await {
+            Ok(addrs) => addrs
+                .iter()
+                .find(|ip| is_blocked_ip(**ip))
+                .map(|ip| format!("host `{host}` resolved to blocked IP `{ip}`")),
+            Err(e) if verdict == DomainVerdict::Allowlisted => {
+                tracing::warn!(
+                    net.host = %host,
+                    error = %e,
+                    "DNS resolution failed for allowlisted host; allowing request",
+                );
+                None
+            },
+            Err(e) => {
+                tracing::warn!(net.host = %host, error = %e, "DNS resolution failed; denying request");
+                Some(format!("DNS resolution failed for host `{host}`: {e}"))
+            },
+        }
+    }
+
+    /// Apply the effect-based policy gate and invoke the handler. Policy
+    /// denials and recoverable handler errors ([`ToolError::is_recoverable`])
+    /// are fed back to the model as the tool result; any other handler
+    /// error terminates the loop via [`AgentError::Tool`].
     async fn check_policy_and_invoke(
         &self,
-        handler: &Arc<dyn ToolHandler>,
-        tool_call: &OrnoChatToolCall,
-        policy: &AgentPolicy,
+        call: &ToolCall<'_>,
         inv: ToolInvocation<'_>,
-        wire_to_yaml: &HashMap<String, String>,
     ) -> Result<String, AgentError> {
-        match handler.effect() {
-            ToolEffect::Mutations => {
-                if !policy.allow_mutations {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_mutations=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-            },
-            ToolEffect::Network => {
-                if !policy.allow_network {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_network=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                // Egress with no allowlist means every domain not in
-                // `blocked_domains` is reachable — surface this so an
-                // operator who forgot to populate the allowlist sees it.
-                if policy.allowed_domains.is_empty() {
-                    tracing::warn!(
-                        tool.name = %tool_call.fn_name,
-                        "allow_network=true but allowed_domains is empty; every non-blocked domain is reachable",
-                    );
-                }
-                // Domain gate: URL extracted from any common URL-shaped
-                // arg. Missing/unparsable URLs fall through to the
-                // handler which produces its own error — the handler
-                // cannot reach the network without a URL anyway.
-                if let Some(parsed) = extract_network_url(&tool_call.fn_arguments) {
-                    // Deny non-HTTP(S) schemes to block file://, ftp://, data://.
-                    let scheme = parsed.scheme();
-                    if scheme != "http" && scheme != "https" {
-                        return Ok(self
-                            .deny(
-                                &inv,
-                                &tool_call.fn_name,
-                                format!(
-                                    "scheme `{scheme}` not permitted; \
-                                     only http and https are allowed"
-                                ),
-                                wire_to_yaml,
-                            )
-                            .await);
-                    }
-                    if let Some(host) = parsed.host_str().map(str::to_string) {
-                        // Literal-IP block list. Hostnames are also
-                        // pre-resolved below — but only after the cheap
-                        // domain-list checks pass, since a host already
-                        // rejected by the operator's allowlist need not
-                        // burn a DNS round-trip.
-                        if let Ok(ip) = host.parse::<IpAddr>() {
-                            let blocked = match ip {
-                                IpAddr::V4(v4) => is_blocked_ipv4(v4),
-                                IpAddr::V6(v6) => is_blocked_ipv6(v6),
-                            };
-                            if blocked {
-                                return Ok(self
-                                    .deny(
-                                        &inv,
-                                        &tool_call.fn_name,
-                                        format!(
-                                            "IP `{ip}` is not routable \
-                                             (loopback / private / link-local / \
-                                             CGNAT / documentation)"
-                                        ),
-                                        wire_to_yaml,
-                                    )
-                                    .await);
-                            }
-                        }
-                        // Suffix match: `d` matches host `h` if `h == d` or
-                        // `h` ends with `.d`. This closes the footgun where
-                        // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
-                        // through under naive equality, and applies the same
-                        // rule to the allowlist.
-                        let host_matches =
-                            |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
-                        if policy.blocked_domains.iter().any(host_matches) {
-                            return Ok(self
-                                .deny(
-                                    &inv,
-                                    &tool_call.fn_name,
-                                    format!("blocked_domains contains `{host}`"),
-                                    wire_to_yaml,
-                                )
-                                .await);
-                        }
-                        let explicitly_allowed = !policy.allowed_domains.is_empty()
-                            && policy.allowed_domains.iter().any(host_matches);
-                        if !policy.allowed_domains.is_empty() && !explicitly_allowed {
-                            return Ok(self
-                                .deny(
-                                    &inv,
-                                    &tool_call.fn_name,
-                                    format!("allowed_domains does not contain `{host}`"),
-                                    wire_to_yaml,
-                                )
-                                .await);
-                        }
-                        // Hostname input that survived the domain rules:
-                        // pre-resolve DNS and reject if any returned address
-                        // is in a blocked range. For open-network requests
-                        // (no allowlist) fail closed on DNS errors — a
-                        // failing resolver must not bypass the gate. For
-                        // explicitly-allowlisted hosts DNS failure is treated
-                        // as a transient resolver issue and the request is
-                        // allowed through with a warning; the operator
-                        // accepted responsibility when they added the domain.
-                        if host.parse::<IpAddr>().is_err() {
-                            match resolve_host(&host).await {
-                                Ok(addrs) => {
-                                    if let Some(blocked_ip) = addrs.iter().find(|ip| match ip {
-                                        IpAddr::V4(v4) => is_blocked_ipv4(*v4),
-                                        IpAddr::V6(v6) => is_blocked_ipv6(*v6),
-                                    }) {
-                                        return Ok(self
-                                            .deny(
-                                                &inv,
-                                                &tool_call.fn_name,
-                                                format!(
-                                                    "host `{host}` resolved to blocked IP \
-                                                     `{blocked_ip}`"
-                                                ),
-                                                wire_to_yaml,
-                                            )
-                                            .await);
-                                    }
-                                },
-                                Err(e) => {
-                                    if explicitly_allowed {
-                                        tracing::warn!(
-                                            host = %host,
-                                            error = ?e,
-                                            "DNS resolution failed for allowlisted host; \
-                                             allowing request (operator-trusted domain)",
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            host = %host,
-                                            error = ?e,
-                                            "DNS resolution failed; denying request",
-                                        );
-                                        return Ok(self
-                                            .deny(
-                                                &inv,
-                                                &tool_call.fn_name,
-                                                format!(
-                                                    "DNS resolution failed for host `{host}`: {e}"
-                                                ),
-                                                wire_to_yaml,
-                                            )
-                                            .await);
-                                    }
-                                },
-                            }
-                        }
-                    }
-                }
-            },
-            ToolEffect::MutationsAndNetwork => {
-                if !policy.allow_mutations {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_mutations=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                if !policy.allow_network {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_network=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-            },
-            ToolEffect::ContextSelf => {
-                if !policy.allow_context_writes {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_context_writes=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-            },
-            ToolEffect::ReadOnly => {},
+        let tool_call = call.tool_call;
+        let effect = call.handler.effect();
+        if let Some(reason) = effect_denial(effect, call.policy) {
+            return Ok(self
+                .deny(&inv, &tool_call.fn_name, reason.into(), call.wire_to_yaml)
+                .await);
+        }
+        if matches!(
+            effect,
+            ToolEffect::Network | ToolEffect::MutationsAndNetwork
+        ) && let Some(denial) = self.gate_network_url(call, &inv).await
+        {
+            return Ok(denial);
         }
 
-        match handler.invoke(inv, tool_call.fn_arguments.clone()).await {
+        match call
+            .handler
+            .invoke(inv, tool_call.fn_arguments.clone())
+            .await
+        {
             Ok(output) => Ok(output),
-            // A stub handler that declared itself NotImplemented is a
-            // predictable condition — feed it back to the model rather
-            // than terminating the loop, matching the denial semantics.
-            Err(ToolError::NotImplemented { name, feature }) => Ok(format!(
-                "error: tool `{name}` not yet implemented: {feature}",
-            )),
+            Err(err) if err.is_recoverable() => Ok(recoverable_feedback(&tool_call.fn_name, &err)),
             Err(source) => Err(AgentError::Tool {
                 name: tool_call.fn_name.clone(),
                 source,
@@ -391,35 +264,23 @@ impl LoopAgent {
         }
     }
 
-    /// Run `check_policy_and_invoke` with a single parse-error retry
-    /// budget per `call_id`, honoring `AgentPolicy.on_parse_error`.
-    /// `RetryOnce` feeds the `InvalidArgs` message back to the model as
-    /// a tool result; the second breach on the same `call_id`
-    /// terminates with [`AgentError::ParseFailed`]. `wire_to_yaml` is
-    /// forwarded into the policy gate so denial events surface the
-    /// YAML-form tool name operators wrote.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "parse-retry wraps check_policy_and_invoke; collapsing into a struct would add indirection without simplifying calls"
-    )]
+    /// Run `check_policy_and_invoke` with a single parse-error retry per
+    /// `call_id`, honoring `AgentPolicy.on_parse_error`. `RetryOnce` feeds
+    /// the `InvalidArgs` message back as a tool result; a second breach on
+    /// the same `call_id` terminates with [`AgentError::ParseFailed`].
     pub(super) async fn invoke_with_parse_retry(
         &self,
-        handler: &Arc<dyn ToolHandler>,
-        tool_call: &OrnoChatToolCall,
-        policy: &AgentPolicy,
+        call: &ToolCall<'_>,
         inv: ToolInvocation<'_>,
         retried: &mut HashSet<String>,
-        wire_to_yaml: &HashMap<String, String>,
     ) -> Result<String, AgentError> {
-        match self
-            .check_policy_and_invoke(handler, tool_call, policy, inv, wire_to_yaml)
-            .await
-        {
+        let tool_call = call.tool_call;
+        match self.check_policy_and_invoke(call, inv).await {
             Ok(s) => Ok(s),
             Err(AgentError::Tool {
                 name,
                 source: ToolError::InvalidArgs { message, .. },
-            }) => match policy.on_parse_error {
+            }) => match call.policy.on_parse_error {
                 crate::pipeline::OnParseError::RetryOnce
                     if !retried.contains(&tool_call.call_id) =>
                 {
@@ -438,142 +299,28 @@ impl LoopAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_network_url, is_blocked_ipv4, is_blocked_ipv6};
-    use serde_json::json;
+    use super::extract_network_urls;
+    use rstest::rstest;
+    use serde_json::{Value, json};
 
-    fn v4(s: &str) -> std::net::Ipv4Addr {
-        s.parse()
-            .unwrap_or_else(|e| panic!("invalid ipv4 `{s}`: {e}"))
+    fn found(args: &Value) -> Vec<String> {
+        extract_network_urls(args)
+            .iter()
+            .map(|u| u.as_str().to_string())
+            .collect()
     }
 
-    fn v6(s: &str) -> std::net::Ipv6Addr {
-        s.parse()
-            .unwrap_or_else(|e| panic!("invalid ipv6 `{s}`: {e}"))
-    }
-
-    #[test]
-    fn ipv4_loopback_range_is_blocked() {
-        // The full /8 must be denied — `is_loopback` may only cover 127.0.0.1
-        // on some platforms, so the implementation also checks the first
-        // octet directly.
-        assert!(is_blocked_ipv4(v4("127.0.0.1")));
-        assert!(is_blocked_ipv4(v4("127.255.255.254")));
-        assert!(is_blocked_ipv4(v4("127.0.0.0")));
-    }
-
-    #[test]
-    fn ipv4_rfc1918_private_ranges_are_blocked() {
-        // RFC 1918: 10/8, 172.16/12, 192.168/16.
-        assert!(is_blocked_ipv4(v4("10.0.0.1")));
-        assert!(is_blocked_ipv4(v4("172.16.0.1")));
-        assert!(is_blocked_ipv4(v4("172.31.255.255")));
-        assert!(is_blocked_ipv4(v4("192.168.0.1")));
-    }
-
-    #[test]
-    fn ipv4_cgnat_range_is_blocked() {
-        // RFC 6598: 100.64.0.0/10. `is_private` does NOT cover this range.
-        assert!(is_blocked_ipv4(v4("100.64.0.1")));
-        assert!(is_blocked_ipv4(v4("100.127.255.255")));
-    }
-
-    #[test]
-    fn ipv4_link_local_range_is_blocked() {
-        // 169.254.0.0/16 — covers the cloud metadata IP at 169.254.169.254.
-        assert!(is_blocked_ipv4(v4("169.254.0.1")));
-        assert!(is_blocked_ipv4(v4("169.254.255.255")));
-    }
-
-    #[test]
-    fn ipv4_documentation_ranges_are_blocked() {
-        // RFC 5737: 192.0.2/24, 198.51.100/24, 203.0.113/24.
-        assert!(is_blocked_ipv4(v4("192.0.2.1")));
-        assert!(is_blocked_ipv4(v4("198.51.100.1")));
-        assert!(is_blocked_ipv4(v4("203.0.113.1")));
-    }
-
-    #[test]
-    fn ipv4_public_addresses_are_not_blocked() {
-        // Real-world public IPs that must continue to be reachable when the
-        // operator has allowed network access.
-        assert!(!is_blocked_ipv4(v4("8.8.8.8")));
-        assert!(!is_blocked_ipv4(v4("1.1.1.1")));
-        assert!(!is_blocked_ipv4(v4("93.184.216.34")));
-    }
-
-    #[test]
-    fn ipv6_loopback_is_blocked() {
-        assert!(is_blocked_ipv6(v6("::1")));
-    }
-
-    #[test]
-    fn ipv6_link_local_range_is_blocked() {
-        // fe80::/10.
-        assert!(is_blocked_ipv6(v6("fe80::1")));
-        assert!(is_blocked_ipv6(v6("fe80::ffff:ffff:ffff:ffff")));
-    }
-
-    #[test]
-    fn ipv6_unique_local_range_is_blocked() {
-        // fc00::/7 — both fc and fd prefixes must be denied.
-        assert!(is_blocked_ipv6(v6("fc00::1")));
-        assert!(is_blocked_ipv6(v6("fd00::1")));
-        assert!(is_blocked_ipv6(v6("fdff:ffff:ffff:ffff::1")));
-    }
-
-    #[test]
-    fn ipv6_v4_mapped_loopback_is_blocked() {
-        // ::ffff:127.0.0.1 is loopback re-encoded; the embedded v4 check
-        // must still reject it.
-        assert!(is_blocked_ipv6(v6("::ffff:127.0.0.1")));
-    }
-
-    #[test]
-    fn ipv6_v4_mapped_private_is_blocked() {
-        assert!(is_blocked_ipv6(v6("::ffff:192.168.1.1")));
-    }
-
-    #[test]
-    fn ipv6_public_addresses_are_not_blocked() {
-        assert!(!is_blocked_ipv6(v6("2001:4860:4860::8888")));
-        assert!(!is_blocked_ipv6(v6("2606:4700:4700::1111")));
-    }
-
-    #[test]
-    fn extract_network_url_finds_endpoint_key() {
-        let args = json!({ "endpoint": "https://api.example.com/data" });
-        let url = extract_network_url(&args).expect("conventional `endpoint` key must resolve");
-        assert_eq!(url.as_str(), "https://api.example.com/data");
-    }
-
-    #[test]
-    fn extract_network_url_finds_target_key() {
-        let args = json!({ "target": "http://example.com/path" });
-        let url = extract_network_url(&args).expect("conventional `target` key must resolve");
-        assert_eq!(url.as_str(), "http://example.com/path");
-    }
-
-    #[test]
-    fn extract_network_url_falls_back_to_unknown_key_with_url_value() {
-        // The fallback scan must catch a URL declared under any key —
-        // otherwise a tool that uses an unconventional argument name would
-        // bypass the policy gate entirely.
-        let args = json!({ "my_url": "https://api.example.com/data" });
-        let url = extract_network_url(&args).expect("fallback scan must catch unknown key");
-        assert_eq!(url.as_str(), "https://api.example.com/data");
-    }
-
-    #[test]
-    fn extract_network_url_returns_none_when_object_has_no_url() {
-        let args = json!({ "name": "foo", "count": 42, "flag": true });
-        assert!(extract_network_url(&args).is_none());
-    }
-
-    #[test]
-    fn extract_network_url_returns_none_for_non_object_args() {
-        // Strings, numbers, and other primitives must not crash the scan —
-        // they simply have no URL to extract.
-        assert!(extract_network_url(&json!("just a string")).is_none());
-        assert!(extract_network_url(&json!(42)).is_none());
+    #[rstest]
+    #[case::conventional_key(json!({ "endpoint": "https://api.example.com/data" }), &["https://api.example.com/data"])]
+    #[case::unconventional_key(json!({ "my_url": "https://api.example.com/data" }), &["https://api.example.com/data"])]
+    #[case::uppercase_scheme(json!({ "x": "HTTP://Example.com/a" }), &["http://example.com/a"])]
+    #[case::nested_object(json!({ "req": { "opts": { "dest": "http://169.254.169.254/" } } }), &["http://169.254.169.254/"])]
+    #[case::inside_array(json!({ "hosts": ["http://a.test/", "plain", "https://b.test/"] }), &["http://a.test/", "https://b.test/"])]
+    #[case::non_http_under_url_key(json!({ "url": "file:///etc/passwd" }), &["file:///etc/passwd"])]
+    #[case::non_http_under_other_key(json!({ "note": "file:///etc/passwd" }), &[])]
+    #[case::no_urls(json!({ "name": "foo", "count": 42, "flag": true }), &[])]
+    #[case::primitive_args(json!("just a string"), &[])]
+    fn urls_are_found_at_any_depth(#[case] args: Value, #[case] expected: &[&str]) {
+        assert_eq!(found(&args), expected);
     }
 }

@@ -9,7 +9,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::truncate_excerpt;
+use super::Redactor;
+use super::redactor::Keep;
 
 /// Why a node never ran. Expanded as new skip cases appear
 /// (branch failure, explicit `when:` gate, etc.).
@@ -93,11 +94,15 @@ pub enum NodeFailure {
     /// available for future strict-mode use.
     ToolDenied { tool_name: String, reason: String },
     /// The node did not return before `Node.timeout` elapsed.
-    /// `limit_secs` echoes the declared budget. The preceding
-    /// `Event::NodeTimedOut` envelope carries the measured
-    /// `elapsed_ms`; this variant stays minimal so `NodeFailure`
-    /// keeps its one-cause-per-variant shape.
-    TimedOut { limit_secs: u64 },
+    /// `limit_secs` echoes the declared budget; the preceding
+    /// `Event::NodeTimedOut` envelope carries the measured `elapsed_ms`.
+    /// A shell node also reports the tail of the stderr it wrote before
+    /// it was killed, bounded and redacted like `NodePayloadFailure`.
+    TimedOut {
+        limit_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stderr_tail: Option<String>,
+    },
 }
 
 /// Why an LLM transport call failed. Carried on
@@ -148,33 +153,40 @@ impl LlmFailure {
     /// a sibling module. `body_excerpt_max_bytes` bounds the body
     /// captured into `ApiError` — pass the engine's
     /// `EngineConfig.max_output_bytes` so the truncation policy
-    /// matches shell stderr tails.
+    /// matches shell stderr tails. Every free-text field passes
+    /// through `redactor` first: provider bodies and transport errors
+    /// can echo request headers.
     #[must_use]
-    pub fn from_llm_error(err: &crate::error::LlmError, body_excerpt_max_bytes: usize) -> Self {
+    pub fn from_llm_error(
+        err: &crate::error::LlmError,
+        redactor: &Redactor,
+        body_excerpt_max_bytes: usize,
+    ) -> Self {
         use crate::error::LlmError;
+        let clean = |s: &str| redactor.redact(s).into_owned();
         match err {
             LlmError::AuthFailed { .. } => Self::AuthFailed,
             LlmError::RateLimited { .. } => Self::RateLimited,
             LlmError::ModelNotFound { .. } => Self::ModelNotFound,
             LlmError::ApiError { status, body, .. } => Self::ApiError {
                 status: *status,
-                body_excerpt: truncate_excerpt(body, body_excerpt_max_bytes),
+                body_excerpt: redactor.redact_bounded(body, body_excerpt_max_bytes, Keep::Head),
             },
             LlmError::Transport(source) => Self::Transport {
-                error: format!("{source:#}"),
+                error: clean(&format!("{source:#}")),
             },
             LlmError::ConfigError(message) => Self::ConfigError {
-                message: message.clone(),
+                message: clean(message),
             },
             LlmError::ParseError(message) => Self::ParseError {
-                message: message.clone(),
+                message: clean(message),
             },
             LlmError::ReplayMiss { key } => Self::ReplayMiss { key: key.clone() },
             // `Rejected`, `NotImplemented`, and any future non-exhaustive
             // additions land here. Render the full chain so the cause is
             // preserved even without a typed variant yet.
             other => Self::Other {
-                message: format!("{other:#}"),
+                message: clean(&format!("{other:#}")),
             },
         }
     }
@@ -248,6 +260,7 @@ mod tests {
                 &LlmError::AuthFailed {
                     provider: "openai".into()
                 },
+                &Redactor::default(),
                 512,
             ),
             LlmFailure::AuthFailed,
@@ -257,6 +270,7 @@ mod tests {
                 &LlmError::RateLimited {
                     provider: "openai".into()
                 },
+                &Redactor::default(),
                 512,
             ),
             LlmFailure::RateLimited,
@@ -267,6 +281,7 @@ mod tests {
                     provider: "openai".into(),
                     model: "gpt-9".into(),
                 },
+                &Redactor::default(),
                 512,
             ),
             LlmFailure::ModelNotFound,
@@ -285,6 +300,7 @@ mod tests {
                 status: 502,
                 body: big,
             },
+            &Redactor::default(),
             64,
         );
         match f {
@@ -308,12 +324,37 @@ mod tests {
     }
 
     #[test]
+    fn api_error_body_is_redacted_before_truncation() {
+        let secrets =
+            std::collections::BTreeMap::from([("k".to_string(), "sk-live-abcdef".to_string())]);
+        let f = LlmFailure::from_llm_error(
+            &LlmError::ApiError {
+                provider: "openai".into(),
+                status: 400,
+                body: "bad key sk-live-abcdef".into(),
+            },
+            &Redactor::new(&secrets),
+            512,
+        );
+        match f {
+            LlmFailure::ApiError { body_excerpt, .. } => {
+                assert_eq!(body_excerpt, "bad key ***");
+            },
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn legacy_variants_fall_through_to_other_with_chain_preserved() {
         // `Rejected`, `NotImplemented`, and future non-exhaustive
         // additions degrade to `Other { message }` rather than getting
         // dropped. The Display chain must round-trip so a downstream
         // operator can still see the cause.
-        let f = LlmFailure::from_llm_error(&LlmError::Rejected("payload too large".into()), 512);
+        let f = LlmFailure::from_llm_error(
+            &LlmError::Rejected("payload too large".into()),
+            &Redactor::default(),
+            512,
+        );
         match f {
             LlmFailure::Other { message } => {
                 assert!(

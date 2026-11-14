@@ -20,61 +20,59 @@ use serde::{Deserialize, Serialize};
 use crate::error::LlmError;
 
 pub use bundle::{
-    BundleContents, BundleEntry, BundleError, CURRENT_BUNDLE_VERSION, read_bundle,
-    scrub_pipeline_secrets, write_bundle,
+    BundleContents, BundleEntry, BundleError, BundleRunInputs, BundleSources,
+    CURRENT_BUNDLE_VERSION, read_bundle, scrub_pipeline_secrets, write_bundle,
 };
 pub use dummy::DummyTransport;
 pub use dummy::ScriptedTransport;
-pub use genai::GenAiTransport;
+pub use genai::{GenAiTransport, provider_api_key_env};
 pub use recording::RecordingTransport;
 pub use replay::ReplayTransport;
 
+/// One chat-completion request. The string fields are `Arc<str>` so the
+/// agent loop clones pointers, not text, on every iteration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
-    pub provider: String,
-    pub model: String,
-    pub prompt: String,
+    /// Transport provider key, e.g. `openai`.
+    pub provider: Arc<str>,
+    /// Provider-side model identifier.
+    pub model: Arc<str>,
+    /// First user message.
+    pub prompt: Arc<str>,
+    /// System prompt, when the agent has one.
     #[serde(default)]
-    pub system: Option<String>,
+    pub system: Option<Arc<str>>,
+    /// Sampling temperature; `None` leaves the provider default.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Completion token cap; `None` leaves the provider default.
     #[serde(default)]
     pub max_tokens: Option<u32>,
     /// Multi-turn conversation history. Empty for single-turn requests.
     #[serde(default)]
     pub messages: Arc<Vec<OrnoChatMessage>>,
-    /// Tools the model may call on this request. Empty means no tool use.
-    /// `Arc`-wrapped so the agent loop can hand the same definitions
-    /// to every iteration's request without re-cloning the underlying
-    /// `Vec`. Serializes identically to `Vec<OrnoChatTool>` thanks to
-    /// serde's blanket `Arc<T>` impl, so the wire format is unchanged.
+    /// Tools the model may call; empty means no tool use. `Arc`-wrapped so
+    /// every iteration shares one definition list.
     #[serde(default)]
     pub tools: Arc<Vec<OrnoChatTool>>,
 }
 
 impl LlmRequest {
-    /// Build the single-turn request shape (no message history, no tools).
-    /// Use when the caller does not need multi-turn context.
+    /// Build a single-turn request (no history, no tools, provider
+    /// defaults for sampling); set the public fields for anything else.
     #[must_use]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "constructor for a value type; no abstraction needed pre-v0.1"
-    )]
     pub fn from_prompt(
-        provider: String,
-        model: String,
-        prompt: String,
-        system: Option<String>,
-        temperature: Option<f32>,
-        max_tokens: Option<u32>,
+        provider: impl Into<Arc<str>>,
+        model: impl Into<Arc<str>>,
+        prompt: impl Into<Arc<str>>,
     ) -> Self {
         Self {
-            provider,
-            model,
-            prompt,
-            system,
-            temperature,
-            max_tokens,
+            provider: provider.into(),
+            model: model.into(),
+            prompt: prompt.into(),
+            system: None,
+            temperature: None,
+            max_tokens: None,
             messages: Arc::new(Vec::new()),
             tools: Arc::new(Vec::new()),
         }
@@ -146,28 +144,43 @@ pub enum OrnoChatMessage {
     },
 }
 
+/// A model reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
+    /// Text of the reply; empty when the turn is only tool calls.
     pub content: String,
+    /// Provider-reported stop reason, when given.
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// Token accounting, when the provider reports it.
     #[serde(default)]
     pub usage: Option<Usage>,
-    /// Tool calls the model issued on this turn. Empty when the model replied
-    /// with plain text (which lands in `content`).
+    /// Tool calls the model issued on this turn; empty for a plain-text reply.
     #[serde(default)]
     pub tool_calls: Vec<OrnoChatToolCall>,
 }
 
+/// Token counts for one LLM call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
+    /// Tokens in the request.
     pub prompt_tokens: u32,
+    /// Tokens in the reply.
     pub completion_tokens: u32,
+    /// Sum charged against the token budget.
     pub total_tokens: u32,
 }
 
+/// Every LLM call goes through this trait; implementations wrap a
+/// provider SDK or decorate another transport.
 #[async_trait]
 pub trait LlmTransport: Send + Sync {
+    /// Send one request and return the model's reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`LlmError`] when the provider call, configuration or
+    /// response parsing fails.
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError>;
 }
 
@@ -182,14 +195,7 @@ mod tests {
         // or a stack-borrowed slice. Subsequent `Arc::clone(&tools)` in
         // the agent loop relies on this shape to cheaply hand the same
         // (empty) definitions to every iteration.
-        let req = LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hi".into(),
-            None,
-            None,
-            None,
-        );
+        let req = LlmRequest::from_prompt("openai", "gpt-5", "hi");
         assert!(
             req.tools.is_empty(),
             "from_prompt must yield an empty tools list",
@@ -206,25 +212,14 @@ mod tests {
 
     #[test]
     fn with_tools_wraps_in_arc_and_replaces_existing() {
-        // Audit fix: `LlmRequest.tools` was promoted to `Arc<Vec<...>>`
-        // so the agent loop hands the same definitions to every
-        // iteration without re-cloning the schema vector. `with_tools`
-        // takes an owned `Vec` and must wrap it in a fresh `Arc`,
-        // overwriting any prior tools.
+        // `with_tools` wraps the owned `Vec` in a fresh `Arc`, replacing
+        // any prior tools.
         let tool = OrnoChatTool {
             name: "Bash".into(),
             description: "run a shell command".into(),
             schema: serde_json::json!({"type": "object"}),
         };
-        let req = LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hi".into(),
-            None,
-            None,
-            None,
-        )
-        .with_tools(vec![tool.clone()]);
+        let req = LlmRequest::from_prompt("openai", "gpt-5", "hi").with_tools(vec![tool.clone()]);
 
         assert_eq!(req.tools.len(), 1);
         assert_eq!(req.tools[0].name, "Bash");
@@ -259,15 +254,7 @@ mod tests {
                 schema: serde_json::json!({}),
             },
         ];
-        let req = LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hi".into(),
-            None,
-            None,
-            None,
-        )
-        .with_tools(tools);
+        let req = LlmRequest::from_prompt("openai", "gpt-5", "hi").with_tools(tools);
 
         let cloned = req.clone();
         assert!(

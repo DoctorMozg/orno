@@ -5,113 +5,58 @@
 //! is what makes it usable as the bounded-non-determinism guarantee
 //! in the strictness contract.
 
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tracing::instrument;
 
-use super::record::{ToolTapeEntry, tool_tape_key};
+use super::record::{ToolTapeEntry, ToolTapeOutcome, tool_tape_key};
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
+use crate::util::{TapeIndex, read_tape};
 
 /// Wraps any `ToolHandler` for metadata but intercepts every `invoke`
 /// call, returning the result stored in the loaded tape instead of
 /// calling the real handler. A tape miss is a hard error.
 pub struct ReplayToolHandler {
     inner: Arc<dyn ToolHandler>,
-    // Per-key FIFO of recorded entries: an agent that calls the same
-    // tool twice with byte-identical args (same `tool_name`, `call_id`,
-    // canonical args JSON) produced two tape entries on the live run,
-    // and replay must hand them back in order. A flat
-    // `HashMap<_, ToolTapeEntry>` collapsed those into one entry,
-    // silently dropping every duplicate after the first.
-    entries: Mutex<HashMap<String, VecDeque<ToolTapeEntry>>>,
+    // Served per `(key, seq)`: an agent that calls the same tool twice
+    // with byte-identical args gets the two recorded results back in
+    // call order.
+    index: TapeIndex<ToolTapeOutcome>,
 }
 
 impl std::fmt::Debug for ReplayToolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let entry_count = self
-            .entries
-            .lock()
-            .map_or(0, |guard| guard.values().map(VecDeque::len).sum::<usize>());
         f.debug_struct("ReplayToolHandler")
             .field("tool", &self.inner.name())
-            .field("entries", &entry_count)
+            .field("entries", &self.index.remaining())
             .finish()
     }
 }
 
 impl ReplayToolHandler {
-    /// Load entries from a tape file. Corrupt lines abort with a
-    /// `ToolError::InvalidArgs` so a half-read tape cannot silently
-    /// replay stale data.
+    /// Load entries from a tape file. A corrupt line aborts with an
+    /// `io::Error` naming the file and line so a half-read tape cannot
+    /// silently replay stale data.
     pub fn load(
         inner: Arc<dyn ToolHandler>,
         path: impl AsRef<Path>,
     ) -> Result<Self, std::io::Error> {
-        let path_ref = path.as_ref();
-        let path_disp = path_ref.display().to_string();
-        let file = File::open(path_ref)?;
-        let mut entries: HashMap<String, VecDeque<ToolTapeEntry>> = HashMap::new();
-        for (lineno, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let entry: ToolTapeEntry = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::other(format!("{path_disp}:{}: {e}", lineno + 1)))?;
-            let key = entry.key.clone();
-            let deque = entries.entry(key.clone()).or_default();
-            if !deque.is_empty() {
-                tracing::warn!(
-                    key_prefix = %&key[..20.min(key.len())],
-                    "duplicate tool tape key detected on load — replay will return entries in sequence"
-                );
-            }
-            deque.push_back(entry);
-        }
-        Ok(Self {
-            inner,
-            entries: Mutex::new(entries),
-        })
+        Self::from_entries(inner, read_tape(path)?)
     }
 
-    /// In-memory constructor — skips file I/O. Useful when entries
-    /// arrive from a replay bundle (`orno replay`) rather than a
-    /// standalone tape file on disk.
-    #[must_use]
-    pub fn from_entries(inner: Arc<dyn ToolHandler>, entries: Vec<ToolTapeEntry>) -> Self {
-        let mut map: HashMap<String, VecDeque<ToolTapeEntry>> = HashMap::new();
-        for entry in entries {
-            let key = entry.key.clone();
-            let deque = map.entry(key.clone()).or_default();
-            if !deque.is_empty() {
-                tracing::warn!(
-                    key_prefix = %&key[..20.min(key.len())],
-                    "duplicate tool tape key detected on load — replay will return entries in sequence"
-                );
-            }
-            deque.push_back(entry);
-        }
-        Self {
-            inner,
-            entries: Mutex::new(map),
-        }
-    }
-
-    /// Pop the next recorded entry for `key`. Each tape entry is
-    /// consumed exactly once; subsequent calls with the same key
-    /// surface as a tape miss once the FIFO is drained.
-    fn consume(&self, key: &str) -> Option<ToolTapeEntry> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(key)?
-            .pop_front()
+    /// Build a handler from entries already in memory, such as a replay
+    /// bundle. Two entries claiming one `(key, seq)` slot are an error.
+    pub fn from_entries(
+        inner: Arc<dyn ToolHandler>,
+        entries: Vec<ToolTapeEntry>,
+    ) -> Result<Self, std::io::Error> {
+        let index = TapeIndex::new(entries.into_iter().map(|e| (e.key, e.seq, e.outcome)))
+            .map_err(std::io::Error::other)?;
+        Ok(Self { inner, index })
     }
 }
 
@@ -130,30 +75,75 @@ impl ToolHandler for ReplayToolHandler {
         self.inner.effect()
     }
 
+    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let key = tool_tape_key(self.inner.name(), inv.call_id, &args);
-        let entry = self.consume(&key).ok_or_else(|| ToolError::Invocation {
+        let key = tool_tape_key(self.inner.name(), inv.call_id, &args, None);
+        let outcome = self.index.take(&key).ok_or_else(|| ToolError::Invocation {
             name: self.inner.name().to_string(),
             source: Box::new(std::io::Error::other(format!(
                 "tool tape miss for key `{key}` — was this call recorded?"
             ))),
         })?;
+        outcome.into_result(self.inner.name())
+    }
+}
 
-        if let Some(content) = entry.content {
-            Ok(content)
-        } else if let Some(err_msg) = entry.error {
-            Err(ToolError::Invocation {
-                name: self.inner.name().to_string(),
-                source: Box::new(std::io::Error::other(err_msg)),
-            })
-        } else {
-            Err(ToolError::Invocation {
-                name: self.inner.name().to_string(),
-                source: Box::new(std::io::Error::other(
-                    "tape entry has neither content nor error",
-                )),
-            })
+/// Replay stand-in for one MCP tool. Its name, description and schema must
+/// match the recorded `OrnoChatTool` so the replayed request hashes to the
+/// recorded tape key. A wrapping `ReplayToolHandler` serves the calls;
+/// invoking the stub directly returns an error.
+pub struct ReplayMcpStubHandler {
+    name: String,
+    description: String,
+    schema: Value,
+}
+
+impl std::fmt::Debug for ReplayMcpStubHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayMcpStubHandler")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayMcpStubHandler {
+    /// `name` is the YAML form (`mcp.<server>.<tool>`) so it matches the
+    /// agent's `allowed_tools`.
+    #[must_use]
+    pub fn new(name: String, description: String, schema: Value) -> Self {
+        Self {
+            name,
+            description,
+            schema,
         }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReplayMcpStubHandler {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::MutationsAndNetwork
+    }
+
+    async fn invoke(&self, _inv: ToolInvocation<'_>, _args: Value) -> Result<String, ToolError> {
+        Err(ToolError::Invocation {
+            name: self.name.clone(),
+            source: Box::new(std::io::Error::other(
+                "ReplayMcpStubHandler::invoke called directly — must be wrapped in ReplayToolHandler so the tool tape serves the response",
+            )),
+        })
     }
 }
 
@@ -164,6 +154,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::error::RecoverableKind;
     use crate::events::Redactor;
     use crate::tool::record::RecordingToolHandler;
     use crate::tool::{ToolInvocation, record::ToolTapeEntry};
@@ -325,8 +316,10 @@ mod tests {
 
         let good = serde_json::to_string(&ToolTapeEntry {
             key: "k".to_string(),
-            content: Some("ok".to_string()),
-            error: None,
+            seq: 0,
+            outcome: ToolTapeOutcome::Ok {
+                content: "ok".to_string(),
+            },
         })
         .unwrap();
         std::fs::write(&path, format!("{good}\nnot-json\n{good}\n")).unwrap();
@@ -343,5 +336,197 @@ mod tests {
             msg.contains(":2:"),
             "error should mention 1-indexed line number `:2:`: {msg}",
         );
+    }
+
+    /// Fails with a configurable `ToolError`, to check the class survives replay.
+    struct FailWith(fn() -> ToolError);
+
+    impl std::fmt::Debug for FailWith {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailWith")
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for FailWith {
+        fn name(&self) -> &str {
+            "Read"
+        }
+        fn description(&self) -> &str {
+            "fails"
+        }
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+        async fn invoke(
+            &self,
+            _inv: ToolInvocation<'_>,
+            _args: Value,
+        ) -> Result<String, ToolError> {
+            Err((self.0)())
+        }
+    }
+
+    async fn replay_failure(make: fn() -> ToolError) -> ToolError {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
+        let handler: Arc<dyn ToolHandler> = Arc::new(FailWith(make));
+        let rec = RecordingToolHandler::create(
+            Arc::clone(&handler),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
+        rec.invoke(ToolInvocation::for_test("c1"), json!({}))
+            .await
+            .unwrap_err();
+        rec.flush().unwrap();
+
+        ReplayToolHandler::load(handler, &path)
+            .unwrap()
+            .invoke(ToolInvocation::for_test("c1"), json!({}))
+            .await
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn recoverable_error_stays_recoverable_with_its_kind() {
+        let err = replay_failure(|| ToolError::Recoverable {
+            name: "Read".into(),
+            kind: RecoverableKind::NotFound,
+            message: "no such file".into(),
+        })
+        .await;
+
+        match err {
+            ToolError::Recoverable {
+                kind: RecoverableKind::NotFound,
+                message,
+                ..
+            } => assert_eq!(message, "no such file"),
+            other => panic!("expected Recoverable(NotFound), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_error_classes_survive_replay() {
+        assert!(matches!(
+            replay_failure(|| ToolError::Denied { reason: "jail".into() }).await,
+            ToolError::Denied { reason } if reason == "jail"
+        ));
+        assert!(matches!(
+            replay_failure(|| ToolError::StateTooLarge {
+                name: "Read".into(),
+                bytes: 9,
+                cap: 4
+            })
+            .await,
+            ToolError::StateTooLarge {
+                bytes: 9,
+                cap: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            replay_failure(|| ToolError::InvalidArgs { name: "Read".into(), message: "bad".into() })
+                .await,
+            ToolError::InvalidArgs { message, .. } if message == "bad"
+        ));
+    }
+
+    #[tokio::test]
+    async fn secret_in_args_replays_from_the_redacted_args() {
+        // Replay receives the args from the redacted LLM tape, so the
+        // key must have been computed over the redacted form.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
+        let secrets =
+            std::collections::BTreeMap::from([("t".to_string(), "tok-abcdef123".to_string())]);
+        let rec = RecordingToolHandler::create(
+            Arc::new(EchoHandler),
+            &path,
+            Arc::new(Redactor::new(&secrets)),
+        )
+        .unwrap();
+        rec.invoke(
+            ToolInvocation::for_test("c1"),
+            json!({"auth": "Bearer tok-abcdef123"}),
+        )
+        .await
+        .unwrap();
+        rec.flush().unwrap();
+
+        let replayed = ReplayToolHandler::load(Arc::new(EchoHandler), &path)
+            .unwrap()
+            .invoke(
+                ToolInvocation::for_test("c1"),
+                json!({"auth": "Bearer ***"}),
+            )
+            .await
+            .expect("redacted args must hit the recorded entry");
+        assert_eq!(replayed, json!({"auth": "Bearer ***"}).to_string());
+    }
+
+    #[tokio::test]
+    async fn identical_calls_replay_in_seq_order() {
+        let key = tool_tape_key("Echo", "c1", &json!({}), None);
+        let entry = |seq, content: &str| ToolTapeEntry {
+            key: key.clone(),
+            seq,
+            outcome: ToolTapeOutcome::Ok {
+                content: content.into(),
+            },
+        };
+        let replay = ReplayToolHandler::from_entries(
+            Arc::new(EchoHandler),
+            vec![entry(1, "second"), entry(0, "first")],
+        )
+        .unwrap();
+
+        for expected in ["first", "second"] {
+            let got = replay
+                .invoke(ToolInvocation::for_test("c1"), json!({}))
+                .await
+                .unwrap();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn replay_stub_exposes_yaml_name_and_recorded_metadata() {
+        let stub = ReplayMcpStubHandler::new(
+            "mcp.fs.read_file".to_string(),
+            "Read a file".to_string(),
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        );
+        assert_eq!(stub.name(), "mcp.fs.read_file");
+        assert_eq!(stub.description(), "Read a file");
+        assert_eq!(stub.schema()["type"], "object");
+        // Effect must match the live `McpToolHandler` so the agent
+        // loop's policy gate behaves identically in replay vs. record.
+        assert_eq!(stub.effect(), ToolEffect::MutationsAndNetwork);
+    }
+
+    #[tokio::test]
+    async fn replay_stub_invoke_called_directly_returns_clear_error() {
+        // Direct invocation should never happen in practice — every
+        // stub gets wrapped in `ReplayToolHandler`. But if it does,
+        // we want a readable error, not a panic.
+        let stub =
+            ReplayMcpStubHandler::new("mcp.fs.read_file".to_string(), String::new(), json!({}));
+        let err = stub
+            .invoke(ToolInvocation::for_test("c1"), json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Invocation { name, source } => {
+                assert_eq!(name, "mcp.fs.read_file");
+                assert!(source.to_string().contains("ReplayToolHandler"));
+            },
+            other => panic!("expected ToolError::Invocation, got {other:?}"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-use super::helpers::{EchoTool, request};
+use super::helpers::{EchoTool, FixedResolver, request};
 use crate::agent::Agent;
 use crate::agent::loop_agent::{LoopAgent, LoopAgentConfig};
 use crate::events::{Event, InMemorySink, Redactor};
@@ -444,7 +444,7 @@ async fn blocked_domains_does_not_match_unrelated_host_with_shared_suffix() {
     //
     // Uses `EchoTool` with `ToolEffect::Network` so the policy gate runs
     // (examining the `url` arg) without the handler actually hitting the
-    // network.
+    // network; DNS goes through a fake resolver.
     let sink = Arc::new(InMemorySink::new());
     let tool = Arc::new(EchoTool::new(ToolEffect::Network, "ok"));
 
@@ -463,12 +463,14 @@ async fn blocked_domains_does_not_match_unrelated_host_with_shared_suffix() {
         redactor: Arc::new(Redactor::default()),
         body_excerpt_max_bytes: 256,
         tools: vec![tool],
-    });
+    })
+    .with_resolver(FixedResolver::public());
 
     let mut req = request();
     req.policy.max_iterations = 3;
     req.policy.allow_network = true;
     req.policy.blocked_domains = vec!["evil.com".into()];
+    req.policy.allowed_domains = vec!["notevil.com".into()];
     req.allowed_tools = vec!["EchoTool".into()];
 
     agent
@@ -551,9 +553,7 @@ async fn allowed_domains_matches_subdomain_by_suffix() {
     //
     // Uses `EchoTool` with `ToolEffect::Network` so the policy gate runs
     // (examining the `url` arg) without the handler actually hitting the
-    // network — the sibling `blocked_domains_*` tests use `WebFetchHandler`
-    // because they rely on the denial path firing before any network call, but
-    // the allowed path here would otherwise attempt a real DNS lookup.
+    // network; DNS goes through a fake resolver.
     let sink = Arc::new(InMemorySink::new());
     let tool = Arc::new(EchoTool::new(ToolEffect::Network, "ok"));
 
@@ -572,7 +572,8 @@ async fn allowed_domains_matches_subdomain_by_suffix() {
         redactor: Arc::new(Redactor::default()),
         body_excerpt_max_bytes: 256,
         tools: vec![tool],
-    });
+    })
+    .with_resolver(FixedResolver::public());
 
     let mut req = request();
     req.policy.max_iterations = 3;
@@ -900,9 +901,8 @@ async fn bash_with_allowed_domains_and_allow_network_is_permitted() {
 async fn mutations_and_network_tool_allowed_when_both_true() {
     // Positive control: when both underlying flags are on, the combined
     // effect must pass through to the handler and produce a real tool
-    // result. `MutationsAndNetwork` is not subject to the URL/domain gate
-    // (it covers shells that open arbitrary connections orno cannot
-    // intercept), so no `ToolDenied` event must fire.
+    // result. The URL/domain gate runs for `MutationsAndNetwork` too, but
+    // these arguments carry no URL, so no `ToolDenied` event must fire.
     let sink = Arc::new(InMemorySink::new());
     let tool = Arc::new(EchoTool::new(ToolEffect::MutationsAndNetwork, "ran ok"));
 
@@ -917,7 +917,8 @@ async fn mutations_and_network_tool_allowed_when_both_true() {
         redactor: Arc::new(Redactor::default()),
         body_excerpt_max_bytes: 256,
         tools: vec![tool],
-    });
+    })
+    .with_resolver(FixedResolver::public());
 
     let mut req = request();
     req.policy.max_iterations = 3;
@@ -955,4 +956,134 @@ async fn mutations_and_network_tool_allowed_when_both_true() {
             "recorded output must carry the handler's payload: {output_excerpt:?}",
         );
     }
+}
+
+fn network_agent(
+    tool: Arc<dyn crate::tool::ToolHandler>,
+    calls: Vec<serde_json::Value>,
+    name: &str,
+) -> (LoopAgent, Arc<InMemorySink>) {
+    let sink = Arc::new(InMemorySink::new());
+    let mut script: Vec<_> = calls
+        .into_iter()
+        .map(|args| ScriptedTransport::tool_call_response("c1", name, args))
+        .collect();
+    script.push(ScriptedTransport::text_response("done"));
+    let agent = LoopAgent::new(LoopAgentConfig {
+        transport: Arc::new(ScriptedTransport::new(script)),
+        sink: sink.clone(),
+        redactor: Arc::new(Redactor::default()),
+        body_excerpt_max_bytes: 256,
+        tools: vec![tool],
+    })
+    .with_resolver(FixedResolver::public());
+    (agent, sink)
+}
+
+fn denial_reasons(sink: &InMemorySink) -> Vec<String> {
+    sink.snapshot()
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::ToolDenied { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn url_nested_in_arguments_is_gated() {
+    let tool = Arc::new(EchoTool::new(ToolEffect::Network, "should not run"));
+    let args = serde_json::json!({ "opts": { "dest": "HTTP://169.254.169.254/latest" } });
+    let (agent, sink) = network_agent(tool, vec![args], "EchoTool");
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.allow_network = true;
+    req.allowed_tools = vec!["EchoTool".into()];
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("denial is non-terminal");
+
+    let reasons = denial_reasons(&sink);
+    assert!(
+        reasons.iter().any(|r| r.contains("169.254.169.254")),
+        "nested metadata URL must be denied: {reasons:?}",
+    );
+}
+
+#[tokio::test]
+async fn subagent_prompt_that_looks_like_a_url_is_not_gated() {
+    let tool = Arc::new(EchoTool {
+        effect: ToolEffect::Network,
+        output: "child ran",
+        name: "subagent.net",
+    });
+    let args = serde_json::json!({ "prompt": "http://127.0.0.1/summarise-this" });
+    let (agent, sink) = network_agent(tool, vec![args], "subagent_net");
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_subagent_depth = 1;
+    req.policy.allow_network = true;
+    req.allowed_tools = vec!["subagent.net".into()];
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("prompt is not a destination");
+
+    assert!(
+        denial_reasons(&sink).is_empty(),
+        "prompt text must not be gated"
+    );
+}
+
+#[tokio::test]
+async fn agent_domain_lists_reach_the_handler() {
+    use crate::error::ToolError;
+    use crate::tool::{ToolHandler, ToolInvocation};
+    use std::sync::Mutex;
+
+    type Seen = (Vec<String>, Vec<String>);
+    struct DomainSpy(Mutex<Option<Seen>>);
+
+    #[async_trait::async_trait]
+    impl ToolHandler for DomainSpy {
+        fn name(&self) -> &str {
+            "Spy"
+        }
+        fn description(&self) -> &str {
+            "records the domain lists it was invoked with"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn effect(&self) -> ToolEffect {
+            ToolEffect::ReadOnly
+        }
+        async fn invoke(
+            &self,
+            inv: ToolInvocation<'_>,
+            _args: serde_json::Value,
+        ) -> Result<String, ToolError> {
+            *self.0.lock().expect("spy lock") =
+                Some((inv.domains.allowed.to_vec(), inv.domains.blocked.to_vec()));
+            Ok("ok".into())
+        }
+    }
+
+    let spy = Arc::new(DomainSpy(Mutex::new(None)));
+    let (agent, _sink) = network_agent(spy.clone(), vec![serde_json::json!({})], "Spy");
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.allowed_domains = vec!["good.test".into()];
+    req.policy.blocked_domains = vec!["evil.test".into()];
+    req.allowed_tools = vec!["Spy".into()];
+    agent.run("run_test", "n", req).await.expect("run succeeds");
+
+    let seen = spy.0.lock().expect("spy lock").clone();
+    assert_eq!(
+        seen,
+        Some((vec!["good.test".to_string()], vec!["evil.test".to_string()]))
+    );
 }

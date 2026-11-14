@@ -96,7 +96,8 @@ impl ToolHandler for SetStateHandler {
         // Redact secret leaves before storage so downstream template
         // renders never re-materialize a secret that happened to be in
         // the written payload.
-        let redacted = self.redactor.redact_json(&value);
+        let mut redacted = value;
+        self.redactor.redact_json(&mut redacted);
 
         let handle = inv.state_handle.ok_or_else(|| ToolError::Invocation {
             name: TOOL_NAME.to_string(),
@@ -208,6 +209,7 @@ mod tests {
 
     use super::*;
     use crate::tool::StateHandle;
+    use crate::tool::net_guard::DomainRules;
 
     fn handler(redactor: Redactor, cap: usize) -> SetStateHandler {
         SetStateHandler::new(Arc::new(redactor), cap)
@@ -224,8 +226,10 @@ mod tests {
             call_id,
             depth: 0,
             state_handle: Some(StateHandle::new(buf)),
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
+            domains: DomainRules::default(),
         }
     }
 
@@ -467,8 +471,10 @@ mod tests {
             call_id: "c1",
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
+            domains: DomainRules::default(),
         };
         let err = h
             .invoke(inv, json!({ "key": "plan", "value": 1 }))

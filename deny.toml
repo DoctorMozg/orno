@@ -1,5 +1,5 @@
 # cargo-deny 0.19+ configuration.
-# Run `cargo deny check` locally; CI runs deny per matrix {advisories, bans, licenses, sources}.
+# Run `cargo deny check` locally; CI runs a single `deny` job (`check`, all four sections).
 
 [graph]
 targets = [
@@ -17,12 +17,10 @@ feature-depth = 1
 version = 2
 yanked  = "warn"
 ignore  = [
-    # RUSTSEC-2025-0026: lru HashMap aliasing UB under Stacked Borrows.
-    # lru is used for the template cache (pipeline/template.rs). The UB
-    # requires a specific Rust toolchain + aliasing analysis mode to trigger
-    # and does not affect orno's read-through cache usage pattern. Tracked
-    # for upgrade once lru >=0.16.3 stabilizes in the dependency graph.
-    "RUSTSEC-2026-0002",
+    # unsafe-libyaml is unmaintained (no fixed release). It arrives only via
+    # serde_yaml_ng, which parses operator-authored pipeline files; revisit
+    # when serde_yaml_ng moves to a maintained backend.
+    "RUSTSEC-2024-0449",
 ]
 
 # --- License policy (AGPL-3.0 project; only permissive deps allowed) ---
@@ -44,9 +42,9 @@ allow = [
 confidence-threshold = 0.8
 
 # `ring` carries a composite MIT/ISC/OpenSSL license.
-# IMPORTANT: The hash below is a TEMPLATE VALUE. Before the deny/licenses CI
-# job passes, run `cargo deny check licenses` locally and replace the hash
-# with the value shown in the error output for the actual ring version.
+# The hash pins the LICENSE file contents of the ring version in Cargo.lock;
+# when a ring upgrade changes that file, `cargo deny check licenses` reports
+# the new value to paste here.
 [[licenses.clarify]]
 crate         = "ring"
 expression    = "MIT AND ISC AND OpenSSL"

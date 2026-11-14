@@ -1,4 +1,4 @@
-# `hello` — minimum viable pipeline
+# `hello`: minimum viable pipeline
 
 The smallest pipeline that exercises a real agent loop. One agent node, `max_iterations: 1`, no tools, no MCP, no network.
 
@@ -22,11 +22,11 @@ cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 
 ## Run without a key
 
-The dummy transport returns a deterministic canned response, so `--replay-tape` and validation tests can exercise the pipeline offline:
+The dummy transport returns a deterministic canned response, so `--replay-tape` and validation tests can exercise the pipeline offline. It needs a build with `--features test-transport`. Release binaries ignore `ORNO_TEST_LLM_TRANSPORT`:
 
 ```bash
 ORNO_TEST_LLM_TRANSPORT=dummy \
-  cargo run -p orno-cli -- run examples/hello/pipeline.yaml
+  cargo run -p orno-cli --features test-transport -- run examples/hello/pipeline.yaml
 ```
 
 ## Inspect without spending tokens

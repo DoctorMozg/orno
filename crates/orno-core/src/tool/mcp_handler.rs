@@ -13,8 +13,9 @@ use serde_json::Value;
 use tracing::instrument;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
-use crate::events::{Event, EventSink, truncate_excerpt};
+use crate::error::{RecoverableKind, ToolError};
+use crate::events::redactor::Keep;
+use crate::events::{Event, EventSink, Redactor};
 use crate::mcp::McpClient;
 
 /// Static metadata for one MCP tool. Grouped so `McpToolHandler::new` stays
@@ -28,12 +29,15 @@ pub struct McpToolHandlerConfig {
     pub server: String,
     /// MCP tool name exactly as advertised by the server's `tools/list`.
     pub tool: String,
+    /// Tool description from `tools/list`, shown to the model.
     pub description: String,
     /// JSON Schema received from the server's `tools/list` response.
     pub schema: Value,
     /// How many bytes of input/output JSON to include in excerpt events.
     /// Shared from the engine's `max_output_bytes` cap.
     pub body_excerpt_max_bytes: usize,
+    /// Scrubs secrets from the excerpts before they reach the event stream.
+    pub redactor: Arc<Redactor>,
 }
 
 /// One handler per `(mcp_server_name, tool_name)` pair. Constructed by
@@ -59,6 +63,13 @@ impl std::fmt::Debug for McpToolHandler {
 }
 
 impl McpToolHandler {
+    fn excerpt(&self, text: &str) -> String {
+        self.config
+            .redactor
+            .redact_bounded(text, self.config.body_excerpt_max_bytes, Keep::Head)
+    }
+
+    /// Bind one MCP tool to the shared `client`; calls emit events on `sink`.
     #[must_use]
     pub fn new(
         config: McpToolHandlerConfig,
@@ -96,14 +107,11 @@ impl ToolHandler for McpToolHandler {
         fields(
             mcp.server = %self.config.server,
             mcp.tool = %self.config.tool,
-            call_id = %inv.call_id
+            tool.call_id = %inv.call_id
         )
     )]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let input_excerpt = truncate_excerpt(
-            &serde_json::to_string(&args).unwrap_or_default(),
-            self.config.body_excerpt_max_bytes,
-        );
+        let input_excerpt = self.excerpt(&serde_json::to_string(&args).unwrap_or_default());
 
         self.sink
             .record(Event::McpToolCallSent {
@@ -120,8 +128,7 @@ impl ToolHandler for McpToolHandler {
 
         match call_result {
             Ok(result) => {
-                let output_excerpt =
-                    truncate_excerpt(&result.content, self.config.body_excerpt_max_bytes);
+                let output_excerpt = self.excerpt(&result.content);
                 self.sink
                     .record(Event::McpToolCallCompleted {
                         run_id: inv.run_id.to_string(),
@@ -133,7 +140,15 @@ impl ToolHandler for McpToolHandler {
                         output_excerpt,
                     })
                     .await;
-                Ok(result.content)
+                if result.ok {
+                    Ok(result.content)
+                } else {
+                    Err(ToolError::Recoverable {
+                        name: self.config.yaml_name.clone(),
+                        kind: RecoverableKind::ToolReported,
+                        message: result.content,
+                    })
+                }
             },
             Err(e) => {
                 let reason = e.to_string();
@@ -145,10 +160,7 @@ impl ToolHandler for McpToolHandler {
                         tool: self.config.tool.clone(),
                         call_id: inv.call_id.to_string(),
                         ok: false,
-                        output_excerpt: truncate_excerpt(
-                            &reason,
-                            self.config.body_excerpt_max_bytes,
-                        ),
+                        output_excerpt: self.excerpt(&reason),
                     })
                     .await;
                 Err(ToolError::Invocation {
@@ -157,80 +169,6 @@ impl ToolHandler for McpToolHandler {
                 })
             },
         }
-    }
-}
-
-/// Replay-only stub for one MCP tool. Carries just enough metadata
-/// (name, description, schema) for the agent loop's outgoing
-/// `OrnoChatTool` definition to byte-equal what was recorded — that
-/// equality is what makes `ReplayTransport` find the right response
-/// (the tape key hashes the entire `LlmRequest`, including its
-/// `tools` list).
-///
-/// The real `McpToolHandler` is unusable in `orno replay` because it
-/// requires a live `McpClient`, which is not spawned in replay (no
-/// network, no subprocess). This stub fills the registration slot so
-/// the agent loop's pre-flight `find_handler` check passes; actual
-/// dispatch is intercepted by `ReplayToolHandler` wrapping the stub,
-/// so [`Self::invoke`] is unreachable in normal use. If somehow
-/// called directly, it returns a clear `ToolError` rather than
-/// panicking.
-pub struct ReplayMcpStubHandler {
-    name: String,
-    description: String,
-    schema: Value,
-}
-
-impl std::fmt::Debug for ReplayMcpStubHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReplayMcpStubHandler")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ReplayMcpStubHandler {
-    /// Build a stub for one MCP tool. `name` is the YAML-form
-    /// (`mcp.<server>.<tool>`) so it matches the agent's
-    /// `allowed_tools` entries directly. `description` and `schema`
-    /// must echo what the original `McpToolHandler` returned at
-    /// recording time — `orno replay` looks them up from the LLM
-    /// tape's `OrnoChatTool` entries to guarantee that.
-    #[must_use]
-    pub fn new(name: String, description: String, schema: Value) -> Self {
-        Self {
-            name,
-            description,
-            schema,
-        }
-    }
-}
-
-#[async_trait]
-impl ToolHandler for ReplayMcpStubHandler {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn schema(&self) -> Value {
-        self.schema.clone()
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::MutationsAndNetwork
-    }
-
-    async fn invoke(&self, _inv: ToolInvocation<'_>, _args: Value) -> Result<String, ToolError> {
-        Err(ToolError::Invocation {
-            name: self.name.clone(),
-            source: Box::new(std::io::Error::other(
-                "ReplayMcpStubHandler::invoke called directly — must be wrapped in ReplayToolHandler so the tool tape serves the response",
-            )),
-        })
     }
 }
 
@@ -312,6 +250,37 @@ mod tests {
         }
     }
 
+    struct ToolReportedErrClient;
+
+    impl std::fmt::Debug for ToolReportedErrClient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ToolReportedErrClient").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for ToolReportedErrClient {
+        fn server_name(&self) -> &str {
+            "fs"
+        }
+        async fn initialize(&mut self) -> Result<Vec<McpTool>, McpError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<McpToolCallResult, McpError> {
+            Ok(McpToolCallResult {
+                ok: false,
+                content: "no such directory".to_string(),
+            })
+        }
+        async fn shutdown(&mut self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
     fn make_handler(client: Arc<dyn McpClient>) -> (McpToolHandler, Arc<InMemorySink>) {
         let sink = Arc::new(InMemorySink::new());
         let handler = McpToolHandler::new(
@@ -322,6 +291,7 @@ mod tests {
                 description: "Read a file".to_string(),
                 schema: json!({"type": "object"}),
                 body_excerpt_max_bytes: 512,
+                redactor: Arc::new(Redactor::default()),
             },
             client,
             sink.clone(),
@@ -378,6 +348,68 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn is_error_result_becomes_recoverable_failure_and_records_ok_false() {
+        let (handler, sink) = make_handler(Arc::new(ToolReportedErrClient));
+
+        let err = handler
+            .invoke(ToolInvocation::for_test("call-3"), json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ToolError::Recoverable { kind: RecoverableKind::ToolReported, message, .. }
+                    if message == "no such directory"
+            ),
+            "got {err:?}",
+        );
+        assert!(matches!(
+            sink.snapshot()[1].event,
+            Event::McpToolCallCompleted { ok: false, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn event_excerpts_are_redacted() {
+        let secrets =
+            std::collections::BTreeMap::from([("t".to_string(), "tok-abcdef123".to_string())]);
+        let sink = Arc::new(InMemorySink::new());
+        let handler = McpToolHandler::new(
+            McpToolHandlerConfig {
+                yaml_name: "mcp.fs.read_file".to_string(),
+                server: "fs".to_string(),
+                tool: "read_file".to_string(),
+                description: String::new(),
+                schema: json!({}),
+                body_excerpt_max_bytes: 512,
+                redactor: Arc::new(Redactor::new(&secrets)),
+            },
+            Arc::new(AlwaysErrClient {
+                server_name: "fs".to_string(),
+            }),
+            sink.clone(),
+        );
+
+        drop(
+            handler
+                .invoke(
+                    ToolInvocation::for_test("c"),
+                    json!({"auth": "tok-abcdef123"}),
+                )
+                .await,
+        );
+
+        match &sink.snapshot()[0].event {
+            Event::McpToolCallSent { input_excerpt, .. } => {
+                assert!(!input_excerpt.contains("tok-abcdef123"), "{input_excerpt}");
+                assert!(input_excerpt.contains("***"), "{input_excerpt}");
+            },
+            other => panic!("expected McpToolCallSent, got {other:?}"),
+        }
+    }
+
     #[test]
     fn effect_is_mutations_and_network() {
         let client: Arc<dyn McpClient> = Arc::new(AlwaysOkClient {
@@ -385,40 +417,5 @@ mod tests {
         });
         let (handler, _sink) = make_handler(client);
         assert_eq!(handler.effect(), ToolEffect::MutationsAndNetwork);
-    }
-
-    #[test]
-    fn replay_stub_exposes_yaml_name_and_recorded_metadata() {
-        let stub = ReplayMcpStubHandler::new(
-            "mcp.fs.read_file".to_string(),
-            "Read a file".to_string(),
-            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-        );
-        assert_eq!(stub.name(), "mcp.fs.read_file");
-        assert_eq!(stub.description(), "Read a file");
-        assert_eq!(stub.schema()["type"], "object");
-        // Effect must match the live `McpToolHandler` so the agent
-        // loop's policy gate behaves identically in replay vs. record.
-        assert_eq!(stub.effect(), ToolEffect::MutationsAndNetwork);
-    }
-
-    #[tokio::test]
-    async fn replay_stub_invoke_called_directly_returns_clear_error() {
-        // Direct invocation should never happen in practice — every
-        // stub gets wrapped in `ReplayToolHandler`. But if it does,
-        // we want a readable error, not a panic.
-        let stub =
-            ReplayMcpStubHandler::new("mcp.fs.read_file".to_string(), String::new(), json!({}));
-        let err = stub
-            .invoke(ToolInvocation::for_test("c1"), json!({}))
-            .await
-            .unwrap_err();
-        match err {
-            ToolError::Invocation { name, source } => {
-                assert_eq!(name, "mcp.fs.read_file");
-                assert!(source.to_string().contains("ReplayToolHandler"));
-            },
-            other => panic!("expected ToolError::Invocation, got {other:?}"),
-        }
     }
 }

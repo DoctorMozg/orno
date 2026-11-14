@@ -4,19 +4,15 @@
 
 ## `orno run`
 
-| Exit code | Condition                                                                                                                                                                                  |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `0`       | Pipeline loaded and executed; the final `run_finished` event reports `ok: true`.                                                                                                            |
-| non-zero  | Pipeline failed to load (`PipelineError`), or the engine returned `Err` while driving the DAG. `run_finished` may or may not be emitted depending on where the failure surfaced.            |
+| Exit code | Condition                                                                                                                                                                          |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`       | Pipeline loaded and executed; the final `run_finished` event reports `ok: true`.                                                                                                   |
+| `1`       | One or more nodes reported `ok: false`; the pipeline failed to load or validate (`PipelineError`); env or secrets resolution failed; or the engine returned `Err`. |
+| `130`     | Run interrupted by SIGINT (Ctrl-C). A `run_finished` envelope with `ok: false` and `failed_nodes: ["<interrupted>"]` is emitted, record tapes are flushed best-effort, and MCP servers are drained (bounded at 5 seconds) before the process exits. |
 
-A node failure within the pipeline does **not** by itself force a non-zero exit. Node failure is a *pipeline-level* signal carried on `node_finished { ok: false }` and aggregated in `run_finished.failed_nodes`. The CLI process exits `0` even when nodes failed, as long as the engine itself completed cleanly. This is intentional: downstream tools consuming the NDJSON stream are the deciders, not the shell.
+When a run has started, `run_finished` is emitted for every outcome above, including MCP handshake failures and `vars:` render failures. Failures that happen before the run starts (the file cannot be read, the YAML does not parse or validate, secrets do not resolve, a `--record-tape` or `--record-tool-tape` target already exists) emit no events: stdout stays empty and the error goes to stderr.
 
-The implication for CI: a green `orno run` exit is **necessary but not sufficient** for a green run. Always inspect the trailing `run_finished` envelope's `ok` field. The repository's example pipelines and integration tests do this with `jq`:
-
-```bash
-orno run pipeline.yaml | tee events.ndjson
-tail -1 events.ndjson | jq -e '.event.type == "run_finished" and .event.ok' >/dev/null
-```
+`--record-tape` and `--record-tool-tape` create the file with `create_new`: an existing path is an error, not overwritten. (The `--help` text says "creates or truncates", but that wording is out of date.)
 
 ## `orno replay`
 
@@ -25,7 +21,7 @@ tail -1 events.ndjson | jq -e '.event.type == "run_finished" and .event.ok' >/de
 | `0`       | Bundle loaded and replay completed; the final `run_finished` event reports `ok: true`.                  |
 | non-zero  | Bundle file missing or malformed, or replay encountered a tape miss. Tape misses are **never** a fallback to the live API — they always surface as failures.   |
 
-Same caveat as `orno run`: per-node replay-miss failures surface on `node_finished` events, not on the process exit code unless the bundle itself was unusable.
+Per-node replay-miss failures surface on `node_finished` events **and** on the process exit code (exit `1`), the same as in `orno run`.
 
 ## `orno validate`
 
@@ -34,7 +30,7 @@ Same caveat as `orno run`: per-node replay-miss failures surface on `node_finish
 | `0`       | Pipeline loaded and passed semantic validation.                                                        |
 | non-zero  | Any `PipelineError` — file not found, YAML parse error, validation failure, undefined agent reference. |
 
-`orno validate` is a quick pre-flight check; pair it with `orno plan` for a fuller pre-spend audit.
+`orno validate` is a quick pre-flight check. Pair it with `orno plan` for a fuller pre-spend audit.
 
 ## `orno plan`
 
@@ -61,6 +57,6 @@ Same caveat as `orno run`: per-node replay-miss failures surface on `node_finish
 
 ## See also
 
-- [CLI](cli.md) — every subcommand and its flags.
-- [Events](events.md) — the wire format that carries node-level pass/fail beyond the process exit code.
-- [Errors](errors.md) — typed error enums behind non-zero exits.
+- [CLI](cli.md): every subcommand and its flags.
+- [Events](events.md): the wire format that carries node-level pass/fail beyond the process exit code.
+- [Errors](errors.md): typed error enums behind non-zero exits.

@@ -38,6 +38,11 @@ version: 1
 vars:
   topic: "How does this MCP server expose its tools to clients?"
 
+# Declared so `record-replay.sh` can pass the key via `--secrets-file`;
+# an exported OPENROUTER_API_KEY satisfies it too.
+secrets:
+  - OPENROUTER_API_KEY
+
 mcp_servers:
   gitmcp:
     transport: http

@@ -10,29 +10,33 @@
 //! - `secrets` — dotenv parsing, inline `-e` handling, `resolve_inputs`
 //! - `transport` — `GenAiTransport` / `ReplayTransport` / `RecordingTransport` selection
 
-mod agent;
+pub(crate) mod agent;
 mod secrets;
 mod transport;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use orno_core::McpError;
+use orno_core::error::CoreError;
 use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
-use orno_core::execution::{EngineConfig, new_run_id};
-use orno_core::llm::RecordingTransport;
+use orno_core::execution::scheduler::RunOutcome;
+use orno_core::execution::{EngineConfig, RunInputs, new_run_id};
+use orno_core::llm::{BundleRunInputs, BundleSources, RecordingTransport, write_bundle};
 use orno_core::mcp::{McpClient, McpTool, McpToolCallResult, RmcpClient};
+use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::schema::McpServerConfig;
+use orno_core::pipeline::template::{TemplateEngine, render_mcp_server, render_pipeline_vars};
 use orno_core::tool::{McpToolHandler, McpToolHandlerConfig, ToolHandler};
+use orno_core::util::TapeFile;
 use serde_json::Value;
 
 use agent::{
@@ -53,7 +57,7 @@ type TransportPair = (
 /// Shared `BufWriter` handle the run path flushes after a successful
 /// or interrupted run. `None` when neither `--record-tool-tape` nor
 /// `--replay-tool-tape` is set.
-type ToolTapeHandle = Arc<Mutex<std::io::BufWriter<std::fs::File>>>;
+type ToolTapeHandle = Arc<TapeFile>;
 
 /// Tool-handler vector paired with the optional shared tape writer.
 /// Returned by [`wrap_tool_tape`].
@@ -75,12 +79,6 @@ type McpSpawn = (
 /// delay the operator's cancel; the OS reaps any stragglers when the
 /// parent exits.
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Sentinel inserted into `RunFinished.failed_nodes` on SIGINT so a
-/// downstream consumer reading the NDJSON stream can tell an
-/// interrupted run apart from a node-level failure without needing
-/// out-of-band exit-code context.
-const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
 
 /// Mutex-guarded wrapper that lets the orchestrator hold a single MCP
 /// client behind `Arc<dyn McpClient>` for `McpToolHandler` dispatch while
@@ -155,9 +153,30 @@ pub struct RunFlags {
     pub record_bundle: Option<PathBuf>,
 }
 
-pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
-    let mut pipeline = pipeline::load::load_from_path(path)
+/// Read the pipeline once and keep the text, so a bundle records what was
+/// loaded rather than whatever the file holds when the run ends.
+fn load_pipeline(path: &Path) -> Result<(String, Pipeline)> {
+    let yaml = std::fs::read_to_string(path)
+        .with_context(|| format!("reading pipeline `{}`", path.display()))?;
+    let pipeline = pipeline::load::load_from_str(&yaml)
         .with_context(|| format!("loading pipeline `{}`", path.display()))?;
+    Ok((yaml, pipeline))
+}
+
+fn engine_config(flags: &RunFlags) -> EngineConfig {
+    EngineConfig {
+        verbose: flags.verbose,
+        max_output_bytes: flags.max_output_bytes,
+        max_node_output_bytes: flags.max_node_output_bytes,
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear setup, run, cleanup sequence; splitting would only thread the same state through helpers"
+)]
+pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
+    let (pipeline_yaml, mut pipeline) = load_pipeline(path)?;
 
     let bundle_paths = derive_bundle_paths(flags.record_bundle.as_ref())?;
     if let Some((_, llm_tmp, tool_tmp)) = &bundle_paths {
@@ -165,12 +184,8 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         flags.record_tool_tape = Some(tool_tmp.clone());
     }
 
-    let engine_config = EngineConfig {
-        verbose: flags.verbose,
-        max_output_bytes: flags.max_output_bytes,
-        max_node_output_bytes: flags.max_node_output_bytes,
-    };
-    let inputs = resolve_inputs(&pipeline, &flags)?;
+    let engine_config = engine_config(&flags);
+    let mut inputs = resolve_inputs(&pipeline, &flags)?;
 
     // Keep a typed handle to `StreamingSink` so the CLI can read its
     // `is_broken` flag after `engine.run` returns. The engine only
@@ -190,17 +205,35 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // reader.
     let body_excerpt_max_bytes = engine_config.max_output_bytes;
 
-    let redactor = Arc::new(Redactor::new(&inputs.secrets));
+    let redactor = Arc::new(Redactor::new(&secrets::redaction_values(
+        &pipeline,
+        &inputs.secrets,
+    )));
+    // The engine would render `vars` itself; rendering here instead lets
+    // the bundle record exactly what the run used.
+    let bundle_inputs = if bundle_paths.is_some() {
+        capture_bundle_inputs(&pipeline, &mut inputs, &redactor)?
+    } else {
+        BundleRunInputs::default()
+    };
     let (transport, recording_transport) =
         build_transport(&flags, &pipeline, &inputs.secrets, &redactor)?;
-    let (mcp_clients, mcp_tools, server_tool_names) =
-        spawn_mcp_servers(&pipeline, &sink, &run_id, body_excerpt_max_bytes).await?;
+    let (mcp_clients, mcp_tools, server_tool_names) = spawn_mcp_servers(
+        &pipeline,
+        &inputs,
+        &sink,
+        &run_id,
+        ExcerptPolicy {
+            max_bytes: body_excerpt_max_bytes,
+            redactor: &redactor,
+        },
+    )
+    .await?;
 
     // Expand `mcp.<server>.*` wildcards before agent construction so
     // the cloned `AgentConfig` each `SubagentHandler` receives carries
     // the expanded list. See `pipeline::load::expand_mcp_wildcards`.
-    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
-        .context("expanding MCP tool wildcards in agent allowed_tools")?;
+    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names);
 
     let builtin_tools = assemble_builtin_tools(&redactor, body_excerpt_max_bytes, mcp_tools);
     let (builtin_tools, tool_tape_to_flush) = wrap_tool_tape(builtin_tools, &flags, &redactor)?;
@@ -212,9 +245,13 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         redactor,
         body_excerpt_max_bytes,
     });
-    let engine = build_engine(sink.clone(), loop_agent, engine_config);
+    let shell = Arc::new(ShellExecutor::with_config(
+        sink.clone(),
+        engine_config.max_node_output_bytes,
+    ));
+    let engine = build_engine(sink.clone(), loop_agent, shell, engine_config);
 
-    let run_outcome = tokio::select! {
+    let run_result = tokio::select! {
         biased;
         () = super::sigint_with_warning() => {
             handle_sigint(
@@ -226,17 +263,67 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
             ).await;
             return Err(super::Interrupted.into());
         }
-        res = engine.run(&run_id, &pipeline, inputs) => res?,
+        // Do not propagate engine errors here — cleanup must run first
+        // so MCP clients drain and the recording tape flushes even when
+        // the engine terminates with a CoreError.
+        res = engine.run(&run_id, &pipeline, inputs) => res,
     };
 
-    flush_and_assemble(
+    let flush_result = flush_and_assemble(
         recording_transport,
         tool_tape_to_flush.as_ref(),
         bundle_paths,
-        path,
-    )?;
+        &pipeline_yaml,
+        &bundle_inputs,
+    );
+    // Always drain MCP children, even when the flush failed.
     shutdown_mcp_servers(&sink, &run_id, &mcp_clients).await;
-    finalize_run(&streaming_sink, &run_outcome)
+    finish_run(&streaming_sink, run_result, flush_result)
+}
+
+/// How MCP tool handlers bound and scrub the excerpts they put on events.
+#[derive(Clone, Copy)]
+struct ExcerptPolicy<'a> {
+    max_bytes: usize,
+    redactor: &'a Arc<Redactor>,
+}
+
+/// Render `vars` once for both the run and the bundle, and snapshot the
+/// template namespaces the bundle will carry.
+fn capture_bundle_inputs(
+    pipeline: &Pipeline,
+    inputs: &mut RunInputs,
+    redactor: &Redactor,
+) -> Result<BundleRunInputs> {
+    let vars = render_pipeline_vars(
+        &TemplateEngine::new(),
+        &pipeline.vars,
+        &inputs.env,
+        &inputs.secrets,
+    )
+    .context("rendering pipeline vars")?;
+    let captured = BundleRunInputs::capture(&vars, &inputs.env, &inputs.secrets, redactor);
+    inputs.rendered_vars = Some(vars);
+    Ok(captured)
+}
+
+/// Combine the engine and flush outcomes. The engine error wins; a flush
+/// failure is logged then, and fails the run only when the engine succeeded.
+fn finish_run(
+    streaming_sink: &Arc<StreamingSink>,
+    run_result: Result<RunOutcome, CoreError>,
+    flush_result: Result<()>,
+) -> Result<()> {
+    match (run_result, flush_result) {
+        (Err(run_err), flush) => {
+            if let Err(flush_err) = flush {
+                tracing::warn!(error = %format!("{flush_err:#}"), "tape flush failed after engine error");
+            }
+            Err(run_err.into())
+        },
+        (Ok(_), Err(flush_err)) => Err(flush_err),
+        (Ok(report), Ok(())) => super::finalize_run(streaming_sink, &report, "run"),
+    }
 }
 
 /// Derive the `(bundle, llm_tmp, tool_tmp)` paths that back
@@ -296,9 +383,10 @@ fn derive_bundle_paths(
 /// with context.
 async fn spawn_mcp_servers(
     pipeline: &Pipeline,
+    inputs: &RunInputs,
     sink: &Arc<dyn EventSink>,
     run_id: &str,
-    body_excerpt_max_bytes: usize,
+    excerpts: ExcerptPolicy<'_>,
 ) -> Result<McpSpawn> {
     let mut mcp_clients: Vec<Arc<SharedMcpClient>> = Vec::new();
     let mut mcp_tools: Vec<Arc<dyn ToolHandler>> = Vec::new();
@@ -308,16 +396,27 @@ async fn spawn_mcp_servers(
     // tool list is only known after `tools/list` returns.
     let mut server_tool_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    for (server_name, server_cfg) in &pipeline.mcp_servers {
-        match init_one_mcp_server(
+    let templates = TemplateEngine::new();
+    for (server_name, raw_cfg) in &pipeline.mcp_servers {
+        // Render before spawning so `{{ secrets.X }}` reaches the server
+        // as the real value. A render failure leaves nothing to drain
+        // beyond the clients already started.
+        let server_cfg = match render_mcp_server(
+            &templates,
             server_name,
-            server_cfg,
-            sink,
-            run_id,
-            body_excerpt_max_bytes,
-        )
-        .await
-        {
+            raw_cfg,
+            &inputs.env,
+            &inputs.secrets,
+        ) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                shutdown_mcp_servers(sink, run_id, &mcp_clients).await;
+                emit_run_lifecycle_failure(sink, run_id, Vec::new(), Vec::new()).await;
+                return Err(anyhow::Error::from(e)
+                    .context(format!("rendering MCP server `{server_name}` config")));
+            },
+        };
+        match init_one_mcp_server(server_name, &server_cfg, sink, run_id, excerpts).await {
             Ok((shared, tools, tool_names)) => {
                 mcp_tools.extend(tools);
                 server_tool_names.insert(server_name.clone(), tool_names);
@@ -329,10 +428,8 @@ async fn spawn_mcp_servers(
                 // Reuses the same shutdown sequence as the success path
                 // at the bottom of `run()`.
                 shutdown_mcp_servers(sink, run_id, &mcp_clients).await;
-                // No nodes ran on this path, so the lifecycle aggregate
-                // vectors are empty. The CLI owns the `RunStarted` /
-                // `RunFinished { ok: false }` pair on the crash path
-                // because `Engine::run` never gets a chance to (H2).
+                // No nodes ran, and `Engine::run` never will, so the CLI
+                // owns the `RunStarted` / `RunFinished { ok: false }` pair.
                 emit_run_lifecycle_failure(sink, run_id, Vec::new(), Vec::new()).await;
                 return Err(e);
             },
@@ -353,7 +450,7 @@ async fn init_one_mcp_server(
     server_cfg: &McpServerConfig,
     sink: &Arc<dyn EventSink>,
     run_id: &str,
-    body_excerpt_max_bytes: usize,
+    excerpts: ExcerptPolicy<'_>,
 ) -> Result<(Arc<SharedMcpClient>, Vec<Arc<dyn ToolHandler>>, Vec<String>)> {
     let transport_label = match server_cfg {
         McpServerConfig::Stdio(_) => "stdio",
@@ -406,8 +503,7 @@ async fn init_one_mcp_server(
     })
     .await;
 
-    let (handlers, tool_names) =
-        build_mcp_handlers(server_name, &tools, &shared, sink, body_excerpt_max_bytes);
+    let (handlers, tool_names) = build_mcp_handlers(server_name, &tools, &shared, sink, excerpts);
     Ok((shared, handlers, tool_names))
 }
 
@@ -420,7 +516,7 @@ fn build_mcp_handlers(
     tools: &[McpTool],
     shared: &Arc<SharedMcpClient>,
     sink: &Arc<dyn EventSink>,
-    body_excerpt_max_bytes: usize,
+    excerpts: ExcerptPolicy<'_>,
 ) -> (Vec<Arc<dyn ToolHandler>>, Vec<String>) {
     let mut handlers: Vec<Arc<dyn ToolHandler>> = Vec::with_capacity(tools.len());
     let mut tool_names: Vec<String> = Vec::with_capacity(tools.len());
@@ -433,7 +529,8 @@ fn build_mcp_handlers(
                 tool: tool.name.clone(),
                 description: tool.description.clone(),
                 schema: tool.schema.clone(),
-                body_excerpt_max_bytes,
+                body_excerpt_max_bytes: excerpts.max_bytes,
+                redactor: Arc::clone(excerpts.redactor),
             },
             shared.clone() as Arc<dyn McpClient>,
             sink.clone(),
@@ -453,33 +550,26 @@ fn flush_and_assemble(
     recording_transport: Option<Arc<RecordingTransport>>,
     tool_tape_to_flush: Option<&ToolTapeHandle>,
     bundle_paths: Option<(PathBuf, PathBuf, PathBuf)>,
-    pipeline_path: &Path,
+    pipeline_yaml: &str,
+    run_inputs: &BundleRunInputs,
 ) -> Result<()> {
     if let Some(rec) = recording_transport {
         rec.flush().context("flushing LLM tape after run")?;
     }
 
     if let Some(tape) = tool_tape_to_flush {
-        tape.lock()
-            .expect("tool tape mutex poisoned")
-            .flush()
-            .context("flushing tool tape after run")?;
+        tape.flush().context("flushing tool tape after run")?;
     }
 
     if let Some((bundle_path, llm_tmp, tool_tmp)) = bundle_paths {
-        let pipeline_yaml = std::fs::read_to_string(pipeline_path).with_context(|| {
-            format!(
-                "reading pipeline YAML `{}` for bundle",
-                pipeline_path.display()
-            )
-        })?;
-        orno_core::llm::write_bundle(
-            &pipeline_yaml,
-            Some(&llm_tmp),
-            Some(&tool_tmp),
-            &bundle_path,
-        )
-        .with_context(|| format!("writing bundle `{}`", bundle_path.display()))?;
+        let sources = BundleSources {
+            pipeline_yaml,
+            run_inputs,
+            llm_tape: Some(&llm_tmp),
+            tool_tape: Some(&tool_tmp),
+        };
+        write_bundle(&sources, &bundle_path)
+            .with_context(|| format!("writing bundle `{}`", bundle_path.display()))?;
         // Best-effort cleanup: a failure to remove a temp file is not
         // fatal — the bundle is already written and a stale `.tmp`
         // sitting next to it is a recoverable mess, not a data loss.
@@ -503,23 +593,16 @@ async fn handle_sigint(
     tool_tape_to_flush: Option<&ToolTapeHandle>,
     mcp_clients: &[Arc<SharedMcpClient>],
 ) {
-    sink.record(Event::RunFinished {
-        run_id: run_id.to_string(),
-        ok: false,
-        failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
-        skipped_nodes: Vec::new(),
-    })
-    .await;
+    super::emit_interrupted(sink, run_id).await;
     if let Some(rec) = recording_transport
         && let Err(e) = rec.flush()
     {
-        tracing::warn!(error = ?e, "flushing LLM tape on SIGINT failed");
+        tracing::warn!(error = %e, "flushing LLM tape on SIGINT failed");
     }
     if let Some(tape) = tool_tape_to_flush
-        && let Ok(mut guard) = tape.lock()
-        && let Err(e) = guard.flush()
+        && let Err(e) = tape.flush()
     {
-        tracing::warn!(error = ?e, "flushing tool tape on SIGINT failed");
+        tracing::warn!(error = %e, "flushing tool tape on SIGINT failed");
     }
     let shutdown_fut = shutdown_mcp_servers(sink, run_id, mcp_clients);
     if tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, shutdown_fut)
@@ -531,34 +614,6 @@ async fn handle_sigint(
             "MCP shutdown exceeded grace window on SIGINT"
         );
     }
-}
-
-/// Translate the engine's outcome and the streaming sink's broken
-/// state into the CLI's process-level exit code. The streaming sink
-/// swallows write errors during the run so a single EPIPE does not
-/// poison every subsequent `record` — but a broken sink still owes
-/// the operator a non-zero exit. Checked after MCP shutdown so the
-/// shutdown envelopes had a chance to fail too.
-fn finalize_run(
-    streaming_sink: &Arc<StreamingSink>,
-    run_outcome: &orno_core::execution::scheduler::RunOutcome,
-) -> Result<()> {
-    if streaming_sink.is_broken() {
-        bail!("event stream write failed (downstream closed?); run output is incomplete");
-    }
-
-    // Skipped descendants are visible in the stream as `node_skipped`
-    // envelopes; we do not re-list them here to keep the CLI message tight.
-    if !run_outcome.ok {
-        let names = if run_outcome.failed_nodes.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            run_outcome.failed_nodes.join(", ")
-        };
-        bail!("run failed: nodes [{names}] reported ok:false");
-    }
-
-    Ok(())
 }
 
 /// Emit the `RunStarted` + `RunFinished { ok: false, .. }` pair the CLI
@@ -607,8 +662,8 @@ async fn shutdown_mcp_servers(
         .await;
         if let Err(e) = client.inner.lock().await.shutdown().await {
             tracing::warn!(
-                server = %client.server,
-                error = ?e,
+                mcp.server = %client.server,
+                error = %e,
                 "MCP server shutdown failed",
             );
         }
@@ -617,5 +672,22 @@ async fn shutdown_mcp_servers(
             server: client.server.clone(),
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod finish_run_tests {
+    use super::*;
+    use orno_core::error::PipelineError;
+
+    #[test]
+    fn engine_error_wins_over_flush_error() {
+        let sink = Arc::new(StreamingSink::stdout());
+        let run_err = CoreError::Pipeline(PipelineError::Validation("engine boom".into()));
+        let err = finish_run(&sink, Err(run_err), Err(anyhow::anyhow!("flush boom")))
+            .expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("engine boom"), "{msg}");
+        assert!(!msg.contains("flush boom"), "{msg}");
     }
 }

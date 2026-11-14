@@ -1,5 +1,5 @@
 //! Agent-loop seam. Every `kind: agent` node routes through an
-//! [`Agent`] implementation. The skeleton ships one impl,
+//! [`Agent`] implementation. The one impl is
 //! [`LoopAgent`], which drives the bounded iteration loop with tool
 //! dispatch and full five-dimension enforcement of the strictness
 //! contract.
@@ -9,10 +9,10 @@
 //! that converts `NodeRequest::Agent` into [`AgentRequest`] and an
 //! [`AgentOutput`] back into `NodeResponse` JSON.
 
+pub mod budget;
 pub mod loop_agent;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::AgentError;
 use crate::llm::Usage;
 use crate::pipeline::schema::AgentPolicy;
+use crate::pipeline::template::RenderScope;
 
+pub use budget::BudgetScope;
 pub use loop_agent::{LoopAgent, LoopAgentConfig};
 
 /// Input to an [`Agent`] call. Structurally mirrors
@@ -59,18 +61,17 @@ pub struct AgentRequest {
     /// in-memory construction sites stay source-compatible.
     #[serde(default)]
     pub depth: u32,
-    /// Parent loop's token counter, set by `SubagentHandler` when the
-    /// child loop is dispatched as a subagent tool call. Each LLM
-    /// response with `usage` in the child loop bumps the parent counter
-    /// in lockstep with the child's local counter, so the parent's
-    /// `policy.max_total_tokens` budget transitively covers child
-    /// subagent token spend (ADR 0023). `None` on the root request
-    /// constructed by `AgentExecutor` — the root has no parent.
-    /// Skipped on serialization because `Arc<AtomicU64>` is a runtime
-    /// shared handle, not a wire payload; record/replay reproduces the
-    /// counter graph by re-running the loop, not by serializing it.
+    /// Budget scope of the calling loop, set by `SubagentHandler` for a
+    /// child. The child's token and tool-call spend is charged up this
+    /// chain so every ancestor's limits hold. `None` on a root request.
+    /// A runtime handle, so it is never serialized.
     #[serde(skip)]
-    pub parent_token_counter: Option<Arc<AtomicU64>>,
+    pub parent_budget: Option<Arc<BudgetScope>>,
+    /// Template scope the request was rendered under. Subagents render
+    /// their own `system` and `roots` through it; `None` leaves child
+    /// configs as written.
+    #[serde(skip)]
+    pub render_scope: Option<RenderScope>,
 }
 
 /// Successful agent-loop output. Returns the LLM's terminal text

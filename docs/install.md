@@ -32,21 +32,21 @@ A clean working tree should pass orno's full quality gate:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 cargo deny check
 cargo machete
 typos
 cargo doc --workspace --all-features --no-deps
 ```
 
-The supplemental tools (`cargo deny`, `cargo machete`, `typos`) are not required to use orno — they are required to *contribute* to it. See the repo-root `CONTRIBUTING.md` once it lands.
+You don't need the supplemental tools (`cargo deny`, `cargo machete`, `typos`) to use orno. You need them to *contribute* to it. See the repo-root `CONTRIBUTING.md` once it lands.
 
 ## Smoke-test against the dummy transport
 
-`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter, but you can exercise it against a deterministic dummy transport without needing a key:
+`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter, but you can exercise it against a deterministic dummy transport without needing a key. The dummy transport only exists in a build with `--features test-transport`. Release binaries and a plain `cargo install` ignore `ORNO_TEST_LLM_TRANSPORT`:
 
 ```bash
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport -- run examples/hello/pipeline.yaml
 ```
 
 You should see NDJSON event envelopes on stdout terminating in a `run_finished` envelope with `"ok": true`.
@@ -54,11 +54,11 @@ You should see NDJSON event envelopes on stdout terminating in a `run_finished` 
 ## Smoke-test against a real LLM
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
-cargo run -p orno-cli -- run examples/hello/pipeline.yaml --secrets-file .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
+cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
-The OpenRouter key is auto-discovered when an agent's `provider:` is `openrouter`. orno will redact the key from every event body and tracing line.
+The OpenRouter key is auto-discovered when an agent's `provider:` is `openrouter`. orno redacts the key from every event body and tracing line.
 
 ## Set up shell completions
 
@@ -72,6 +72,6 @@ The `completions` subcommand also supports `elvish` and `powershell`.
 
 ## Where to go next
 
-- [What is orno](what-is-orno.md) — the runtime contract, in plain English.
-- [Pipeline YAML grammar](reference/pipeline-yaml.md) — every field of every block.
-- The per-example READMEs under [`../examples/`](../examples/README.md) — runnable shapes to copy from.
+- [What is orno](what-is-orno.md): the runtime contract, in plain English.
+- [Pipeline YAML grammar](reference/pipeline-yaml.md): every field of every block.
+- The per-example READMEs under [`../examples/`](../examples/README.md) hold runnable shapes to copy from.

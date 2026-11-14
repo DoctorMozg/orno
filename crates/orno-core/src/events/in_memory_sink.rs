@@ -1,4 +1,4 @@
-//! In-memory `EventSink` used by the skeleton CLI and by tests. A
+//! In-memory `EventSink` used by tests. A
 //! feature-gated `SqliteSink` plugs in alongside this impl without
 //! touching the scheduler or the trait.
 

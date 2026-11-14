@@ -28,7 +28,7 @@ test-transport = []
 orno-core = { workspace = true }
 
 anyhow = { workspace = true }
-async-trait = "0.1"
+async-trait = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 serde_json = { workspace = true }
@@ -42,4 +42,3 @@ tracing-subscriber = { workspace = true }
 assert_cmd = { workspace = true }
 insta = { workspace = true }
 predicates = { workspace = true }
-tempfile = { workspace = true }

@@ -4,12 +4,13 @@
 //! delegates to an `Arc<dyn Agent>`, and packages the `AgentOutput` back
 //! into `NodeResponse` JSON. All loop behavior — LLM dispatch, event
 //! emission, policy checks — lives inside the injected `Agent` impl
-//! (`LoopAgent` today; Phase 5 grows it).
+//! (`LoopAgent` today).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tracing::instrument;
 
 use crate::agent::{Agent, AgentOutput, AgentRequest, LoopAgent, LoopAgentConfig};
 use crate::error::{AgentError, NodeError};
@@ -55,6 +56,10 @@ impl AgentExecutor {
 
 #[async_trait]
 impl NodeExecutor for AgentExecutor {
+    #[instrument(
+        skip(self, req),
+        fields(node.id = %node_id, node.kind = "agent", pipeline.run_id = %run_id),
+    )]
     async fn execute(
         &self,
         run_id: &str,
@@ -69,6 +74,7 @@ impl NodeExecutor for AgentExecutor {
             model,
             policy,
             allowed_tools,
+            render_scope,
         }) = req
         else {
             return Err(NodeError::Execution {
@@ -93,10 +99,10 @@ impl NodeExecutor for AgentExecutor {
             // subagent tool call from depth N dispatches the child at
             // `N + 1`; see `LoopAgent::run` for the recursion gate.
             depth: 0,
-            // Root request has no parent loop to charge — the parent
-            // counter is `Some` only on subagent recursion (set inside
-            // `SubagentHandler::invoke`).
-            parent_token_counter: None,
+            // The root has no parent loop to charge; children get
+            // theirs from `SubagentHandler::invoke`.
+            parent_budget: None,
+            render_scope,
         };
 
         let output = self
@@ -112,22 +118,11 @@ impl NodeExecutor for AgentExecutor {
     }
 }
 
-/// Translate an [`AgentError`] into a [`NodeError`] preserving the
-/// two user-facing distinctions that the dispatch layer already
-/// surfaces: "feature not ready yet" stays `UnsupportedYet` so strict
-/// pipelines get the same classification they got pre-adapter;
-/// everything else collapses into `Execution` with the agent error as
-/// the `source()` chain.
+/// The agent error stays reachable through the `source()` chain.
 fn agent_error_to_node(id: &str, err: AgentError) -> NodeError {
-    match err {
-        AgentError::UnsupportedYet(feature) => NodeError::UnsupportedYet {
-            id: id.to_string(),
-            feature,
-        },
-        other => NodeError::Execution {
-            id: id.to_string(),
-            source: Box::new(other),
-        },
+    NodeError::Execution {
+        id: id.to_string(),
+        source: Box::new(err),
     }
 }
 
@@ -208,6 +203,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            unconfined_shell: false,
         }
     }
 
@@ -220,6 +216,7 @@ mod tests {
             model: "gpt-5".into(),
             policy: policy(),
             allowed_tools: Vec::new(),
+            render_scope: None,
         })
     }
 
@@ -284,27 +281,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_yet_error_preserves_node_classification() {
-        // The adapter must keep the "feature not ready" distinction that
-        // strict pipelines rely on — collapsing it into Execution would
-        // make unrelated failures indistinguishable from policy drift.
-        let fake = FakeAgent::err(AgentError::UnsupportedYet("allowed_tools (Phase 5)".into()));
-        let exec = AgentExecutor::from_agent(fake);
-
-        let err = exec
-            .execute("run_test", "n", agent_node_request())
-            .await
-            .expect_err("UnsupportedYet must propagate");
-        match err {
-            NodeError::UnsupportedYet { id, feature } => {
-                assert_eq!(id, "n");
-                assert!(feature.contains("allowed_tools"));
-            },
-            other => panic!("expected UnsupportedYet, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn invalid_policy_error_surfaces_as_execution_with_source() {
         let fake = FakeAgent::err(AgentError::InvalidPolicy(
             "max_iterations must be >= 1".into(),
@@ -338,6 +314,7 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
         let err = exec
             .execute("run_test", "n", req)

@@ -2,7 +2,7 @@
 //! wrapping, `LoopAgent` construction via `Arc::new_cyclic`, and
 //! `Engine` registration.
 
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 
@@ -11,25 +11,23 @@ use orno_core::events::{EventSink, Redactor};
 use orno_core::execution::Engine;
 use orno_core::execution::EngineConfig;
 use orno_core::llm::LlmTransport;
-use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
-use orno_core::node::shell::ShellExecutor;
+use orno_core::node::{NodeExecutor, NodeRegistry};
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, ReadHandler, RecordingToolHandler, ReplayToolHandler,
-    SetStateHandler, SubagentHandler, ToolHandler, WebFetchHandler, WriteHandler,
+    RecordingToolHandler, ReplayToolHandler, SubagentHandler, ToolHandler, builtin_handlers,
 };
+use orno_core::util::TapeFile;
 
 use super::{RunFlags, ToolTapePair};
 
-/// Construct the built-in tool vector — `BashHandler`, `ReadHandler`,
-/// `WriteHandler`, `EditHandler`, `WebFetchHandler`, `SetStateHandler`
-/// — and append the per-MCP-server tool handlers already produced by
+/// Construct the built-in tool vector (`orno_core::tool::BUILTIN_TOOLS`)
+/// and append the per-MCP-server tool handlers already produced by
 /// `spawn_mcp_servers`. `LoopAgent` gates each call against the
 /// per-agent `AgentPolicy.allowed_tools` list, so an agent that does
 /// not opt into a handler cannot reach it: this vector is the
-/// availability ceiling, not the default. `SetStateHandler` shares
+/// availability ceiling, not the default. `SetState` shares
 /// the run-level redactor so `secrets.*` leaves are scrubbed before
 /// state reaches the wire.
 pub(super) fn assemble_builtin_tools(
@@ -37,39 +35,21 @@ pub(super) fn assemble_builtin_tools(
     body_excerpt_max_bytes: usize,
     mcp_tools: Vec<Arc<dyn ToolHandler>>,
 ) -> Vec<Arc<dyn ToolHandler>> {
-    let mut tools: Vec<Arc<dyn ToolHandler>> = vec![
-        Arc::new(BashHandler),
-        Arc::new(ReadHandler),
-        Arc::new(WriteHandler),
-        Arc::new(EditHandler),
-        Arc::new(WebFetchHandler::default()),
-        Arc::new(SetStateHandler::new(
-            redactor.clone(),
-            body_excerpt_max_bytes,
-        )),
-    ];
+    let mut tools = builtin_handlers(redactor, body_excerpt_max_bytes);
     tools.extend(mcp_tools);
     tools
 }
 
-/// Register the `shell` and `agent` node executors against a fresh
-/// `NodeRegistry`, build the template engine, and wire everything into
-/// the final [`Engine`]. Consumes `engine_config` so the caller cannot
-/// accidentally read tunables that have already been threaded into the
-/// engine.
-pub(super) fn build_engine(
+/// Wire the `shell` executor and the agent executor into an [`Engine`].
+/// Replay passes a refusing shell executor, `run` a real one.
+pub(crate) fn build_engine(
     sink: Arc<dyn EventSink>,
     loop_agent: Arc<LoopAgent>,
+    shell: Arc<dyn NodeExecutor>,
     engine_config: EngineConfig,
 ) -> Engine {
     let mut registry = NodeRegistry::new();
-    registry.register(
-        "shell",
-        Arc::new(ShellExecutor::with_config(
-            sink.clone(),
-            engine_config.max_node_output_bytes,
-        )),
-    );
+    registry.register("shell", shell);
     let agent: Arc<dyn Agent> = loop_agent;
     registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
     let registry = Arc::new(registry);
@@ -79,7 +59,7 @@ pub(super) fn build_engine(
 
 /// Wrap every handler in `tools` for record/replay when the relevant
 /// tape flag is set. Returns the (possibly wrapped) handler vector and
-/// the shared `BufWriter` handle that the run path flushes after the
+/// the shared tape handle that the run path flushes after the
 /// engine returns. `--record-tool-tape` and `--replay-tool-tape` are
 /// mutually exclusive at the CLI layer.
 pub(super) fn wrap_tool_tape(
@@ -88,30 +68,16 @@ pub(super) fn wrap_tool_tape(
     redactor: &Arc<Redactor>,
 ) -> Result<ToolTapePair> {
     if let Some(path) = &flags.record_tool_tape {
-        let mut opts = std::fs::OpenOptions::new();
-        // O_EXCL: prevent a pre-planted symlink at the path from redirecting
-        // writes to an attacker-controlled file, and force the caller to make
-        // an explicit decision when a stale tape already exists at the path.
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Tool tapes capture full request/response payloads including
-            // secrets — must not be readable by other local users.
-            opts.mode(0o600);
-        }
-        let file = opts
-            .open(path)
-            .with_context(|| format!("creating tool tape `{}`", path.display()))?;
-        let shared = Arc::new(Mutex::new(std::io::BufWriter::new(file)));
-        let path_buf = path.clone();
+        let shared = Arc::new(
+            TapeFile::create(path)
+                .with_context(|| format!("creating tool tape `{}`", path.display()))?,
+        );
         let wrapped: Vec<Arc<dyn ToolHandler>> = tools
             .into_iter()
             .map(|h| {
                 Arc::new(RecordingToolHandler::with_shared_tape(
                     h,
                     shared.clone(),
-                    path_buf.clone(),
                     redactor.clone(),
                 )) as Arc<dyn ToolHandler>
             })
@@ -133,7 +99,7 @@ pub(super) fn wrap_tool_tape(
 
 /// Inputs for [`build_loop_agent`]. Grouped to keep the call site
 /// under the four-parameter threshold (CLAUDE.md convention).
-pub(super) struct BuildLoopAgentArgs<'a> {
+pub(crate) struct BuildLoopAgentArgs<'a> {
     pub transport: Arc<dyn LlmTransport>,
     pub builtin_tools: Vec<Arc<dyn ToolHandler>>,
     pub pipeline: &'a Pipeline,
@@ -152,7 +118,7 @@ pub(super) struct BuildLoopAgentArgs<'a> {
 /// One handler per entry in `pipeline.agents`: the YAML form
 /// `subagent.<name>` is the same string the parent's `allowed_tools`
 /// references, so registration key = handler name = allowlist entry.
-pub(super) fn build_loop_agent(args: BuildLoopAgentArgs<'_>) -> Arc<LoopAgent> {
+pub(crate) fn build_loop_agent(args: BuildLoopAgentArgs<'_>) -> Arc<LoopAgent> {
     let BuildLoopAgentArgs {
         transport,
         builtin_tools,

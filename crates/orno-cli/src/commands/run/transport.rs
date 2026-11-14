@@ -23,8 +23,8 @@ use super::{RunFlags, TransportPair};
 /// snapshot the event stream without a live API key. When set to
 /// `scripted`, tests can drive multi-turn agent + subagent loops
 /// by pre-seeding the response queue via `ORNO_TEST_SCRIPTED_TAPE`
-/// — required for record/replay coverage of subagent dispatch
-/// (Phase 6). Only honored when the `test-transport` feature is
+/// — required for record/replay coverage of subagent dispatch.
+/// Only honored when the `test-transport` feature is
 /// enabled (or `cfg(test)` is live for in-crate unit tests); a
 /// stock `cargo install` build silently ignores the variable.
 #[cfg(any(test, feature = "test-transport"))]

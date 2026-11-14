@@ -1,9 +1,7 @@
 //! Lifecycle event variants.
 //!
-//! Split out of `mod.rs` so the enum can grow without pushing the
-//! module file past the 300-LOC soft cap. The enum is the only public
-//! surface here; re-exported from the parent module so consumer paths
-//! stay `crate::events::Event`.
+//! The enum is re-exported from the parent module as
+//! `crate::events::Event`.
 
 use serde::{Deserialize, Serialize};
 
@@ -49,10 +47,6 @@ pub enum Event {
         /// `schema_version: 2`.
         node_kind: String,
         reason: SkipReason,
-    },
-    BudgetExceeded {
-        run_id: String,
-        reason: String,
     },
     /// Emitted at the start of each agent iteration before the LLM
     /// transport is called. `iteration` is 0-based so a single-shot
@@ -271,12 +265,13 @@ pub enum Event {
     /// head-truncated to the cap and the child continues running so it
     /// does not block on a full PIPE buffer; this envelope records
     /// that the captured stream is incomplete. `stream` is `"stdout"`
-    /// or `"stderr"`. `captured_bytes` reports the number of bytes
-    /// the child actually wrote past the cap before exiting (so an
+    /// or `"stderr"`. `total_bytes` reports the number of bytes the
+    /// child wrote before exiting, the retained prefix included (so an
     /// observer sees how badly the cap was exceeded). `cap_bytes`
     /// echoes the engine's cap so a single envelope tells the full
     /// story without cross-referencing the run config. Added in
-    /// `schema_version: 3`.
+    /// `schema_version: 3`; `captured_bytes` was renamed to
+    /// `total_bytes` in `schema_version: 4`.
     NodeOutputTruncated {
         run_id: String,
         node_id: String,
@@ -289,7 +284,7 @@ pub enum Event {
         stream: String,
         /// Total bytes the child wrote on this stream before exiting.
         /// Always `>= cap_bytes` when this event fires.
-        captured_bytes: u64,
+        total_bytes: u64,
         /// The cap that fired. Echoes
         /// `EngineConfig.max_node_output_bytes` at the time of the
         /// run so a downstream tool can render the breach without

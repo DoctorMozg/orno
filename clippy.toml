@@ -50,8 +50,8 @@ doc-valid-idents = [
 # which orno-cli suppresses at crate level (legitimate CLI output).
 disallowed-macros = [
     { path = "std::dbg",           reason = "debugging macro must not be committed; use tracing::debug! instead" },
-    { path = "std::todo",          reason = "open an issue or add to docs/roadmap.md instead of committing todo!()" },
-    { path = "std::unimplemented", reason = "open an issue or add to docs/roadmap.md instead of committing unimplemented!()" },
+    { path = "std::todo",          reason = "open an issue instead of committing todo!()" },
+    { path = "std::unimplemented", reason = "open an issue instead of committing unimplemented!()" },
 ]
 
 # --- Disallowed methods (thread-safety + process conventions) ---

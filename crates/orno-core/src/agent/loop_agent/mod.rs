@@ -1,42 +1,30 @@
-//! `LoopAgent` — iteration-loop implementation of [`Agent`].
+//! `LoopAgent`, the iteration-loop implementation of [`crate::agent::Agent`].
 //!
-//! Enforces the five strictness dimensions in one loop: bounded
-//! iteration (`max_iterations`), bounded tool surface (`allowed_tools`
-//! plus registered handlers), bounded effects (`allow_mutations` and
-//! `allow_network` — denials feed back to the model as tool-result
-//! strings, the loop continues), bounded resources (`max_total_tokens`,
-//! `max_tool_calls`), and bounded non-determinism (delegated to the
-//! transport / recording layer).
+//! It enforces the five strictness dimensions in one loop. Effect and
+//! tool-error denials feed back to the model as tool-result strings; a
+//! transport failure emits a typed `LlmRequestFailed` next to the
+//! dangling `LlmRequestStarted`.
 //!
-//! On transport failure the impl emits a typed `LlmRequestFailed` next
-//! to the dangling `LlmRequestStarted` so downstream consumers can
-//! classify auth / rate-limit / model-not-found without grepping error
-//! strings.
+//! Entries named `subagent.<child>` in `allowed_tools` map to
+//! [`crate::tool::SubagentHandler`]s holding a `Weak<LoopAgent>`. Depth is
+//! gated here, before any child loop starts. Dotted YAML names become
+//! `subagent_<child>` on the wire because some providers reject dots in
+//! `function.name`, and are mapped back when routing a tool call.
 //!
-//! **Subagent dispatch.** Entries in `allowed_tools` named
-//! `subagent.<child>` correspond to [`SubagentHandler`] instances that
-//! hold a `Weak<LoopAgent>` back-pointer into this same loop. Depth is
-//! enforced here (not in the handler) so the policy gate runs before
-//! any child loop entry, and the denial feeds back as a
-//! tool-result string. Wire names are sanitized at the
-//! `OrnoChatTool` boundary — the YAML uses dotted names but some
-//! providers reject dots in `function.name`, so we translate
-//! `subagent.<child>` → `subagent_<child>` before the schema reaches
-//! the LLM, and reverse-translate when routing the model's tool call
-//! back to a handler.
-//!
-//! Module layout: `mod.rs` owns the struct and its trivial helpers plus
-//! all unit tests; `policy.rs` owns the effect-gate and parse-retry
-//! helpers; `run.rs` owns the `impl Agent for LoopAgent` body.
+//! `mod.rs` owns the struct and tests, `policy.rs` the effect gate and
+//! parse retry, `run.rs` the loop.
 
+mod history;
 pub(crate) mod policy;
 mod run;
 
 use std::sync::Arc;
 
-use crate::events::{EventSink, Redactor, truncate_excerpt};
+use crate::events::redactor::Keep;
+use crate::events::{EventSink, Redactor};
 use crate::llm::LlmTransport;
 use crate::tool::ToolHandler;
+use crate::tool::net_guard::{HostResolver, SystemResolver};
 
 /// Default cap on the body excerpt captured into `LlmFailure::ApiError`
 /// when the agent was constructed without a caller-supplied bound.
@@ -70,19 +58,31 @@ pub struct LoopAgentConfig {
     /// Handlers for tools the agent is allowed to invoke. An empty
     /// vector means the agent can only converse — it will receive no
     /// tool definitions and any tool-call turn from the model will
-    /// route through [`AgentError::UnknownToolCalled`] since every
+    /// route through [`crate::error::AgentError::UnknownToolCalled`] since every
     /// name validates against this set.
     pub tools: Vec<Arc<dyn ToolHandler>>,
 }
 
 pub struct LoopAgent {
     config: LoopAgentConfig,
+    resolver: Arc<dyn HostResolver>,
 }
 
 impl LoopAgent {
     #[must_use]
     pub fn new(config: LoopAgentConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            resolver: Arc::new(SystemResolver),
+        }
+    }
+
+    /// Swap the DNS used by the network policy gate for a fake.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_resolver(mut self, resolver: Arc<dyn HostResolver>) -> Self {
+        self.resolver = resolver;
+        self
     }
 
     /// Convenience constructor for embedders and tests that do not
@@ -107,10 +107,9 @@ impl LoopAgent {
     /// prompts lead with the instruction and responses lead with the
     /// answer.
     fn excerpt_for_wire(&self, s: &str) -> String {
-        truncate_excerpt(
-            self.config.redactor.redact(s).as_ref(),
-            self.config.body_excerpt_max_bytes,
-        )
+        self.config
+            .redactor
+            .redact_bounded(s, self.config.body_excerpt_max_bytes, Keep::Head)
     }
 
     /// Locate the handler for a tool by its YAML-facing name. Returns
@@ -150,6 +149,7 @@ mod tests {
     mod strictness_resources;
     mod strictness_tools;
     mod subagent;
+    mod tool_errors;
 
     use super::wire_name_from_yaml;
 

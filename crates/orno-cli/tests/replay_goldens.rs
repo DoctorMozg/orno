@@ -33,8 +33,8 @@ fn orno() -> Command {
 
 /// Walk a parsed NDJSON envelope and overwrite the two
 /// non-deterministic envelope fields in place:
-/// - `run_id`: ULID minted per process (ADR 0019 form).
-/// - `timestamp`: RFC 3339 UTC wall-clock (ADR 0018).
+/// - `run_id`: ULID minted per process.
+/// - `timestamp`: RFC 3339 UTC wall-clock.
 ///
 /// Values are replaced with stable string sentinels so the snapshot
 /// remains structurally faithful (the keys still exist, the type is
@@ -86,4 +86,32 @@ fn hello_bundle_replays_to_stable_event_stream() {
         .collect();
 
     insta::assert_yaml_snapshot!(events);
+}
+
+/// Every bundle checked in under `examples/` must still replay, so a
+/// request-shape change that strands a committed recording fails CI.
+#[test]
+fn example_bundles_still_replay() {
+    let examples = std::path::Path::new("../../examples");
+    let mut bundles: Vec<_> = std::fs::read_dir(examples)
+        .expect("read examples/")
+        .filter_map(|entry| {
+            let path = entry.expect("examples entry").path().join("bundle.ndjson");
+            path.is_file().then_some(path)
+        })
+        .collect();
+    bundles.sort();
+    assert!(
+        !bundles.is_empty(),
+        "no example bundles found under examples/"
+    );
+
+    for bundle in bundles {
+        orno()
+            .env_remove("OPENROUTER_API_KEY")
+            .arg("replay")
+            .arg(&bundle)
+            .assert()
+            .success();
+    }
 }

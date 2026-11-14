@@ -4,11 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## About orno
 
-Orno is a CI-native runner for **strict agentic loops** (Rust workspace) in pre-v0.1 skeleton state. Trait seams and module tree are in place; the agent loop, tool handlers, LLM transport wiring, MCP client, scheduler parallelism, and record/replay are intentionally unimplemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
+Orno is a CI-native runner for **strict agentic loops** (Rust workspace) at v0.3.0. The agent loop, tool handlers (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`, `SubagentHandler`, `McpHandler`), LLM transport (via `genai`), MCP client (via `rmcp`), execution scheduler, and record/replay are all implemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
 
-"Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style, ADR 0006), not peer-to-peer messaging between agents.
-
-Read `docs/adr/` before making architectural changes — nine committed ADRs constrain most design decisions. `docs/yaml-spec.md` is the target user-facing YAML shape; `docs/roadmap.md` phases the v0.1.0 build.
+"Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style), not peer-to-peer messaging between agents.
 
 ## Common commands
 
@@ -38,7 +36,7 @@ cargo machete                                       # unused-dep scan
 cargo nextest run --workspace --all-targets         # faster test runner (optional)
 ```
 
-CI (`.github/workflows/ci.yml`) runs 9 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `test`, `msrv`, and `coverage`. A release-build matrix runs on ubuntu-latest, macos-14, and windows-2022. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — Phase 2 activation after doc comments exist.
+CI (`.github/workflows/ci.yml`) runs 13 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `shellcheck`, `test`, `test-mcp-real`, `coverage`, `build-matrix`, `install-smoke`, and `dogfood`. First-party actions are tag-pinned (`actions/checkout@v6`); third-party actions are pinned to full commit SHAs. Jobs that compile Rust use `Swatinem/rust-cache`; `deny`, `machete`, `typos`, and `shellcheck` do not. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job enforces `RUSTDOCFLAGS="-D warnings"`.
 
 ## Verification after every change batch
 
@@ -54,15 +52,15 @@ typos
 cargo doc --workspace --all-features --no-deps
 ```
 
-All seven must pass. A green `cargo test` alone is not sufficient: `cargo deny` catches new advisories on transitive deps (including `rmcp` → `paste`), `typos` catches wording drift in doc comments and ADRs, `machete` catches dead deps, `cargo doc` catches broken intra-doc links, and `fmt`/`clippy` catch style and lint regressions that will fail CI. Never claim a change is complete based on a subset — CI runs all of them and will red-flag anything skipped locally.
+All seven must pass. A green `cargo test` alone is not sufficient: `cargo deny` catches new advisories on transitive deps (including `rmcp` → `paste`), `typos` catches wording drift in doc comments and docs, `machete` catches dead deps, `cargo doc` catches broken intra-doc links, and `fmt`/`clippy` catch style and lint regressions that will fail CI. Never claim a change is complete based on a subset — CI runs all of them and will red-flag anything skipped locally.
 
 If a gate fails on something unrelated to the current change (e.g. a newly-reported advisory on a transitive dep), fix it or add a targeted ignore with a rationale in `deny.toml`. Never bypass with `--no-verify`, `allow(...)` blanket suppressions, or by deleting the failing test — the gate is there to catch real drift and suppressing it silently accrues debt.
 
 ## Workspace shape
 
-Two crates, enforced by ADR 0001:
+Two crates:
 
-- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine, config, telemetry. The binary's `clap` and `tokio` dependencies do NOT live here.
+- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine. The binary's `clap` dependency does NOT live here; `tokio` is used with an explicit, minimal feature list.
 - `crates/orno-cli/` — binary (`orno`). Subcommand dispatch, output formatting, clap derive. Depends on `orno-core` only.
 
 Do not split further without a concrete consumer or a build-parallelism justification.
@@ -71,39 +69,35 @@ Do not split further without a concrete consumer or a build-parallelism justific
 
 Seven traits constrain the architecture. Every executor path routes through one of these; nothing side-steps them. Additions are append-only.
 
-**Existing in the skeleton:**
+1. **`LlmTransport`** (`orno-core/src/llm/mod.rs`) — every LLM call. Concrete impl wraps `genai`; record/replay lands as a decorator. Do NOT expose `genai` types on orno's public surface.
+2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins would arrive as a `transport:` axis on the existing kinds, not as a new node kind.
+3. **`EventSink`** (`orno-core/src/events/sink.rs`) — every lifecycle event. Implemented by `InMemorySink` (tests, snapshots) and `StreamingSink` (NDJSON on stdout); a new sink plugs in without scheduler changes.
+4. **`EventEnvelope { schema_version, seq, timestamp, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format. `timestamp` is RFC 3339 UTC; `seq` stays the strict-ordering key for replay. `Event::NodeSkipped` is part of the wire format; its `reason` field is a `#[non_exhaustive]` `SkipReason` enum. `Event::NodeFinished` carries `failure: Option<NodeFailure>` populated exactly when `ok: false`; `NodeFailure` is `#[non_exhaustive]` and discriminates `NoExecutorRegistered`, `TemplateRenderFailed`, `ExecutorError`, `IterationLimitExceeded`, `BudgetExceeded`, `ToolDenied`, `TimedOut { limit_secs, stderr_tail }` (`stderr_tail` set for shell nodes), and `NodePayloadFailure { exit_code, signal, stderr_tail }` (`signal` is set when a Unix process was killed by a signal, and `exit_code` is then `None`) — eight kinds in all. On failed or timed-out shell nodes, `Engine` also records `resp.output` into `Context.nodes.<id>` so downstream templates can read the unbounded `stderr` / `exit_code`. `Event::LlmRequestFailed { failure: LlmFailure }` pairs every dangling `LlmRequestStarted` on a transport failure; `LlmFailure` is `#[non_exhaustive]` with typed variants (`AuthFailed`, `RateLimited`, `ModelNotFound`, `ApiError { status, body_excerpt }`, `Transport`, `ConfigError`, `ParseError`, `ReplayMiss`, `Other`). `Event::RunFinished` carries `failed_nodes: Vec<String>` and `skipped_nodes: Vec<String>` aggregates in causal order so a tail-line read of the stream summarizes the failure footprint without folding.
 
-1. **`LlmTransport`** (`orno-core/src/llm/mod.rs`) — every LLM call. Concrete impl wraps `genai` (ADR 0002); record/replay lands as a decorator. Do NOT expose `genai` types on orno's public surface.
-2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds (ADR 0017 §3 supersedes the earlier `NodeKind::External` stub from ADR 0004).
-3. **`EventSink`** (`orno-core/src/events/sink.rs`) — every lifecycle event. `InMemorySink` today; feature-gated `SqliteSink` plugs in without scheduler changes.
-4. **`EventEnvelope { schema_version, seq, timestamp, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format. `timestamp` is RFC 3339 UTC (ADR 0018); `seq` stays the strict-ordering key for replay. `Event::NodeSkipped` is part of the wire format; its `reason` field is a `#[non_exhaustive]` `SkipReason` enum (ADR 0021). `Event::NodeFinished` carries `failure: Option<NodeFailure>` populated exactly when `ok: false`; `NodeFailure` is `#[non_exhaustive]` and discriminates `NoExecutorRegistered`, `TemplateRenderFailed`, `ExecutorError`, `NodePayloadFailure { exit_code, stderr_tail }` (ADR 0022). On failed shell nodes, `Engine` also records `resp.output` into `Context.nodes.<id>` so downstream templates can read the unbounded `stderr` / `exit_code`. `Event::LlmRequestFailed { failure: LlmFailure }` pairs every dangling `LlmRequestStarted` on a transport failure; `LlmFailure` is `#[non_exhaustive]` with typed variants (`AuthFailed`, `RateLimited`, `ModelNotFound`, `ApiError { status, body_excerpt }`, `Transport`, `ConfigError`, `ParseError`, `ReplayMiss`, `Other`). `Event::RunFinished` carries `failed_nodes: Vec<String>` and `skipped_nodes: Vec<String>` aggregates in causal order so a tail-line read of the stream summarizes the failure footprint without folding (ADR 0023).
-
-**Planned by ADRs 0005–0008, not yet implemented:**
-
-5. **`Agent`** — agent-loop trait; `LoopAgent` implements ADR 0005's five strictness dimensions.
-6. **`ToolHandler`** — one impl per builtin tool (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`) plus `SubagentHandler` (ADR 0006) and `McpHandler` (ADR 0007). See ADR 0008 for the fixed tool set.
-7. **`McpClient`** — MCP protocol client. Wraps `rmcp` (ADR 0007); swap without touching tool dispatch.
+5. **`Agent`** — agent-loop trait; `LoopAgent` implements the five strictness dimensions.
+6. **`ToolHandler`** — one impl per builtin tool (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`) plus `SubagentHandler` and `McpHandler`.
+7. **`McpClient`** — MCP protocol client. Wraps `rmcp`; swap without touching tool dispatch.
 
 ## The five strictness dimensions
 
-Every `agent` node enforces these at runtime (ADR 0005). They are user-facing guarantees, not internal knobs:
+Every `agent` node enforces these at runtime. They are user-facing guarantees, not internal knobs:
 
 1. **Bounded iteration** — `max_iterations` mandatory; overrun → `IterationLimitExceeded` → terminate.
 2. **Bounded tool surface** — only explicitly-listed builtins + MCP tools are callable. Unknown tool → `UnknownToolCalled` → terminate.
-3. **Bounded effects** — `allow_mutations` + `allow_network` booleans plus `allowed_domains` / `blocked_domains`. Each tool has a declared effect class (ADR 0008 table).
-4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`, `max_tool_output_bytes`. Breach of the first two → `BudgetExceeded { kind }` → terminate. Per-call tool output that exceeds `max_tool_output_bytes` (default 256 KiB) is head-truncated with an ellipsis marker before it lands in the conversation history — the loop does not terminate, but the next LLM turn sees a bounded payload. Wall-clock is handled separately by the universal node-level `timeout:` attribute (ADR 0017) which emits `NodeTimedOut` and applies to every kind, not only agents. Token budget enforcement depends on the provider returning a `usage` block; when usage is omitted the loop emits a `tracing::warn` per response — the cap is intrinsically degraded for that response since there are no tokens to charge against the budget. `kind: shell` nodes have a separate per-stream cap, `EngineConfig.max_node_output_bytes` (default 8 MiB, exposed as `--max-node-output-bytes`), enforced by the `ShellExecutor` itself: stdout and stderr are streamed concurrently in 16 KiB chunks, the captured prefix is retained, the child keeps running so it does not block on a full pipe buffer, and an `Event::NodeOutputTruncated { stream, captured_bytes, cap_bytes }` is emitted per overflowed stream. Truncation walks back to the nearest UTF-8 lead byte so the captured slice stays valid UTF-8 even when the child wrote a multi-byte character across the boundary.
+3. **Bounded effects** — `allow_mutations` + `allow_network` booleans plus `allowed_domains` / `blocked_domains`. Each tool has a declared effect class.
+4. **Bounded resources** — `max_total_tokens`, `max_tool_calls`, `max_tool_output_bytes`. Breach of the first two → `BudgetExceeded { kind }` → terminate. Per-call tool output that exceeds `max_tool_output_bytes` (default 256 KiB) is head-truncated with an ellipsis marker before it lands in the conversation history — the loop does not terminate, but the next LLM turn sees a bounded payload. Wall-clock is handled separately by the universal node-level `timeout:` attribute which emits `NodeTimedOut` and applies to every kind, not only agents. Token budget enforcement depends on the provider returning a `usage` block; when usage is omitted the loop emits a `tracing::warn` per response — the cap is intrinsically degraded for that response since there are no tokens to charge against the budget. `kind: shell` nodes have a separate per-stream cap, `EngineConfig.max_node_output_bytes` (default 8 MiB, exposed as `--max-node-output-bytes`), enforced by the `ShellExecutor` itself: stdout and stderr are streamed concurrently in 16 KiB chunks, the captured prefix is retained, the child keeps running so it does not block on a full pipe buffer, and an `Event::NodeOutputTruncated { stream, total_bytes, cap_bytes }` is emitted per overflowed stream. Truncation walks back to the nearest UTF-8 lead byte so the captured slice stays valid UTF-8 even when the child wrote a multi-byte character across the boundary.
 5. **Bounded non-determinism** — every LLM request and tool call recorded; replay reproduces bit-for-bit.
 
 Parallel tool calls are executed **serially** in declaration order. Parallelism is a DAG-level concern, not an agent-internal one.
 
 ## Pipeline wire format
 
-User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.1.0 target):
+User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.3.0):
 
 - `version: u32` — schema version.
 - `vars: Map<String, Value>` — template variables (MiniJinja).
 - `agents: Map<String, AgentConfig>` — named agent configurations.
-- `mcp_servers: Map<String, McpServerConfig>` — MCP servers spawned at run start, shut down at run end (ADR 0007).
+- `mcp_servers: Map<String, McpServerConfig>` — MCP servers spawned at run start, shut down at run end.
 - `nodes: [Node]` — the DAG.
 
 Two distinct serde tag conventions are intentional:
@@ -111,16 +105,16 @@ Two distinct serde tag conventions are intentional:
 - `Event` uses `#[serde(tag = "type")]` — lifecycle events.
 - `NodeKind` / `NodeRequest` use `#[serde(tag = "kind")]` — pipeline node discriminator.
 
-Both are `#[non_exhaustive]`. v0.1.0 node kinds are `agent` and `shell` (ADR 0009 collapsed `llm` into `agent`; ADR 0017 §1 removed the former `external` variant entirely — it returns post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind). `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
+Both are `#[non_exhaustive]`. v0.3.0 node kinds are `agent` and `shell`. `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
 
-Execution model: `Engine::run` drives a generator-style `DagWalker` (`execution::walker`) over the pipeline's DAG, dispatches each ready node through `NodeRegistry::get(kind_str).execute(id, req)` against a per-node `Context` (`execution::context`), and on node failure emits `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` for every transitively-dependent node (ADR 0021). Disjoint branches keep running.
+Execution model: `Engine::run` drives a generator-style `DagWalker` (`execution::walker`) over the pipeline's DAG, dispatches each ready node through `NodeRegistry::get(kind_str).execute(id, req)` against a per-node `Context` (`execution::context`), and on node failure emits `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` for every transitively-dependent node. Disjoint branches keep running.
 
 Stream separation in `orno run`:
 
 - **stdout**: `EventEnvelope` NDJSON (consumed by downstream tools).
 - **stderr**: `tracing` JSON logs (consumed by log pipelines).
 
-Do not cross the streams. `init_tracing` in `orno-cli/src/main.rs` enforces the split. Both streams use the same RFC 3339 UTC timestamp format so a run's stdout and stderr are trivially joinable on wall clock (ADR 0018).
+Do not cross the streams. `init_tracing` in `orno-cli/src/main.rs` enforces the split. Both streams use the same RFC 3339 UTC timestamp format so a run's stdout and stderr are trivially joinable on wall clock.
 
 ## Dependency discipline
 
@@ -128,8 +122,8 @@ Set on day 1, must be preserved:
 
 - `default-features = false` on `reqwest`, `tokio`, `tracing-subscriber`, `minijinja`. Feature lists are enumerated explicitly in root `Cargo.toml` under `[workspace.dependencies]`. Do not add `tokio` with `features = ["full"]`.
 - YAML parser: **`serde_yaml_ng`** only. `serde_yaml` is archived; `serde_yml` carries RUSTSEC-2025-0068 and must never enter the tree.
-- LLM stack: `genai` (ADR 0002), accessed only through `LlmTransport`.
-- MCP stack: `rmcp` (ADR 0007), accessed only through `McpClient`.
+- LLM stack: `genai`, accessed only through `LlmTransport`.
+- MCP stack: `rmcp`, accessed only through `McpClient`.
 - `unsafe_code = "forbid"` at the crate level in both crates.
 - **MSRV policy.** `rust-version` in the root `Cargo.toml` must match `rust-toolchain.toml`'s `channel`. Bumping one requires bumping the other in the same commit. Current MSRV: 1.95.
 
@@ -147,7 +141,7 @@ Use `#[error(transparent)]` on pass-through variants that wrap a foreign error (
 - **`#[non_exhaustive]` on every public enum.** Already on `Event`, `NodeKind`, `NodeRequest`, and each error enum. Adding a variant must stay non-breaking. Internal-only enums may skip it; enums reachable through serde or the public API must carry it.
 - **Map-shaped variants only on tag-serialized enums.** Serde internal tagging (`tag = "type"`, `tag = "kind"`) needs each variant to serialize as a map. Named-field struct variants (`RunStarted { run_id }`) and newtype variants wrapping a struct (`Agent(AgentNode)`) both qualify; plain multi-field tuple variants do not. `Event` uses the first form, `NodeKind` / `NodeRequest` use the second.
 - **Borrow in parameters, own in fields.** `&str` / `&Path` in function signatures, `String` / `PathBuf` in storage. Tool-handler return types are the exception: they own their output strings because they cross async boundaries.
-- **Keep transport-library types off the public surface.** `genai::*` and `rmcp::*` live behind `LlmTransport` and `McpClient`. If a helper needs them, make it `pub(crate)` and translate at the trait boundary. This is the load-bearing rule behind ADRs 0002 and 0007 — breaking it forces every downstream crate to track `genai`/`rmcp` versions.
+- **Keep transport-library types off the public surface.** `genai::*` and `rmcp::*` live behind `LlmTransport` and `McpClient`. If a helper needs them, make it `pub(crate)` and translate at the trait boundary. This is the load-bearing rule behind the transport seams — breaking it forces every downstream crate to track `genai`/`rmcp` versions.
 - **Traits live in files separate from their non-trivial implementations.** A trait file holds the contract plus the request/response types at its boundary. Concrete impls with real logic go in sibling files (`llm/dummy.rs`, `events/in_memory_sink.rs`). Zero-logic placeholders — `NoopEnforcer`-style impls whose methods return `Ok(())` or are empty — may stay alongside the trait because reading them does not distract from the contract. Re-export the moved type from the parent `mod.rs` so consumer paths don't break.
 - **`#[must_use]` on constructors returning `Result`** and on builder methods that consume state. Catches silently-dropped errors and half-built configs at compile time.
 
@@ -167,7 +161,7 @@ Stream discipline is already fixed: stdout = NDJSON events, stderr = tracing JSO
 
 - **WHY, never WHAT.** If a block needs a narrator, rename the function instead.
 - **`pub` items in `orno-core` carry a doc comment, either item-level `///` or a module-level `//!` that covers them.** When a module has a single dominant symbol (e.g. `pipeline::template::TemplateEngine`), the `//!` header is enough; when a file exposes multiple distinct symbols, each gets its own `///`. Trait-method doc comments describe the contract (preconditions, postconditions, panics); implementation notes belong inside the method body.
-- **No TODO comments in committed code.** Open an issue or add to `docs/roadmap.md`. A rare exception takes the form `// TODO(user, 2026-Q?): <concrete removal trigger>`.
+- **No TODO comments in committed code.** Open an issue. A rare exception takes the form `// TODO(user, 2026-Q?): <concrete removal trigger>`.
 - **No section-header comments.** If a file wants `// === parsing ===` dividers, it wants splitting instead.
 - **No autobiographical comments.** `// added to fix bug #47`, `// this used to use X`, `// refactored from the old module` — all of these belong in commit messages, not source.
 
@@ -180,7 +174,7 @@ Workspace lints live in root `Cargo.toml`'s `[workspace.lints.rust]` and `[works
 ## Testing patterns
 
 - **CLI integration tests use `assert_cmd` + `predicates`.** They live in `crates/orno-cli/tests/` and invoke `orno` as a subprocess. `tests/cli.rs` is the template — copy its pattern rather than starting a parallel one.
-- **Event-stream assertions use `insta` YAML snapshots.** Snapshots contain `run_<ULID>` ids (ADR 0019) and RFC 3339 timestamps (ADR 0018); redact with `insta::with_settings! { filters => vec![(regex, replacement)] }` alongside the test. The run_id redaction regex is `run_[0-9A-HJKMNP-TV-Z]{26}`; the timestamp regex matches the RFC 3339 form. Snapshots now also contain `node_skipped` envelopes (ADR 0021); `reason.upstream` is the originating failure, not the direct parent. Keep redactions next to the test, not in a shared helper — it makes the snapshot self-describing.
+- **Event-stream assertions use `insta` YAML snapshots.** Snapshots contain `run_<ULID>` ids and RFC 3339 timestamps; redact with `insta::with_settings! { filters => vec![(regex, replacement)] }` alongside the test. The run_id redaction regex is `run_[0-9A-HJKMNP-TV-Z]{26}`; the timestamp regex matches the RFC 3339 form. Snapshots now also contain `node_skipped` envelopes; `reason.upstream` is the originating failure, not the direct parent. Keep redactions next to the test, not in a shared helper — it makes the snapshot self-describing.
 - **Parametric tests use `rstest`.** Each strictness dimension (iteration limit, unknown tool, mutation denied, network denied, budget exceeded) lands as an `#[rstest]` + `#[case]` table. Async cases combine `#[rstest]` with `#[tokio::test]` and mark fixture args with `#[future]`.
 - **Hand-rolled fakes, not `mockall`.** The seam count is small enough that a fake struct in a `mod tests` block is clearer than derived mocks. `mockall` adds proc-macro latency and obscures intent.
 - **One test per terminal `AgentError` variant.** Every strictness dimension must have at least one test that asserts termination with the exact expected variant. The loop's contract is "bounded" — only a test that checks the bound actually proves it.
@@ -189,4 +183,4 @@ Workspace lints live in root `Cargo.toml`'s `[workspace.lints.rust]` and `[works
 
 ## YAML spec
 
-- `docs/yaml-spec.md` — full v0.1.0 user-facing YAML shape. Examples in `examples/` conform to this shape (not to the current skeleton, which implements a subset).
+- `docs/reference/pipeline-yaml.md` — user-facing YAML reference. Examples in `examples/` conform to it; `schemas/pipeline.schema.json` is the generated source of truth.

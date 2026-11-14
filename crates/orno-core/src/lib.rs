@@ -1,8 +1,7 @@
 //! `orno-core` — library surface for the orno orchestrator.
 //!
-//! The trait seams that the evolution path depends on all live in this
-//! crate and are exercised (with dummy implementations) from the skeleton
-//! onward.
+//! Every trait seam (`LlmTransport`, `NodeExecutor`, `EventSink`, `Agent`,
+//! `ToolHandler`, `McpClient`) lives in this crate.
 
 // Crate-level allows: these lints are correct for specific design decisions
 // in orno-core and are allowed here rather than inline to keep the lint
@@ -12,7 +11,6 @@
 #![allow(clippy::unnecessary_literal_bound)] // dynamic ToolHandler::name() lifetime bound
 
 pub mod agent;
-pub mod config;
 pub mod error;
 pub mod events;
 pub mod execution;
@@ -21,11 +19,12 @@ pub mod mcp;
 pub mod node;
 pub mod pipeline;
 pub mod plan;
-pub mod telemetry;
 pub mod tool;
 pub mod util;
 
-pub use error::{AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, ToolError};
+pub use error::{
+    AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, RecoverableKind, ToolError,
+};
 
 /// Render the pipeline JSON Schema as a pretty-printed string. Used by the
 /// `orno schema` subcommand; IDEs can reference the committed file via a

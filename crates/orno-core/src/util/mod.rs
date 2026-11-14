@@ -1,29 +1,14 @@
 //! Small utilities used by more than one subsystem and not large enough
 //! to warrant their own module.
 
+pub(crate) mod child_guard;
 pub mod tape;
 
-pub use tape::{TapeReader, TapeWriter};
+pub use tape::{DuplicateTapeEntry, SeqCounter, TapeFile, TapeIndex, read_tape};
 
-/// Serialize a `serde_json::Value` with object keys in alphabetic order
-/// at every nesting level. Arrays preserve their element order; scalars
-/// are written via `serde_json::to_string` so escaping matches the
-/// canonical JSON profile (UTF-8, `\uXXXX` for control chars).
-///
-/// # Why this exists
-///
-/// Tape-key derivation in [`crate::llm::replay`] and
-/// [`crate::tool::record`] hashes the request payload to derive a
-/// stable replay key. Nested JSON objects in the payload — for example
-/// tool argument schemas produced by `schemars` — are not guaranteed
-/// to emit keys in the same order across crate versions. Without a
-/// canonical form a `schemars` minor bump silently invalidates every
-/// existing tape with no migration path. Sorting keys at the
-/// canonicalization step pins the hash input to the value's content,
-/// not its serialization accident.
-///
-/// The function is infallible because every leaf path is either an
-/// infallible scalar serialization or a recursive descent.
+/// Serialize a `serde_json::Value` with object keys sorted at every level.
+/// Tape keys hash this form, so a `schemars` bump that reorders tool-schema
+/// keys cannot invalidate recorded tapes.
 #[must_use]
 pub fn canonical_json(value: &serde_json::Value) -> String {
     let mut out = String::new();

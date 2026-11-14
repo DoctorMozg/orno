@@ -1,6 +1,7 @@
 //! Error hierarchy. One enum per subsystem, `#[source]` for chaining,
 //! `#[from]` only where the conversion is unambiguous.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -52,9 +53,8 @@ pub enum PipelineError {
     InvalidGraph { reason: String },
 
     /// An agent node referenced a name missing from `Pipeline.agents`.
-    /// Raised during dispatch, not at load time — `validate()` does not
-    /// yet cross-check node → agent references (that is Phase 7 work on
-    /// the full `orno validate` policy surface per `docs/roadmap.md`).
+    /// `validate()` rejects this at load time; the render path reports it
+    /// too, for pipelines built in code without going through `validate()`.
     #[error("node references unknown agent `{name}`")]
     UnknownAgent { name: String },
 }
@@ -62,19 +62,8 @@ pub enum PipelineError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NodeError {
-    #[error("node `{id}` kind `{kind}` is not registered")]
-    UnknownKind { id: String, kind: String },
-
     #[error("node `{id}` is not implemented yet (skeleton stub)")]
     NotImplemented { id: String },
-
-    /// Raised when a `kind: agent` node carries a configuration that
-    /// Phase 4 cannot honor yet — e.g. a non-empty `allowed_tools`
-    /// (tools land in Phase 5) or `max_iterations > 1` (the loop body
-    /// also lands in Phase 5). Fails fast rather than silently
-    /// ignoring the declared policy.
-    #[error("node `{id}` uses feature `{feature}` not yet supported")]
-    UnsupportedYet { id: String, feature: String },
 
     #[error("node `{id}` failed")]
     Execution {
@@ -92,7 +81,7 @@ pub enum NodeError {
 }
 
 /// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Carries
-/// the variants enforced by the strictness contract: `PolicyInvalid`,
+/// the variants enforced by the strictness contract: `InvalidPolicy`,
 /// `IterationLimitExceeded`, `UnknownToolCalled`, `BudgetExceeded`, and
 /// `ParseFailed`.
 #[derive(Debug, Error)]
@@ -103,13 +92,6 @@ pub enum AgentError {
     /// configuration error rather than a mid-run transport failure.
     #[error("invalid agent policy: {0}")]
     InvalidPolicy(String),
-
-    /// A policy feature is declared but not yet honored in this phase
-    /// (e.g. non-empty `allowed_tools` before Phase 5 wires tool
-    /// handlers). Fails fast so strict pipelines never silently lose
-    /// policy.
-    #[error("agent uses feature `{0}` not yet supported")]
-    UnsupportedYet(String),
 
     /// Agent exhausted `max_iterations` without reaching a `stop`
     /// finish reason.
@@ -128,16 +110,13 @@ pub enum AgentError {
     #[error("agent exceeded budget: {kind:?}")]
     BudgetExceeded { kind: crate::events::BudgetKind },
 
-    /// Subagent recursion exceeded `max_subagent_depth`.
-    #[error("subagent depth exceeded ({max})")]
-    SubagentDepthExceeded { max: u32 },
-
     /// A tool's arguments failed to parse and `on_parse_error: fail`
     /// was set.
     #[error("tool `{tool}` arguments failed to parse: {error}")]
     ParseFailed { tool: String, error: String },
 
-    /// A tool handler returned an error. `name` is the tool name for
+    /// A tool handler returned a terminal error (see
+    /// [`ToolError::is_recoverable`]). `name` is the tool name for
     /// context; `source` is the underlying `ToolError`.
     #[error("tool `{name}` failed")]
     Tool {
@@ -155,9 +134,6 @@ pub enum AgentError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LlmError {
-    #[error("LLM transport is not wired yet (skeleton stub)")]
-    NotImplemented,
-
     #[error("LLM request rejected: {0}")]
     Rejected(String),
 
@@ -251,17 +227,38 @@ pub enum McpError {
         message: String,
     },
 
-    #[error("MCP server `{server}` crashed mid-run")]
-    ServerCrashed { server: String },
-
     #[error("MCP transport `{transport}` is not supported in this build")]
     UnsupportedTransport { transport: String },
+}
 
-    #[error("MCP server `{server}` shutdown timed out after {secs}s")]
-    ShutdownTimeout { server: String, secs: u64 },
+/// Why a tool run failed in a way the model can act on. Matched on by
+/// the tape and by tests; the human-readable detail lives in the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RecoverableKind {
+    /// A path the model named does not exist.
+    NotFound,
+    /// A file exists but its content cannot be used as asked (not UTF-8).
+    InvalidData,
+    /// The tool hit its own time limit.
+    Timeout,
+    /// An edit's `old_string` matched zero or several places in the file.
+    NoMatch,
+    /// An external tool ran and reported a failure (MCP `isError: true`).
+    ToolReported,
+}
 
-    #[error("MCP server `{server}` does not advertise tool `{tool}`")]
-    UnknownTool { server: String, tool: String },
+impl std::fmt::Display for RecoverableKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "not_found",
+            Self::InvalidData => "invalid_data",
+            Self::Timeout => "timeout",
+            Self::NoMatch => "no_match",
+            Self::ToolReported => "tool_reported",
+        })
+    }
 }
 
 /// Errors surfaced from [`crate::tool::ToolHandler::invoke`].
@@ -270,6 +267,16 @@ pub enum McpError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ToolError {
+    /// The tool ran and failed in a way the model can react to (missing
+    /// file, timeout, tool-reported error). The agent loop feeds
+    /// `message` back as a tool result instead of terminating.
+    #[error("tool `{name}` failed ({kind}): {message}")]
+    Recoverable {
+        name: String,
+        kind: RecoverableKind,
+        message: String,
+    },
+
     /// The underlying I/O or API call failed. `source` carries the
     /// original error chain.
     #[error("tool `{name}` invocation failed")]
@@ -286,10 +293,9 @@ pub enum ToolError {
 
     /// A `SetState` call would push the serialized size of
     /// `nodes.<self>.state` past `EngineConfig.max_output_bytes`. The
-    /// write is rejected and the previous state is left intact. ADR
-    /// 0025 §5 — shared cap with stderr tails, API body excerpts, and
-    /// prompt/response excerpts so one knob governs every
-    /// wire-emitted value.
+    /// write is rejected and the previous state is left intact. The cap
+    /// is shared with stderr tails and API body excerpts so one knob
+    /// governs every wire-emitted value.
     #[error("tool `{name}` write rejected: state size {bytes} exceeds cap {cap}")]
     StateTooLarge {
         name: String,
@@ -297,8 +303,7 @@ pub enum ToolError {
         cap: usize,
     },
 
-    /// This handler is not yet wired (stub). Indicates a Phase 5+
-    /// feature that the caller declared but has not been implemented.
+    /// The caller declared a feature this handler does not implement yet.
     #[error("tool `{name}` not implemented yet: {feature}")]
     NotImplemented { name: String, feature: String },
 
@@ -309,4 +314,37 @@ pub enum ToolError {
     /// root-jail when the requested path escapes the configured roots.
     #[error("tool access denied: {reason}")]
     Denied { reason: String },
+}
+
+impl ToolError {
+    /// True when the agent loop should show the failure to the model and
+    /// continue. Jail and policy violations, oversize state and internal
+    /// invocation failures stay terminal.
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Recoverable { .. } | Self::NotImplemented { .. })
+    }
+
+    /// Wrap an I/O failure, classifying the kinds the model can fix by
+    /// changing its request. `context` names the path or command.
+    #[must_use]
+    pub fn from_io(name: &str, context: &str, err: std::io::Error) -> Self {
+        let kind = match err.kind() {
+            std::io::ErrorKind::NotFound => Some(RecoverableKind::NotFound),
+            std::io::ErrorKind::InvalidData => Some(RecoverableKind::InvalidData),
+            std::io::ErrorKind::TimedOut => Some(RecoverableKind::Timeout),
+            _ => None,
+        };
+        match kind {
+            Some(kind) => Self::Recoverable {
+                name: name.to_string(),
+                kind,
+                message: format!("{context}: {err}"),
+            },
+            None => Self::Invocation {
+                name: name.to_string(),
+                source: Box::new(err),
+            },
+        }
+    }
 }

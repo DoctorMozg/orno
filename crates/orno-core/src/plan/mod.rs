@@ -15,8 +15,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::PipelineError;
-use crate::execution::walker::DagWalker;
 use crate::pipeline::Pipeline;
+use crate::pipeline::load::validate;
 use crate::pipeline::schema::NodeKind;
 
 /// Per-node static preview. Captures everything a reviewer needs to
@@ -83,22 +83,19 @@ pub enum PlanOutput {
 /// values: one [`PlanNode`] per node in source order, then one
 /// [`PlanSummary`].
 ///
-/// DAG validation runs through [`DagWalker::new`] before any record is
-/// produced — a cyclic graph or an unknown `needs:` target returns
-/// `Err(PipelineError::InvalidGraph)` and the caller surfaces a non-zero
-/// exit code at the CLI layer.
-///
-/// Agent nodes that reference an undeclared agent name (a load-time
-/// validator gap) still emit a [`PlanNode`] with the agent-only fields
-/// left as `None` / empty, so the preview surfaces the missing reference
-/// rather than swallowing the node.
+/// Full pipeline validation runs before any record is produced — a cyclic
+/// graph or an unknown `needs:` target returns
+/// `Err(PipelineError::InvalidGraph)`, any other violation (such as an
+/// undeclared agent) `Err(PipelineError::Validation)`, and the caller
+/// surfaces a non-zero exit code at the CLI layer.
 ///
 /// # Errors
 ///
 /// Returns [`PipelineError::InvalidGraph`] when the DAG cannot be walked
-/// (cycle, unknown `needs:` target).
+/// (cycle, unknown `needs:` target) and [`PipelineError::Validation`] for
+/// every other validation failure.
 pub fn plan_pipeline(pipeline: &Pipeline) -> Result<Vec<PlanOutput>, PipelineError> {
-    DagWalker::new(pipeline)?;
+    validate(pipeline)?;
 
     let mut outputs: Vec<PlanOutput> = Vec::with_capacity(pipeline.nodes.len() + 1);
     let mut totals = BudgetTotals::default();
@@ -108,15 +105,13 @@ pub fn plan_pipeline(pipeline: &Pipeline) -> Result<Vec<PlanOutput>, PipelineErr
             NodeKind::Agent(agent_node) => {
                 totals.agent_nodes += 1;
                 totals.agents_used.push(agent_node.agent.clone());
-                let config = pipeline.agents.get(&agent_node.agent);
-                if let Some(cfg) = config {
-                    totals.max_iterations_total += u64::from(cfg.policy.max_iterations);
-                    totals.max_tokens_total = totals
-                        .max_tokens_total
-                        .saturating_add(cfg.policy.max_total_tokens);
-                    totals.max_tool_calls_total += u64::from(cfg.policy.max_tool_calls);
-                }
-                build_agent_plan_node(node, agent_node, config)
+                let cfg = &pipeline.agents[&agent_node.agent];
+                totals.max_iterations_total += u64::from(cfg.policy.max_iterations);
+                totals.max_tokens_total = totals
+                    .max_tokens_total
+                    .saturating_add(cfg.policy.max_total_tokens);
+                totals.max_tool_calls_total += u64::from(cfg.policy.max_tool_calls);
+                build_agent_plan_node(node, agent_node, cfg)
             },
             NodeKind::Shell(_) => {
                 totals.shell_nodes += 1;
@@ -161,7 +156,7 @@ struct BudgetTotals {
 fn build_agent_plan_node(
     node: &crate::pipeline::Node,
     agent_node: &crate::pipeline::AgentNode,
-    config: Option<&crate::pipeline::AgentConfig>,
+    config: &crate::pipeline::AgentConfig,
 ) -> PlanNode {
     PlanNode {
         node_id: node.id.clone(),
@@ -169,21 +164,17 @@ fn build_agent_plan_node(
         depends_on: node.needs.clone(),
         timeout_secs: node.timeout,
         agent_name: Some(agent_node.agent.clone()),
-        model: config.map(|c| c.model.clone()),
-        provider: config.map(|c| c.provider.clone()),
-        tools: config.map(|c| c.allowed_tools.clone()).unwrap_or_default(),
-        max_iterations: config.map(|c| c.policy.max_iterations),
-        max_total_tokens: config.map(|c| c.policy.max_total_tokens),
-        max_tool_calls: config.map(|c| c.policy.max_tool_calls),
-        allow_mutations: config.map(|c| c.policy.allow_mutations),
-        allow_network: config.map(|c| c.policy.allow_network),
-        allow_context_writes: config.map(|c| c.policy.allow_context_writes),
-        allowed_domains: config
-            .map(|c| c.policy.allowed_domains.clone())
-            .unwrap_or_default(),
-        blocked_domains: config
-            .map(|c| c.policy.blocked_domains.clone())
-            .unwrap_or_default(),
+        model: Some(config.model.clone()),
+        provider: Some(config.provider.clone()),
+        tools: config.allowed_tools.clone(),
+        max_iterations: Some(config.policy.max_iterations),
+        max_total_tokens: Some(config.policy.max_total_tokens),
+        max_tool_calls: Some(config.policy.max_tool_calls),
+        allow_mutations: Some(config.policy.allow_mutations),
+        allow_network: Some(config.policy.allow_network),
+        allow_context_writes: Some(config.policy.allow_context_writes),
+        allowed_domains: config.policy.allowed_domains.clone(),
+        blocked_domains: config.policy.blocked_domains.clone(),
     }
 }
 
@@ -264,6 +255,7 @@ mod tests {
                 on_parse_error: OnParseError::Fail,
                 roots: Vec::new(),
                 max_message_history_bytes: None,
+                unconfined_shell: false,
             },
         }
     }

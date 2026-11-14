@@ -2,9 +2,8 @@
 //!
 //! `NodeRequest` and `NodeResponse` are the serde-tagged contracts that
 //! every node kind flows through. Built-in executors implement the same
-//! trait; the subprocess plugin transport (deferred past v0.1 per ADR
-//! 0017) will reuse the same wire format without reintroducing a
-//! sibling kind.
+//! trait; a future subprocess plugin transport would reuse the same wire
+//! format rather than add a sibling kind.
 
 pub mod agent;
 pub mod registry;
@@ -13,6 +12,9 @@ pub mod shell;
 pub use registry::NodeRegistry;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,7 +23,7 @@ use crate::error::{NodeError, PipelineError};
 use crate::execution::context::Context;
 use crate::pipeline::NodeKind;
 use crate::pipeline::schema::{AgentConfig, AgentPolicy};
-use crate::pipeline::template::TemplateEngine;
+use crate::pipeline::template::{RenderScope, TemplateEngine};
 
 /// Input to a node. `#[non_exhaustive]` so we can grow the variant list
 /// without breaking on-disk replays.
@@ -62,6 +64,11 @@ pub struct AgentNodeRequest {
     /// driving `LoopAgent`; an unknown name terminates the agent loop.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Template scope the node was rendered under; lets subagents render
+    /// their own `system` and `roots` the same way. Runtime handle, never
+    /// serialized.
+    #[serde(skip)]
+    pub render_scope: Option<RenderScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +86,10 @@ pub struct ShellNodeRequest {
     /// See `ShellNode::env` for the security rationale.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The node's `timeout:`, set by the scheduler so the executor can kill
+    /// the child itself and keep what it captured before the deadline.
+    #[serde(skip)]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,10 +116,12 @@ pub trait NodeExecutor: Send + Sync {
 /// template field rendered through `TemplateEngine` in `ctx`, and
 /// every agent-config field materialized from `agents`.
 ///
-/// Shell: renders `command` and every entry in `args`.
-/// Agent: renders `initial_prompt` and the agent's `system` prompt,
-/// then bundles provider, model, policy, and `allowed_tools` onto the
-/// request so the executor is self-contained at dispatch time.
+/// Shell: renders `command`, every entry in `args`, `stdin`, and every
+/// value in the `env` map (keys are not rendered — they are identifiers).
+/// Agent: renders `initial_prompt`, the agent's `system` prompt, and
+/// every entry in `policy.roots`, then bundles provider, model, policy,
+/// and `allowed_tools` onto the request so the executor is self-contained
+/// at dispatch time.
 ///
 /// Errors:
 /// - `PipelineError::UnknownAgent` if the node references a name not
@@ -116,7 +129,7 @@ pub trait NodeExecutor: Send + Sync {
 /// - `PipelineError::Template` if any field fails to render.
 pub fn render_request(
     kind: &NodeKind,
-    tmpl: &TemplateEngine,
+    tmpl: &Arc<TemplateEngine>,
     ctx: &Context,
     agents: &BTreeMap<String, AgentConfig>,
 ) -> Result<NodeRequest, PipelineError> {
@@ -128,20 +141,18 @@ pub fn render_request(
                 .ok_or_else(|| PipelineError::UnknownAgent {
                     name: n.agent.clone(),
                 })?;
-            let initial_prompt =
-                tmpl.render("agent.initial_prompt", &n.initial_prompt, &ctx_json)?;
-            let system = match cfg.system.as_deref() {
-                Some(s) => Some(tmpl.render("agent.system", s, &ctx_json)?),
-                None => None,
-            };
+            let scope = RenderScope::new(Arc::clone(tmpl), Arc::clone(&ctx_json));
+            let initial_prompt = scope.render("agent.initial_prompt", &n.initial_prompt)?;
+            let (system, policy) = render_agent_templates(cfg, &scope)?;
             Ok(NodeRequest::Agent(AgentNodeRequest {
                 agent: n.agent.clone(),
                 initial_prompt,
                 system,
                 provider: cfg.provider.clone(),
                 model: cfg.model.clone(),
-                policy: cfg.policy.clone(),
+                policy,
                 allowed_tools: cfg.allowed_tools.clone(),
+                render_scope: Some(scope),
             }))
         },
         NodeKind::Shell(n) => {
@@ -154,14 +165,45 @@ pub fn render_request(
                 Some(s) => Some(tmpl.render("shell.stdin", s, &ctx_json)?),
                 None => None,
             };
+            let mut env = BTreeMap::new();
+            for (k, v) in &n.env {
+                env.insert(
+                    k.clone(),
+                    tmpl.render(&format!("shell.env[{k}]"), v, &ctx_json)?,
+                );
+            }
             Ok(NodeRequest::Shell(ShellNodeRequest {
                 command,
                 args,
                 stdin,
-                env: n.env.clone(),
+                env,
+                timeout: None,
             }))
         },
     }
+}
+
+/// Render the templated parts of an agent config, `system` and
+/// `policy.roots`, against `scope`. Shared by node dispatch and subagent
+/// dispatch so parent and child resolve templates the same way.
+///
+/// Errors: `PipelineError::Template` if any field fails to render.
+pub fn render_agent_templates(
+    cfg: &AgentConfig,
+    scope: &RenderScope,
+) -> Result<(Option<String>, AgentPolicy), PipelineError> {
+    let system = cfg
+        .system
+        .as_deref()
+        .map(|s| scope.render("agent.system", s))
+        .transpose()?;
+    let mut policy = cfg.policy.clone();
+    for (i, root) in policy.roots.iter_mut().enumerate() {
+        let rendered =
+            scope.render(&format!("agent.policy.roots[{i}]"), &root.to_string_lossy())?;
+        *root = PathBuf::from(rendered);
+    }
+    Ok((system, policy))
 }
 
 /// Registry lookup key for a `NodeKind`. Matches the
@@ -197,6 +239,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            unconfined_shell: false,
         }
     }
 
@@ -233,7 +276,7 @@ mod tests {
             agent: "writer".into(),
             initial_prompt: "hi".into(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Agent(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
@@ -255,7 +298,7 @@ mod tests {
             agent: "missing".into(),
             initial_prompt: String::new(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let err =
@@ -275,7 +318,7 @@ mod tests {
             stdin: None,
             env: BTreeMap::new(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
@@ -297,12 +340,68 @@ mod tests {
             stdin: None,
             env: env.clone(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
             panic!("expected NodeRequest::Shell");
         };
         assert_eq!(req.env, env);
+    }
+
+    #[test]
+    fn render_request_renders_shell_env_values() {
+        let agents: BTreeMap<String, AgentConfig> = BTreeMap::new();
+        let mut env_template = BTreeMap::new();
+        env_template.insert("MY_VAR".to_string(), "{{ env.TOKEN }}".to_string());
+        let kind = NodeKind::Shell(ShellNode {
+            command: "true".into(),
+            args: Vec::new(),
+            stdin: None,
+            env: env_template,
+        });
+        let tmpl = Arc::new(TemplateEngine::new());
+        let mut env_ctx = BTreeMap::new();
+        env_ctx.insert("TOKEN".to_string(), "secret-value".to_string());
+        let ctx = Context::new(BTreeMap::new(), env_ctx, BTreeMap::new());
+
+        let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
+            panic!("expected NodeRequest::Shell");
+        };
+        assert_eq!(
+            req.env.get("MY_VAR").map(String::as_str),
+            Some("secret-value")
+        );
+    }
+
+    #[test]
+    fn render_request_renders_agent_roots() {
+        use serde_json::json;
+        let mut agents = BTreeMap::new();
+        let mut policy = default_policy();
+        policy.roots = vec![PathBuf::from("{{ vars.workspace }}")];
+        agents.insert(
+            "worker".to_string(),
+            AgentConfig {
+                model: "m".into(),
+                provider: "p".into(),
+                system: None,
+                allowed_tools: Vec::new(),
+                policy,
+            },
+        );
+        let kind = NodeKind::Agent(AgentNode {
+            agent: "worker".into(),
+            initial_prompt: String::new(),
+        });
+        let tmpl = Arc::new(TemplateEngine::new());
+        let mut vars = BTreeMap::new();
+        vars.insert("workspace".to_string(), json!("/home/runner/work"));
+        let ctx = Context::new(vars, BTreeMap::new(), BTreeMap::new());
+
+        let NodeRequest::Agent(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
+            panic!("expected NodeRequest::Agent");
+        };
+        assert_eq!(req.policy.roots, vec![PathBuf::from("/home/runner/work")]);
     }
 }

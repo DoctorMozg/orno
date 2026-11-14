@@ -1,8 +1,7 @@
 //! `Edit` tool — replace a unique substring in a file.
 //! Requires `allow_mutations`.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -10,9 +9,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
-use super::path_guard::jail_path;
+use super::fs_util::{atomic_write, run_blocking};
+use super::path_guard::jail_file;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
+use crate::error::{RecoverableKind, ToolError};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -59,9 +59,9 @@ impl ToolHandler for EditHandler {
         })?;
 
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
+            jail_file(root, &path).await?
         } else {
-            // BS1: fail closed when roots is empty — no boundary, no edit.
+            // Fail closed when roots is empty — no boundary, no edit.
             return Err(ToolError::Denied {
                 reason: "Edit tool requires a non-empty `roots` list; \
                          no jail boundary is configured for this agent"
@@ -69,58 +69,36 @@ impl ToolHandler for EditHandler {
             });
         };
 
-        let original = std::fs::read_to_string(&resolved).map_err(|e| ToolError::Invocation {
-            name: "Edit".to_string(),
-            source: Box::new(e),
-        })?;
+        let target = resolved.clone();
+        run_blocking("Edit", move || {
+            let original = std::fs::read_to_string(&target)
+                .map_err(|e| ToolError::from_io("Edit", &target.display().to_string(), e))?;
 
-        let occurrences = original.matches(&old_string).count();
-        if occurrences == 0 {
-            return Err(ToolError::InvalidArgs {
-                name: "Edit".to_string(),
-                message: format!("old_string not found in {}", resolved.display()),
-            });
-        }
-        if occurrences > 1 {
-            return Err(ToolError::InvalidArgs {
-                name: "Edit".to_string(),
-                message: format!(
-                    "old_string is not unique in {}: found {occurrences} occurrences",
-                    resolved.display(),
-                ),
-            });
-        }
+            let occurrences = original.matches(&old_string).count();
+            if occurrences == 0 {
+                return Err(ToolError::Recoverable {
+                    name: "Edit".to_string(),
+                    kind: RecoverableKind::NoMatch,
+                    message: format!("old_string not found in {}", target.display()),
+                });
+            }
+            if occurrences > 1 {
+                return Err(ToolError::Recoverable {
+                    name: "Edit".to_string(),
+                    kind: RecoverableKind::NoMatch,
+                    message: format!(
+                        "old_string is not unique in {}: found {occurrences} occurrences",
+                        target.display(),
+                    ),
+                });
+            }
 
-        let updated = original.replacen(&old_string, &new_string, 1);
+            let updated = original.replacen(&old_string, &new_string, 1);
+            atomic_write("Edit", &target, updated.as_bytes())
+        })
+        .await?;
 
-        // Atomic write: stage in a sibling temp file and rename onto
-        // the target. Same rationale as `Write` — avoids a half-written
-        // file on a crash and prevents another reader from observing
-        // an empty file mid-write.
-        let parent_dir = resolved.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp =
-            tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| ToolError::Invocation {
-                name: "Edit".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.as_file_mut()
-            .write_all(updated.as_bytes())
-            .map_err(|e| ToolError::Invocation {
-                name: "Edit".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|e| ToolError::Invocation {
-                name: "Edit".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.persist(&resolved).map_err(|e| ToolError::Invocation {
-            name: "Edit".to_string(),
-            source: Box::new(e.error),
-        })?;
-
-        debug!(file.path = %resolved.display(), call_id = %inv.call_id, "edited file");
+        debug!(file.path = %resolved.display(), tool.call_id = %inv.call_id, "edited file");
         Ok(format!(
             "Edited {} (replaced 1 occurrence)",
             resolved.display(),
@@ -181,14 +159,19 @@ mod tests {
             .expect_err("edit must fail when old_string absent");
 
         match err {
-            ToolError::InvalidArgs { name, message } => {
+            ToolError::Recoverable {
+                name,
+                kind,
+                message,
+            } => {
                 assert_eq!(name, "Edit");
+                assert_eq!(kind, RecoverableKind::NoMatch);
                 assert!(
                     message.contains("not found"),
                     "message should mention 'not found': {message}"
                 );
             },
-            other => panic!("expected InvalidArgs, got {other:?}"),
+            other => panic!("expected Recoverable, got {other:?}"),
         }
     }
 
@@ -213,14 +196,19 @@ mod tests {
             .expect_err("edit must fail when old_string is ambiguous");
 
         match err {
-            ToolError::InvalidArgs { name, message } => {
+            ToolError::Recoverable {
+                name,
+                kind,
+                message,
+            } => {
                 assert_eq!(name, "Edit");
+                assert_eq!(kind, RecoverableKind::NoMatch);
                 assert!(
                     message.contains("not unique") && message.contains('2'),
                     "message should mention uniqueness and count: {message}"
                 );
             },
-            other => panic!("expected InvalidArgs, got {other:?}"),
+            other => panic!("expected Recoverable, got {other:?}"),
         }
     }
 
@@ -279,5 +267,52 @@ mod tests {
             },
             other => panic!("expected InvalidArgs, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_keeps_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().expect("create tempdir");
+        let path = tmp.path().join("run.sh");
+        std::fs::write(&path, "echo old\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let roots = vec![tmp.path().to_path_buf()];
+
+        EditHandler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": "run.sh", "old_string": "old", "new_string": "new" }),
+            )
+            .await
+            .expect("edit succeeds");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo new\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rejects_fifo() {
+        let tmp = TempDir::new().expect("create tempdir");
+        let fifo = tmp.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let roots = vec![tmp.path().to_path_buf()];
+        let call = EditHandler.invoke(
+            ToolInvocation::for_test_with_roots("call-1", &roots),
+            json!({ "path": "pipe", "old_string": "a", "new_string": "b" }),
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("Edit must not block on a FIFO")
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
     }
 }

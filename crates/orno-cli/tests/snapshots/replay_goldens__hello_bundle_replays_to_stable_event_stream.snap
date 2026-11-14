@@ -1,12 +1,11 @@
 ---
 source: crates/orno-cli/tests/replay_goldens.rs
-assertion_line: 88
 expression: events
 ---
 - event:
     run_id: "[run_id]"
     type: run_started
-  schema_version: 3
+  schema_version: 4
   seq: 1
   timestamp: "[timestamp]"
 - event:
@@ -14,7 +13,7 @@ expression: events
     node_kind: agent
     run_id: "[run_id]"
     type: node_started
-  schema_version: 3
+  schema_version: 4
   seq: 2
   timestamp: "[timestamp]"
 - event:
@@ -23,7 +22,7 @@ expression: events
     node_kind: agent
     run_id: "[run_id]"
     type: agent_iteration_started
-  schema_version: 3
+  schema_version: 4
   seq: 3
   timestamp: "[timestamp]"
 - event:
@@ -34,7 +33,7 @@ expression: events
     run_id: "[run_id]"
     system_excerpt: You are friendly.
     type: llm_request_started
-  schema_version: 3
+  schema_version: 4
   seq: 4
   timestamp: "[timestamp]"
 - event:
@@ -47,7 +46,7 @@ expression: events
       completion_tokens: 0
       prompt_tokens: 0
       total_tokens: 0
-  schema_version: 3
+  schema_version: 4
   seq: 5
   timestamp: "[timestamp]"
 - event:
@@ -57,7 +56,7 @@ expression: events
     ok: true
     run_id: "[run_id]"
     type: node_finished
-  schema_version: 3
+  schema_version: 4
   seq: 6
   timestamp: "[timestamp]"
 - event:
@@ -66,6 +65,6 @@ expression: events
     run_id: "[run_id]"
     skipped_nodes: []
     type: run_finished
-  schema_version: 3
+  schema_version: 4
   seq: 7
   timestamp: "[timestamp]"

@@ -5,7 +5,202 @@ All notable changes to orno are recorded here. The format follows
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once the first tagged release ships.
 
-## Unreleased
+## 0.3.0 - 2026-11-15
+
+### Security
+
+- Redaction runs before truncation for node stderr/stdout tails and agent
+  tool output, so a secret cut by the size cap no longer leaks its tail.
+- The redactor also matches uppercase hex, unpadded base64, base64 of a
+  secret embedded at byte offset 1 or 2, percent-encoded and JSON-escaped
+  forms, and each long line of a multi-line secret; `redact_json` redacts
+  object keys too.
+- Provider API keys read from the process env (`OPENAI_API_KEY`, ...) are
+  redacted for the providers a pipeline uses, even when not declared under
+  `secrets:`.
+- `--record-bundle` scrubs every literal MCP `env` value, `headers` value
+  and `auth` token/password, not only HTTP bearer tokens.
+- `{{ secrets.* }}` / `{{ env.* }}` in `mcp_servers` (url, command, env,
+  headers, auth) are now rendered; before, the template text was sent
+  literally. A name listed in both `pass_env` and `secrets` fails
+  validation, and the `self-review` example moves `GH_TOKEN` to `secrets:`.
+- Dotenv parse errors and `-e` errors no longer echo the offending line,
+  and `Debug` output of MCP auth, `env` and `headers` config hides values.
+- `Read` / `Write` / `Edit` no longer follow a symlinked directory out
+  of the root when the target does not exist yet (`link/new.txt` with
+  `link -> /elsewhere`), and relative paths resolve against the root
+  instead of the process cwd.
+
+### Added
+
+- Optional per-server `call_timeout_secs` on `mcp_servers` entries
+  (default 30).
+- Each LLM request attempt is cut off after 5 minutes and surfaces as a
+  transport failure; a timed-out attempt is not retried.
+- A shell node that hits its `timeout:` keeps the output it captured:
+  `failure.stderr_tail` on the `timed_out` failure shows what it printed
+  last.
+
+### Changed
+
+- **Breaking:** the bundle and tape format is version 2. A bundle or
+  tape entry is `{key, seq, outcome}` instead of carrying the full
+  request, so files no longer grow quadratically with the conversation,
+  and a bundle gains a `run_inputs` line. `orno replay` refuses version 1
+  bundles and names both versions; re-record them. The reader also
+  insists on the header first, the trailer last, and exactly one
+  `pipeline_yaml` and `run_inputs`.
+- A missing provider API key is reported as a configuration error that
+  names the env var to set, instead of `AuthFailed`.
+- A recoverable tool failure (missing file, non-UTF-8 content, Bash or
+  WebFetch timeout, `Edit` with no or several matches, MCP `isError: true`)
+  is fed back to the model as an `error: ...` tool result and the loop
+  continues; a Bash timeout includes the partial output. Jail and policy
+  denials and internal failures still terminate the run.
+- `max_total_tokens` and `max_tool_calls` now cover the whole subagent
+  tree: grandchild spend counts against the root, and a child's tool
+  calls count against each ancestor. Iterations stay per loop.
+- **Breaking (wire):** `schema_version` is now `4`.
+  `node_output_truncated.captured_bytes` is renamed `total_bytes`
+  (it always held the total the child wrote), and `Event::BudgetExceeded`
+  stays removed; see `docs/reference/events.md`.
+- **Breaking:** an agent that lists `Bash` together with a non-empty
+  `allowed_domains` or `roots` now fails validation, because a shell
+  escapes both limits. Add `unconfined_shell: true` to the agent's
+  policy to accept that (the `commit-digest` and `flaky-test-triage`
+  examples do).
+- **Breaking:** unknown keys in a pipeline file are rejected with the key
+  and node id in the error (a typo like `need:` or
+  `blocked_domain:` used to be dropped silently). The JSON schema now
+  sets `additionalProperties: false`.
+- **Breaking:** node ids must match `[A-Za-z_][A-Za-z0-9_]*`, so
+  `nodes.<id>` is writable in templates. `timeout: 0` and an empty shell
+  `command` are rejected.
+- **Breaking:** `orno run`, `plan` and `replay` run the full validation
+  that only `orno validate` ran before (undeclared agents, unknown tools,
+  zero budgets, effect gates) and report every error at once, so a run
+  fails before its first node starts. `orno plan` exits non-zero on an
+  undeclared agent instead of printing a node for it.
+- Validation also compiles every template and checks that
+  `nodes.<id>` reads name a transitive `needs:` ancestor. Dependency
+  cycles are reported as `InvalidGraph` everywhere.
+- `policy.roots` entries and shell-node `env:` values are rendered
+  through the template engine, so `{{ vars.* }}` / `{{ env.* }}` work
+  there.
+- `orno run` emits `run_finished { ok: false }` when the DAG walker or
+  the `vars:` render fails before the first node, and engine errors no
+  longer skip MCP shutdown or tape flushing.
+- Ready nodes run in YAML source order among ties, as documented. The
+  walker used to pick the most recently unblocked node first, so `a`, `b`,
+  `c` (needs `a`) ran `a`, `c`, `b`.
+- `LlmRequest.provider`, `model`, `prompt` and `system` are `Arc<str>`, and
+  `LlmRequest::from_prompt` takes only provider, model and prompt. The
+  serialized request, and so the tape key, is unchanged.
+- `expand_mcp_wildcards` returns `()` instead of a `Result` that could not
+  fail.
+- `ReplayMcpStubHandler` moves from `tool::mcp_handler` to `tool::replay`
+  (still exported from `orno_core::tool`).
+- The `docs` CI job builds rustdoc with `-D warnings`.
+
+### Fixed
+
+- A secret in a prompt, a tool argument or a tool result no longer makes
+  `orno replay` miss the tape: entries are keyed on the request with
+  secrets masked, which is the form replay can rebuild.
+- Identical requests issued concurrently replay in call order; each
+  entry carries a per-key sequence number taken when the call started.
+- `--record-bundle` writes to a temporary file and renames it into place,
+  so a failed run leaves no partial bundle; a truncated bundle is
+  rejected instead of replayed with a warning.
+- `orno replay` works for pipelines that read `env.*` or `secrets.*` in
+  `vars` or in node templates: the bundle records the rendered `vars`,
+  the `env` values (redacted) and the secret names with masked values.
+- A replayed tool error keeps its class: a recoverable failure stays
+  recoverable with the same kind, and terminal errors stay terminal.
+- A tool-call turn keeps the text the model wrote beside the call, and a
+  404 only means "model not found" when the body mentions the model, so
+  a wrong `OLLAMA_HOST` shows up as an API error.
+- MCP call excerpts and `llm_request_failed` body excerpts are redacted
+  before truncation.
+- History eviction no longer leaves a `ToolResult` without its tool call
+  (providers answered 400); it drops whole turns once per turn, off a
+  running byte total instead of re-summing the history.
+- A subagent's `system` and `policy.roots` templates are rendered with the
+  parent node's context, and a rendered root outside the parent's roots
+  is rejected.
+- `..` in `policy.roots` is rejected, so `/work/../etc` no longer passes
+  the subagent roots check against `/work`.
+- A templated MCP server `url` is now validated (http/https, loopback-only
+  plain http, blocked IPs) after rendering, right before the server is
+  spawned; load-time validation only sees the template text.
+- A tape or bundle flush failure no longer leaks MCP child processes or
+  hides the engine error; the bundle records the pipeline text loaded at
+  startup instead of re-reading the file.
+- `Read`, `Write` and `Edit` reject FIFOs, devices and directories
+  instead of hanging, and run their file I/O off the async workers.
+- `Write` and `Edit` keep the target's permissions (a 0755 script stays
+  0755).
+- `Read` decodes invalid UTF-8 lossily for files of every size.
+- Shell nodes and `Bash` run in their own process group and SIGKILL it on
+  exit, timeout or cancellation, so a background grandchild neither hangs
+  the node on the inherited pipes nor outlives a timeout.
+- Capped shell and `Bash` output no longer collapses to empty when it
+  ends in stray UTF-8 continuation bytes.
+- `orno replay` keeps each agent's recorded `allow_mutations` and
+  `allow_network`, so recorded MCP and mutating tool calls replay instead
+  of being denied and missing the next LLM entry. Replay still runs
+  nothing live: tool calls answer from the tape.
+- `examples/mcp-http-demo/bundle.ndjson` is re-recorded with the current
+  request shape, and a test replays every bundle under `examples/` so a
+  stranded recording fails CI.
+- CLI integration tests strip provider API keys from the child env, so a
+  `cargo test` without `--features test-transport` fails with a clear
+  message instead of calling a live, billed LLM.
+
+### Removed
+
+- `Event::BudgetExceeded` (never emitted; budget breaches surface as
+  `NodeFailure::BudgetExceeded` on `node_finished`).
+- `AgentError::SubagentDepthExceeded` and `LlmError::NotImplemented`
+  (never constructed).
+- The uncompiled `orno_core::config` module.
+- Unused public items: `Context::merge`, `Context::empty`,
+  `ContextConflict`, `orno_core::telemetry` (`run_span`),
+  `SubagentHandler::child_agent_name`, `impl Clone for Redactor`,
+  `AgentError::UnsupportedYet`, `NodeError::UnsupportedYet`,
+  `NodeError::UnknownKind` and `McpError::{ServerCrashed, ShutdownTimeout,
+  UnknownTool}`. `DagWalker::is_done` and `statuses` are test-only. The
+  `hex` dependency is gone.
+
+### Fixed
+
+- MCP stdio servers' stderr no longer leaks into orno's stderr; it is
+  logged at debug level.
+- MCP tool calls with non-object arguments now fail instead of running
+  with none, image/audio-only results yield a placeholder instead of an
+  empty string, and a repeated `initialize` returns the cached tools.
+
+### Security
+
+- A call to `subagent.<name>` is now checked against `allowed_tools`
+  like every other tool; an unlisted subagent used to dispatch.
+- `WebFetch` receives the calling agent's `allowed_domains` /
+  `blocked_domains` on every call. Redirect hops were checked against
+  empty lists, so an open redirect on an allowlisted host could reach
+  any domain.
+- `WebFetch` resolves names through a guard that drops blocked
+  addresses at connect time (closing the DNS-rebinding window between
+  the check and the dial) and ignores `HTTP(S)_PROXY`.
+- The blocked-address list now covers `0.0.0.0/8`, `192.0.0.0/24`,
+  `198.18.0.0/15`, multicast and `240.0.0.0/4` for IPv4, and `::`,
+  multicast, documentation, NAT64, 6to4 and Teredo for IPv6, and
+  bracketed IPv6 literals are recognized.
+- `blocked_domains` and `allowed_domains` matching ignores case and a
+  trailing dot, so `evil.com.` no longer slips past `evil.com`.
+- The network gate scans tool arguments recursively for http(s) URLs in
+  any case, not just top-level strings starting with lowercase `http`.
+- Bump `rmcp` to 3.10 (fixes RUSTSEC-2026-0462, unbounded response
+  buffering in the streamable HTTP client).
 
 ## 0.2.0 - 2026-05-03
 
@@ -118,7 +313,7 @@ once the first tagged release ships.
 
 - **`roots` field required for file tools** (`Read`, `Write`, `Edit`). Any pipeline agent that
   uses these tools must now declare a `roots:` list in its `AgentPolicy`. Agents that omit
-  `roots:` will receive a `ToolError::PolicyViolation` on every file-tool call. Migration:
+  `roots:` will receive a `ToolError::Denied` on every file-tool call. Migration:
   add `roots: ["/path/to/project"]` to the agent's policy block in your YAML.
 
 - **`ORNO_TEST_LLM_TRANSPORT` env var gated behind `test-transport` feature**. The escape hatch
@@ -137,7 +332,7 @@ once the first tagged release ships.
 - Bash tool environment isolation: cleared `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`,
   `DYLD_LIBRARY_PATH`, and `PYTHONPATH` before exec to prevent library-injection attacks.
 - Path jail (`jail_path`) enforced on all file tools; symlink traversal outside the jail now
-  returns `ToolError::PolicyViolation`.
+  returns `ToolError::Denied`.
 - Write and Edit tools now use `NamedTempFile` + atomic rename instead of direct `fs::write` to
   prevent partial-write corruption and toctou races.
 - Tape file creation now uses `O_EXCL` (`create_new(true)`) and `mode(0o600)` on Unix so stale
@@ -161,7 +356,7 @@ once the first tagged release ships.
 ### Other changes
 
 - `AgentPolicy.max_message_history_bytes` (default 4 MiB) bounds per-agent conversation history;
-  oldest messages are evicted when the cap is exceeded, keeping at least the first two.
+  the oldest messages are evicted when the cap is exceeded, keeping at least the most recent two.
 - `LoopAgentRequest` fields `initial_prompt`, `system`, `provider`, `model` changed to `Arc<str>`
   to eliminate per-iteration `String` clones on the hot path.
 - Template engine LRU cache capacity fixed: now correctly removes evicted templates from the
@@ -170,5 +365,7 @@ once the first tagged release ships.
   existing LLM and tool tape layers still use their own I/O (migration deferred).
 - `orno-cli`'s `run.rs` split into `run/mod.rs`, `run/agent.rs`, `run/secrets.rs`,
   `run/transport.rs` for maintainability.
+
+## 0.1.0
 
 - Initial release.

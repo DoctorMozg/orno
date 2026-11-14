@@ -1,25 +1,31 @@
-//! Combined record/replay bundle: pipeline YAML + LLM tape entries +
-//! tool tape entries packed into a single NDJSON file.
+//! Combined record/replay bundle: pipeline YAML + run inputs + LLM tape
+//! entries + tool tape entries packed into a single NDJSON file.
 //!
 //! Format: one JSON object per line, internally tagged on `"type"`.
 //! ```text
-//! {"type":"bundle_header","format_version":1}
+//! {"type":"bundle_header","format_version":2}
 //! {"type":"pipeline_yaml","content":"version: 1\n..."}
-//! {"type":"llm_entry","req":{...},"outcome":{"kind":"ok","res":{...}}}
-//! {"type":"llm_entry","req":{...},"outcome":{"kind":"err","err":{...}}}
-//! {"type":"tool_entry","key":"<hex>","content":"...","error":null}
+//! {"type":"run_inputs","vars":{...},"env":{...},"secrets":{"KEY":"***"}}
+//! {"type":"llm_entry","key":"<provider:model:hash>","seq":0,"outcome":{"kind":"ok","res":{...}}}
+//! {"type":"tool_entry","key":"<hex>","seq":0,"outcome":{"kind":"ok","content":"..."}}
+//! {"type":"bundle_trailer","blake3":"<hex>"}
 //! ```
 //! `LlmEntry` and `ToolEntry` use newtype variants; serde's internal
 //! tagging flattens the inner struct's fields alongside `"type"`, so a
 //! bundle line carries both the discriminator and the entry payload at
 //! the same JSON level — no nested `"data": {...}` wrapper.
 //!
-//! `read_bundle` is forgiving on unknown future entry types via
-//! `#[non_exhaustive]` on the enum, but a missing `pipeline_yaml`
-//! section is a hard error: `orno replay` cannot proceed without one,
-//! and a `bundle_header` whose `format_version` does not match
-//! [`CURRENT_BUNDLE_VERSION`] is also a hard error so a future-version
-//! bundle is rejected up front rather than silently misinterpreted.
+//! `read_bundle` is strict: the header comes first and its
+//! `format_version` must equal [`CURRENT_BUNDLE_VERSION`] (older and
+//! newer bundles are refused, naming both versions), the trailer comes
+//! last and its digest must match, and `pipeline_yaml` and `run_inputs`
+//! each appear exactly once. A truncated or hand-edited bundle is
+//! therefore rejected rather than replayed partially.
+//!
+//! `run_inputs` holds what templates saw at record time: the rendered
+//! `vars`, the `env` namespace, and the `secrets` namespace with every
+//! value replaced by the redaction placeholder, so replay renders the
+//! same prompts without the bundle containing a real secret.
 //!
 //! Bearer-token scrub: `write_bundle` walks the parsed pipeline's
 //! `mcp_servers` block for HTTP servers with `auth.kind: bearer` and
@@ -28,14 +34,18 @@
 //! they are placeholders, not the secret itself. This is a defense-in-
 //! depth measure against bundles being shared as repro artifacts.
 
-use std::fs::{File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use blake3::Hasher as Blake3Hasher;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::events::Redactor;
+use crate::events::redactor::REDACTION_MARKER;
 use crate::pipeline::Pipeline;
 use crate::pipeline::schema::{McpAuthConfig, McpServerConfig};
 use crate::tool::ToolTapeEntry;
@@ -48,7 +58,7 @@ use super::recording::TapeEntry;
 /// cannot silently misinterpret a newer bundle, and a newer reader
 /// does not blindly replay an older bundle whose semantics may have
 /// shifted.
-pub const CURRENT_BUNDLE_VERSION: u32 = 1;
+pub const CURRENT_BUNDLE_VERSION: u32 = 2;
 
 /// Replacement string substituted for literal bearer tokens during
 /// bundle write. Chosen to be visually loud in a diff and to never
@@ -65,7 +75,7 @@ pub enum BundleEntry {
     /// wire format changes incompatibly so a future reader can refuse
     /// rather than misinterpret an older bundle.
     BundleHeader {
-        /// Bundle wire-format version. Currently `1`.
+        /// Bundle wire-format version. Currently `2`.
         format_version: u32,
     },
     /// Verbatim pipeline YAML the original run was driven from. Embedded
@@ -74,20 +84,78 @@ pub enum BundleEntry {
         /// Pipeline YAML body, exactly as the original `orno run` saw it.
         content: String,
     },
-    /// One recorded LLM `(request, response)` pair from the run.
+    /// What templates saw at record time, with secrets replaced by a placeholder.
+    RunInputs(BundleRunInputs),
+    /// One recorded LLM call from the run.
     LlmEntry(TapeEntry),
     /// One recorded tool invocation from the run.
     ToolEntry(ToolTapeEntry),
     /// Last line of every bundle. Carries the BLAKE3 hex digest over all
     /// preceding body lines (each written as `{json}\n`), excluding the
-    /// trailer line itself. `read_bundle` verifies this digest; a missing
-    /// trailer emits a `tracing::warn!` rather than hard-failing so
-    /// pre-BS4 bundles still replay.
+    /// trailer line itself. `read_bundle` verifies this digest and
+    /// rejects a bundle without a trailer.
     BundleTrailer {
         /// Lowercase hex-encoded BLAKE3 digest of all body bytes written
         /// before the trailer.
         blake3: String,
     },
+}
+
+/// The template namespaces of a recorded run, as `orno replay` needs to
+/// rebuild them. Holds no real secret value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BundleRunInputs {
+    /// Pipeline `vars:` after rendering, redacted. Replay uses these as
+    /// they are instead of rendering again.
+    pub vars: BTreeMap<String, Value>,
+    /// The `env.*` namespace, redacted.
+    pub env: BTreeMap<String, String>,
+    /// The `secrets.*` namespace: every key kept, every value replaced
+    /// by the redaction placeholder so templates still render.
+    pub secrets: BTreeMap<String, String>,
+}
+
+impl BundleRunInputs {
+    /// Snapshot the namespaces of a run, scrubbing `vars` and `env`
+    /// with `redactor` and masking every secret value.
+    #[must_use]
+    pub fn capture(
+        vars: &BTreeMap<String, Value>,
+        env: &BTreeMap<String, String>,
+        secrets: &BTreeMap<String, String>,
+        redactor: &Redactor,
+    ) -> Self {
+        let vars = vars
+            .iter()
+            .map(|(k, v)| {
+                let mut v = v.clone();
+                redactor.redact_json(&mut v);
+                (k.clone(), v)
+            })
+            .collect();
+        let env = env
+            .iter()
+            .map(|(k, v)| (k.clone(), redactor.redact(v).into_owned()))
+            .collect();
+        let secrets = secrets
+            .keys()
+            .map(|k| (k.clone(), REDACTION_MARKER.to_string()))
+            .collect();
+        Self { vars, env, secrets }
+    }
+}
+
+/// Everything `write_bundle` packs into a bundle.
+#[derive(Debug, Clone, Copy)]
+pub struct BundleSources<'a> {
+    /// Pipeline YAML exactly as the run loaded it.
+    pub pipeline_yaml: &'a str,
+    /// Template namespaces the run rendered against.
+    pub run_inputs: &'a BundleRunInputs,
+    /// LLM tape written by `RecordingTransport`, if any.
+    pub llm_tape: Option<&'a Path>,
+    /// Tool tape written by `RecordingToolHandler`, if any.
+    pub tool_tape: Option<&'a Path>,
 }
 
 /// Parsed contents of a bundle file. The two entry vectors preserve the
@@ -99,6 +167,8 @@ pub enum BundleEntry {
 pub struct BundleContents {
     /// Pipeline YAML body extracted from the `pipeline_yaml` line.
     pub pipeline_yaml: String,
+    /// Template namespaces captured at record time.
+    pub run_inputs: BundleRunInputs,
     /// LLM tape entries in the order they appeared in the bundle.
     pub llm_entries: Vec<TapeEntry>,
     /// Tool tape entries in the order they appeared in the bundle.
@@ -112,13 +182,34 @@ pub enum BundleError {
     /// Underlying I/O error (file open, read, write).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    /// Bundle did not contain a `pipeline_yaml` section. Replay cannot
-    /// reconstruct the run without it.
-    #[error("bundle is missing pipeline YAML section")]
-    MissingPipelineYaml,
+    /// A required section (`pipeline_yaml` or `run_inputs`) is absent.
+    /// Replay cannot reconstruct the run without it.
+    #[error("bundle is missing its `{section}` section")]
+    MissingSection {
+        /// Wire name of the absent section.
+        section: &'static str,
+    },
+    /// A section that must appear once appeared again.
+    #[error("bundle line {line}: duplicate `{section}` section")]
+    DuplicateSection {
+        /// Wire name of the repeated section.
+        section: &'static str,
+        /// 1-based line number of the second occurrence.
+        line: usize,
+    },
+    /// The first line of the bundle is not a `bundle_header`.
+    #[error("bundle does not start with a `bundle_header` line")]
+    MissingHeader,
+    /// The last line of the bundle is not a `bundle_trailer`: the file
+    /// was truncated or never finished writing.
+    #[error("bundle has no `bundle_trailer` line (truncated or unfinished write?)")]
+    MissingTrailer,
     /// Bundle's `bundle_header` carried a `format_version` this build
     /// cannot interpret. Returned only by [`read_bundle`].
-    #[error("bundle format version {found} is not supported by this build (expected {expected})")]
+    #[error(
+        "bundle format version {found} is not supported by this build (expected {expected}); \
+         re-record the run with this build"
+    )]
     IncompatibleVersion {
         /// `format_version` value read from the bundle header.
         found: u32,
@@ -180,7 +271,7 @@ impl<W: Write> HashAccumWriter<W> {
     /// the trailer without going through the hasher.
     fn finalize(mut self) -> std::io::Result<(W, String)> {
         self.inner.flush()?;
-        let digest = hex::encode(self.hasher.finalize().as_bytes());
+        let digest = self.hasher.finalize().to_hex().to_string();
         Ok((self.inner, digest))
     }
 }
@@ -197,8 +288,8 @@ impl<W: Write> Write for HashAccumWriter<W> {
     }
 }
 
-/// Write a bundle combining the pipeline YAML body with previously
-/// recorded LLM and tool tape files.
+/// Write a bundle combining the pipeline YAML body and run inputs with
+/// previously recorded LLM and tool tape files.
 ///
 /// The tape files are read line-by-line and re-emitted as `LlmEntry` /
 /// `ToolEntry` lines in the bundle. Pipeline YAML is embedded after
@@ -206,31 +297,30 @@ impl<W: Write> Write for HashAccumWriter<W> {
 /// literal bearer tokens round-trip byte-for-byte (so comments and
 /// whitespace survive for human inspection), while pipelines that
 /// carry literal credentials are parsed, walked, and re-emitted with
-/// `<REDACTED>` substituted in. `orno replay` still sees the YAML the
-/// original `orno run` did, modulo the redacted secrets.
+/// `<REDACTED>` substituted in.
 ///
 /// Either tape path may be `None` when no entries of that kind were
-/// recorded; the bundle will simply omit those lines.
+/// recorded; the bundle will simply omit those lines. A
+/// `bundle_trailer` line carrying a BLAKE3 hex digest over all body
+/// lines is appended last.
 ///
-/// A `bundle_trailer` line carrying a BLAKE3 hex digest over all body
-/// lines is appended last. `read_bundle` verifies this digest to detect
-/// on-disk corruption or tampering.
-pub fn write_bundle(
-    pipeline_yaml: &str,
-    llm_tape_path: Option<&Path>,
-    tool_tape_path: Option<&Path>,
-    out: &Path,
-) -> Result<(), BundleError> {
-    let scrubbed_yaml = scrub_pipeline_secrets(pipeline_yaml)?;
+/// The bundle is written to a temporary file in the target directory,
+/// synced, and renamed into place, so a crash or error never leaves a
+/// partial bundle at `out`.
+pub fn write_bundle(sources: &BundleSources<'_>, out: &Path) -> Result<(), BundleError> {
+    let scrubbed_yaml = scrub_pipeline_secrets(sources.pipeline_yaml)?;
 
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(out)?;
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp = tempfile::Builder::new()
+        .prefix(".orno-bundle-")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+
     // Wrap in HashAccumWriter so every body byte is hashed as it is written.
-    let mut writer = HashAccumWriter::new(BufWriter::new(file));
-
+    let mut writer = HashAccumWriter::new(BufWriter::new(temp.as_file()));
     write_entry(
         &mut writer,
         &BundleEntry::BundleHeader {
@@ -243,19 +333,20 @@ pub fn write_bundle(
             content: scrubbed_yaml,
         },
     )?;
-
-    if let Some(path) = llm_tape_path {
+    write_entry(
+        &mut writer,
+        &BundleEntry::RunInputs(sources.run_inputs.clone()),
+    )?;
+    if let Some(path) = sources.llm_tape {
         copy_tape_file::<TapeEntry, _>(path, &mut writer, BundleEntry::LlmEntry)?;
     }
-
-    if let Some(path) = tool_tape_path {
+    if let Some(path) = sources.tool_tape {
         copy_tape_file::<ToolTapeEntry, _>(path, &mut writer, BundleEntry::ToolEntry)?;
     }
 
-    // Flush, extract body digest, then write the trailer directly to the
-    // inner BufWriter — bypassing the hasher so the trailer is not
-    // self-referential (the reader hashes all non-trailer lines and then
-    // compares against the digest in the trailer).
+    // Write the trailer directly to the inner writer — bypassing the
+    // hasher so the trailer is not self-referential (the reader hashes
+    // all non-trailer lines and compares against the trailer's digest).
     let (mut inner, blake3_hex) = writer.finalize().map_err(BundleError::Io)?;
     let trailer = serde_json::to_string(&BundleEntry::BundleTrailer { blake3: blake3_hex })
         .map_err(|e| BundleError::ParseError {
@@ -264,70 +355,104 @@ pub fn write_bundle(
         })?;
     writeln!(inner, "{trailer}")?;
     inner.flush()?;
+    drop(inner);
+
+    temp.as_file().sync_all()?;
+    temp.persist(out).map_err(|e| BundleError::Io(e.error))?;
     Ok(())
 }
 
-/// Replace literal MCP bearer tokens in `pipeline_yaml` with
-/// `<REDACTED>` so a shared bundle does not leak production credentials.
+/// Replace literal MCP credentials in `pipeline_yaml` with `<REDACTED>`
+/// so a shared bundle does not leak production secrets.
 ///
-/// The pipeline is parsed first to discover whether any HTTP server is
-/// configured with a literal (non-templated) bearer token. When the
-/// answer is no, the input is returned verbatim so comments and
-/// whitespace round-trip byte-for-byte for human inspection of the
-/// bundle. When the answer is yes, the YAML body is parsed into a
-/// generic `serde_yaml_ng::Value` tree and walked structurally:
-/// string leaves under a credential-shaped key are replaced with the
-/// redaction placeholder, then the tree is re-serialized. This avoids
-/// the failure modes of a naive `str::replace` loop — which could
-/// corrupt unrelated text that happened to share a token's bytes — at
-/// the cost of dropping comments and re-normalizing whitespace on the
-/// scrub-required path.
-///
-/// Template values (`{{ secrets.X }}`) are detected at every level and
-/// preserved verbatim, because they are placeholders the runtime
-/// renderer resolves, not the secret itself. If the structural walk
-/// fails (parse error on an otherwise-loadable pipeline body), the
-/// scrubber falls back to a literal-token Aho-Corasick replacement so
-/// the bundle is still emitted with the credentials redacted.
+/// The YAML is always parsed into a generic tree and walked
+/// structurally. When something was scrubbed the tree is re-serialized
+/// (comments and whitespace are lost); otherwise the input comes back
+/// verbatim. String
+/// leaves under a credential-shaped key are replaced, and so is every
+/// literal value under an MCP server's `env`, every `headers` value and
+/// the `token` / `password` of its `auth` block. Template values
+/// (`{{ secrets.X }}`) are kept verbatim because the runtime resolves
+/// them; they are placeholders, not the secret. If the generic parse
+/// fails on an otherwise-loadable pipeline, the literal credentials are
+/// replaced by an Aho-Corasick scan of the raw text instead.
 pub fn scrub_pipeline_secrets(pipeline_yaml: &str) -> Result<String, BundleError> {
     let pipeline: Pipeline = serde_yaml_ng::from_str(pipeline_yaml)
         .map_err(|e| BundleError::PipelineParse(e.to_string()))?;
 
-    let mut tokens: Vec<String> = Vec::new();
-    for server in pipeline.mcp_servers.values() {
-        if let McpServerConfig::Http(http) = server
-            && let Some(McpAuthConfig::Bearer { token }) = &http.auth
-        {
-            // Template placeholders are not literal secrets — skip
-            // them so the rendered YAML still resolves at replay time.
-            if token.contains("{{") || token.is_empty() {
-                continue;
-            }
-            tokens.push(token.clone());
-        }
-    }
-
-    if tokens.is_empty() {
-        return Ok(pipeline_yaml.to_string());
-    }
-
     match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(pipeline_yaml) {
         Ok(mut value) => {
+            let original = value.clone();
             scrub_yaml_value(&mut value);
+            scrub_mcp_servers(&mut value);
+            // Untouched input keeps its comments and formatting.
+            if value == original {
+                return Ok(pipeline_yaml.to_string());
+            }
             serde_yaml_ng::to_string(&value).map_err(|e| BundleError::PipelineParse(e.to_string()))
         },
         Err(parse_err) => {
-            // The pipeline parsed as `Pipeline` above, so a generic
-            // `Value` parse should not normally fail. If it does, fall
-            // back to the literal-token path so the bundle still ships
-            // with the credentials redacted — the alternative would be
-            // emitting plaintext tokens.
+            // Shipping plaintext credentials is worse than a degraded scrub.
             tracing::warn!(
                 error = %parse_err,
-                "bundle scrub: generic YAML parse failed; falling back to literal-token replacement",
+                "bundle scrub: generic YAML parse failed; falling back to literal replacement",
             );
-            Ok(scrub_yaml_with_tokens(pipeline_yaml, &tokens))
+            Ok(scrub_yaml_with_tokens(
+                pipeline_yaml,
+                &literal_mcp_credentials(&pipeline),
+            ))
         },
+    }
+}
+
+fn is_literal(value: &str) -> bool {
+    !value.is_empty() && !value.contains("{{")
+}
+
+fn literal_mcp_credentials(pipeline: &Pipeline) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for server in pipeline.mcp_servers.values() {
+        match server {
+            McpServerConfig::Stdio(stdio) => out.extend(stdio.env.values().cloned()),
+            McpServerConfig::Http(http) => {
+                out.extend(http.headers.values().cloned());
+                match &http.auth {
+                    Some(McpAuthConfig::Bearer { token }) => out.push(token.clone()),
+                    Some(McpAuthConfig::Basic { password, .. }) => out.push(password.clone()),
+                    _ => {},
+                }
+            },
+        }
+    }
+    out.retain(|v| is_literal(v));
+    out
+}
+
+/// Replace every literal string under MCP `env`, `headers` and the
+/// credential fields of `auth`, whatever the key is called.
+fn scrub_mcp_servers(root: &mut serde_yaml_ng::Value) {
+    use serde_yaml_ng::Value;
+    let Some(servers) = root.get_mut("mcp_servers").and_then(Value::as_mapping_mut) else {
+        return;
+    };
+    let scrub_leaf = |leaf: &mut Value| {
+        if matches!(leaf, Value::String(t) if is_literal(t)) {
+            *leaf = Value::String(BEARER_REDACTION_PLACEHOLDER.to_string());
+        }
+    };
+    for (_, server) in servers.iter_mut() {
+        for section in ["env", "headers"] {
+            if let Some(map) = server.get_mut(section).and_then(Value::as_mapping_mut) {
+                map.iter_mut().for_each(|(_, v)| scrub_leaf(v));
+            }
+        }
+        if let Some(auth) = server.get_mut("auth").and_then(Value::as_mapping_mut) {
+            for field in ["token", "password"] {
+                if let Some(v) = auth.get_mut(field) {
+                    scrub_leaf(v);
+                }
+            }
+        }
     }
 }
 
@@ -412,42 +537,30 @@ fn scrub_yaml_with_tokens(pipeline_yaml: &str, tokens: &[String]) -> String {
 
 /// Read a bundle file back into its components.
 ///
-/// Returns [`BundleError::MissingPipelineYaml`] when no `pipeline_yaml`
-/// line was found, [`BundleError::IncompatibleVersion`] when the
-/// `bundle_header` carries a `format_version` other than
-/// [`CURRENT_BUNDLE_VERSION`], [`BundleError::ParseError`] for corrupt
-/// lines (carrying the 1-based line number), and
-/// [`BundleError::IntegrityMismatch`] when a `bundle_trailer` is present
-/// but its BLAKE3 digest does not match the digest recomputed over the
-/// body lines. A missing trailer emits a `tracing::warn!` but is not an
-/// error so pre-BS4 bundles still replay.
-#[expect(
-    clippy::too_many_lines,
-    reason = "sequential parse-hash-dispatch loop with integrity verification and post-trailer detection"
-)]
+/// Fails with [`BundleError::MissingHeader`] unless the first line is a
+/// `bundle_header`, [`BundleError::IncompatibleVersion`] when its
+/// `format_version` is not [`CURRENT_BUNDLE_VERSION`] (checked before any
+/// other line is parsed, so an old-format bundle gets this error rather
+/// than a parse error), [`BundleError::MissingTrailer`] unless the last
+/// line is a `bundle_trailer`, [`BundleError::IntegrityMismatch`] when
+/// the trailer digest does not match the body,
+/// [`BundleError::DuplicateSection`] / [`BundleError::MissingSection`]
+/// unless `pipeline_yaml` and `run_inputs` each appear exactly once, and
+/// [`BundleError::ParseError`] for corrupt lines (with the 1-based line
+/// number).
 pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    let mut pipeline_yaml: Option<String> = None;
-    let mut llm_entries: Vec<TapeEntry> = Vec::new();
-    let mut tool_entries: Vec<ToolTapeEntry> = Vec::new();
-    let mut hasher = Blake3Hasher::new();
-    let mut trailer_seen = false;
+    let mut parsed = ParsedBundle::default();
     let mut extra_after_trailer: usize = 0;
 
-    for (idx, line) in reader.lines().enumerate() {
+    for (idx, line) in BufReader::new(File::open(path)?).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        // Guard against post-trailer tampering: any non-empty line that
-        // arrives after the integrity trailer is outside the hashed body
-        // and must not be parsed or hashed. Counting (rather than breaking)
-        // surfaces the violation as a typed error instead of silently
-        // dropping the bytes, and placing the check before the JSON parse
-        // ensures garbage payloads do not masquerade as `ParseError`.
-        if trailer_seen {
+        // Anything after the trailer is outside the hashed body. The
+        // check precedes the JSON parse so garbage payloads surface as
+        // tampering, not as a misleading `ParseError`.
+        if parsed.trailer_seen {
             extra_after_trailer += 1;
             continue;
         }
@@ -456,44 +569,7 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
                 line: idx + 1,
                 msg: e.to_string(),
             })?;
-
-        // Hash all body lines before dispatching. The trailer line
-        // itself is excluded from the hash so the digest is not
-        // self-referential — writers skip the trailer through the
-        // same logic (writing it directly to the inner writer, not
-        // through the HashAccumWriter).
-        if !matches!(entry, BundleEntry::BundleTrailer { .. }) {
-            hasher.update(line.as_bytes());
-            hasher.update(b"\n");
-        }
-
-        match entry {
-            BundleEntry::BundleHeader { format_version } => {
-                // Reject mismatched versions up front so a future bundle
-                // is never fed into an older reader that would silently
-                // ignore new fields, and an older bundle is never
-                // replayed under semantics it was not recorded against.
-                if format_version != CURRENT_BUNDLE_VERSION {
-                    return Err(BundleError::IncompatibleVersion {
-                        found: format_version,
-                        expected: CURRENT_BUNDLE_VERSION,
-                    });
-                }
-            },
-            BundleEntry::PipelineYaml { content } => pipeline_yaml = Some(content),
-            BundleEntry::LlmEntry(e) => llm_entries.push(e),
-            BundleEntry::ToolEntry(e) => tool_entries.push(e),
-            BundleEntry::BundleTrailer { blake3 } => {
-                let actual = hex::encode(hasher.finalize().as_bytes());
-                if actual != blake3 {
-                    return Err(BundleError::IntegrityMismatch {
-                        expected: blake3,
-                        actual,
-                    });
-                }
-                trailer_seen = true;
-            },
-        }
+        parsed.accept(entry, &line, idx + 1)?;
     }
 
     if extra_after_trailer > 0 {
@@ -501,22 +577,109 @@ pub fn read_bundle(path: &Path) -> Result<BundleContents, BundleError> {
             line_count: extra_after_trailer,
         });
     }
+    parsed.finish()
+}
 
-    if !trailer_seen {
-        tracing::warn!(
-            path = %path.display(),
-            "bundle has no integrity trailer; skipping verification \
-             (bundle may have been written before BS4 or was truncated)",
-        );
+/// Accumulates bundle lines while enforcing the section rules.
+#[derive(Default)]
+struct ParsedBundle {
+    header_seen: bool,
+    trailer_seen: bool,
+    pipeline_yaml: Option<String>,
+    run_inputs: Option<BundleRunInputs>,
+    llm_entries: Vec<TapeEntry>,
+    tool_entries: Vec<ToolTapeEntry>,
+    hasher: Blake3Hasher,
+}
+
+impl ParsedBundle {
+    fn accept(&mut self, entry: BundleEntry, raw: &str, line: usize) -> Result<(), BundleError> {
+        // The header must open the file, and its version is checked
+        // before anything else so an old bundle fails on the version.
+        if !self.header_seen {
+            let BundleEntry::BundleHeader { format_version } = entry else {
+                return Err(BundleError::MissingHeader);
+            };
+            if format_version != CURRENT_BUNDLE_VERSION {
+                return Err(BundleError::IncompatibleVersion {
+                    found: format_version,
+                    expected: CURRENT_BUNDLE_VERSION,
+                });
+            }
+            self.header_seen = true;
+            self.hash_line(raw);
+            return Ok(());
+        }
+
+        // The trailer line is excluded from the digest; writers emit it
+        // outside the hashing writer for the same reason.
+        if !matches!(entry, BundleEntry::BundleTrailer { .. }) {
+            self.hash_line(raw);
+        }
+        match entry {
+            BundleEntry::BundleHeader { .. } => {
+                return Err(BundleError::DuplicateSection {
+                    section: "bundle_header",
+                    line,
+                });
+            },
+            BundleEntry::PipelineYaml { content } => {
+                Self::set_once(&mut self.pipeline_yaml, content, "pipeline_yaml", line)?;
+            },
+            BundleEntry::RunInputs(inputs) => {
+                Self::set_once(&mut self.run_inputs, inputs, "run_inputs", line)?;
+            },
+            BundleEntry::LlmEntry(e) => self.llm_entries.push(e),
+            BundleEntry::ToolEntry(e) => self.tool_entries.push(e),
+            BundleEntry::BundleTrailer { blake3 } => {
+                let actual = self.hasher.finalize().to_hex().to_string();
+                if actual != blake3 {
+                    return Err(BundleError::IntegrityMismatch {
+                        expected: blake3,
+                        actual,
+                    });
+                }
+                self.trailer_seen = true;
+            },
+        }
+        Ok(())
     }
 
-    let pipeline_yaml = pipeline_yaml.ok_or(BundleError::MissingPipelineYaml)?;
+    fn hash_line(&mut self, raw: &str) {
+        self.hasher.update(raw.as_bytes());
+        self.hasher.update(b"\n");
+    }
 
-    Ok(BundleContents {
-        pipeline_yaml,
-        llm_entries,
-        tool_entries,
-    })
+    fn set_once<T>(
+        slot: &mut Option<T>,
+        value: T,
+        section: &'static str,
+        line: usize,
+    ) -> Result<(), BundleError> {
+        if slot.replace(value).is_some() {
+            return Err(BundleError::DuplicateSection { section, line });
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<BundleContents, BundleError> {
+        if !self.header_seen {
+            return Err(BundleError::MissingHeader);
+        }
+        if !self.trailer_seen {
+            return Err(BundleError::MissingTrailer);
+        }
+        Ok(BundleContents {
+            pipeline_yaml: self.pipeline_yaml.ok_or(BundleError::MissingSection {
+                section: "pipeline_yaml",
+            })?,
+            run_inputs: self.run_inputs.ok_or(BundleError::MissingSection {
+                section: "run_inputs",
+            })?,
+            llm_entries: self.llm_entries,
+            tool_entries: self.tool_entries,
+        })
+    }
 }
 
 /// Serialize one `BundleEntry` and write it as a single NDJSON line.
@@ -559,40 +722,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::LlmResponse;
     use crate::llm::recording::TapeOutcome;
-    use crate::llm::{LlmRequest, LlmResponse, Usage};
+    use crate::tool::record::ToolTapeOutcome;
     use std::io::Write;
 
-    fn sample_tape_entry(prompt: &str) -> TapeEntry {
+    const YAML: &str = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
+
+    fn llm_entry(key: &str, content: &str) -> TapeEntry {
         TapeEntry {
-            req: LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                prompt.into(),
-                None,
-                None,
-                None,
-            ),
+            key: key.to_string(),
+            seq: 0,
+            tools: Vec::new(),
             outcome: TapeOutcome::Ok {
                 res: LlmResponse {
-                    content: format!("answer to {prompt}"),
+                    content: content.to_string(),
                     finish_reason: Some("stop".into()),
-                    usage: Some(Usage {
-                        prompt_tokens: 1,
-                        completion_tokens: 2,
-                        total_tokens: 3,
-                    }),
+                    usage: None,
                     tool_calls: Vec::new(),
                 },
             },
         }
     }
 
-    fn sample_tool_entry(key: &str, content: &str) -> ToolTapeEntry {
+    fn tool_entry(key: &str, content: &str) -> ToolTapeEntry {
         ToolTapeEntry {
             key: key.to_string(),
-            content: Some(content.to_string()),
-            error: None,
+            seq: 0,
+            outcome: ToolTapeOutcome::Ok {
+                content: content.to_string(),
+            },
         }
     }
 
@@ -605,132 +764,291 @@ mod tests {
         f
     }
 
-    #[test]
-    fn round_trip_preserves_pipeline_and_entries() {
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let llm = vec![sample_tape_entry("hello"), sample_tape_entry("world")];
-        let tools = vec![
-            sample_tool_entry("aaaa", "first"),
-            sample_tool_entry("bbbb", "second"),
-        ];
-
-        let llm_tape = write_tape(&llm);
-        let tool_tape = write_tape(&tools);
-        let out = tempfile::NamedTempFile::new().unwrap();
-
+    fn write(
+        yaml: &str,
+        llm: Option<&Path>,
+        tool: Option<&Path>,
+        out: &Path,
+    ) -> Result<(), BundleError> {
         write_bundle(
-            yaml_body,
-            Some(llm_tape.path()),
-            Some(tool_tape.path()),
-            out.path(),
+            &BundleSources {
+                pipeline_yaml: yaml,
+                run_inputs: &BundleRunInputs::default(),
+                llm_tape: llm,
+                tool_tape: tool,
+            },
+            out,
         )
-        .expect("bundle write must succeed");
+    }
 
-        let read = read_bundle(out.path()).expect("bundle read must succeed");
-        assert_eq!(read.pipeline_yaml, yaml_body);
-        assert_eq!(read.llm_entries.len(), 2);
-        assert_eq!(read.llm_entries[0].req.prompt, "hello");
-        assert_eq!(read.llm_entries[1].req.prompt, "world");
-        assert_eq!(read.tool_entries.len(), 2);
-        assert_eq!(read.tool_entries[0].key, "aaaa");
-        assert_eq!(read.tool_entries[1].key, "bbbb");
-        assert_eq!(read.tool_entries[0].content.as_deref(), Some("first"));
+    fn bundle_lines(path: &Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn rewrite(path: &Path, lines: &[String]) {
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn fresh_bundle() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bundle.ndjson");
+        write(YAML, None, None, &path).unwrap();
+        (dir, path)
     }
 
     #[test]
-    fn write_with_no_tapes_emits_only_header_and_yaml() {
-        // Minimal but parseable: `nodes:` is required by the Pipeline
-        // struct, and `scrub_pipeline_secrets` parses the YAML as part
-        // of locating bearer tokens to redact.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let out = tempfile::NamedTempFile::new().unwrap();
+    fn round_trip_preserves_pipeline_inputs_and_entries() {
+        let llm_tape = write_tape(&[llm_entry("k1", "hello"), llm_entry("k2", "world")]);
+        let tool_tape = write_tape(&[tool_entry("aaaa", "first"), tool_entry("bbbb", "second")]);
+        let inputs = BundleRunInputs {
+            vars: BTreeMap::from([("tag".to_string(), serde_json::json!("v1"))]),
+            env: BTreeMap::from([("HOME".to_string(), "/h".to_string())]),
+            secrets: BTreeMap::from([("T".to_string(), "***".to_string())]),
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("bundle.ndjson");
 
-        write_bundle(yaml_body, None, None, out.path()).unwrap();
+        write_bundle(
+            &BundleSources {
+                pipeline_yaml: YAML,
+                run_inputs: &inputs,
+                llm_tape: Some(llm_tape.path()),
+                tool_tape: Some(tool_tape.path()),
+            },
+            &out,
+        )
+        .expect("bundle write must succeed");
 
-        let read = read_bundle(out.path()).unwrap();
-        assert_eq!(read.pipeline_yaml, yaml_body);
+        let read = read_bundle(&out).expect("bundle read must succeed");
+        assert_eq!(read.pipeline_yaml, YAML);
+        assert_eq!(read.run_inputs.vars, inputs.vars);
+        assert_eq!(read.run_inputs.env, inputs.env);
+        assert_eq!(read.run_inputs.secrets, inputs.secrets);
+        assert_eq!(read.llm_entries.len(), 2);
+        assert_eq!(read.llm_entries[0].key, "k1");
+        assert_eq!(read.llm_entries[1].key, "k2");
+        assert_eq!(read.tool_entries.len(), 2);
+        assert_eq!(read.tool_entries[0].key, "aaaa");
+        assert_eq!(
+            read.tool_entries[0].outcome,
+            ToolTapeOutcome::Ok {
+                content: "first".into()
+            }
+        );
+    }
+
+    #[test]
+    fn capture_masks_secrets_and_redacts_vars_and_env() {
+        let secrets = BTreeMap::from([("T".to_string(), "sk-live-123456".to_string())]);
+        let redactor = Redactor::new(&secrets);
+        let vars = BTreeMap::from([(
+            "auth".to_string(),
+            serde_json::json!("Bearer sk-live-123456"),
+        )]);
+        let env = BTreeMap::from([("X".to_string(), "pre sk-live-123456".to_string())]);
+
+        let captured = BundleRunInputs::capture(&vars, &env, &secrets, &redactor);
+
+        let json = serde_json::to_string(&captured).unwrap();
+        assert!(!json.contains("sk-live-123456"), "{json}");
+        assert_eq!(captured.secrets["T"], "***");
+        assert_eq!(captured.vars["auth"], "Bearer ***");
+        assert_eq!(captured.env["X"], "pre ***");
+    }
+
+    #[test]
+    fn write_with_no_tapes_emits_header_yaml_inputs_trailer() {
+        let (_dir, path) = fresh_bundle();
+
+        let read = read_bundle(&path).unwrap();
+        assert_eq!(read.pipeline_yaml, YAML);
         assert!(read.llm_entries.is_empty());
         assert!(read.tool_entries.is_empty());
+        assert_eq!(bundle_lines(&path).len(), 4);
+    }
+
+    #[test]
+    fn truncated_bundle_without_trailer_is_rejected() {
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
+        let last = lines.pop().unwrap();
+        assert!(last.contains(r#""type":"bundle_trailer""#), "{last}");
+        rewrite(&path, &lines);
+
+        let err = read_bundle(&path).expect_err("no trailer must be an error");
+        assert!(matches!(err, BundleError::MissingTrailer), "{err:?}");
+    }
+
+    #[test]
+    fn bundle_without_header_is_rejected() {
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
+        lines.remove(0);
+        rewrite(&path, &lines);
+
+        let err = read_bundle(&path).expect_err("header-less bundle must be rejected");
+        assert!(matches!(err, BundleError::MissingHeader), "{err:?}");
+    }
+
+    #[test]
+    fn duplicate_pipeline_yaml_is_rejected() {
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
+        let yaml_line = lines[1].clone();
+        lines.insert(2, yaml_line);
+        rewrite(&path, &lines);
+
+        let err = read_bundle(&path).expect_err("two pipeline_yaml lines must be rejected");
+        assert!(
+            matches!(
+                err,
+                BundleError::DuplicateSection {
+                    section: "pipeline_yaml",
+                    line: 3
+                }
+            ),
+            "{err:?}",
+        );
     }
 
     #[test]
     fn missing_pipeline_yaml_is_rejected() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"bundle_header","format_version":{CURRENT_BUNDLE_VERSION}}}"#,
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
+        lines.remove(1);
+        // Dropping a body line also breaks the digest, so re-seal the trailer.
+        lines.pop();
+        let mut hasher = Blake3Hasher::new();
+        for l in &lines {
+            hasher.update(l.as_bytes());
+            hasher.update(b"\n");
+        }
+        let trailer = serde_json::to_string(&BundleEntry::BundleTrailer {
+            blake3: hasher.finalize().to_hex().to_string(),
+        })
+        .unwrap();
+        lines.push(trailer);
+        rewrite(&path, &lines);
+
+        let err = read_bundle(&path).expect_err("must reject bundle without pipeline_yaml");
+        assert!(
+            matches!(
+                err,
+                BundleError::MissingSection {
+                    section: "pipeline_yaml"
+                }
+            ),
+            "{err:?}",
+        );
+    }
+
+    #[test]
+    fn old_format_bundle_is_refused_naming_both_versions() {
+        // An old bundle's later lines no longer parse; the version check
+        // on the header must fire first.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("old.ndjson");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"bundle_header","format_version":1}"#,
+                "\n",
+                r#"{"type":"llm_entry","req":{"provider":"x"},"outcome":{"kind":"ok"}}"#,
+                "\n",
+            ),
         )
         .unwrap();
-        f.flush().unwrap();
 
-        let err = read_bundle(f.path()).expect_err("must reject bundle without pipeline_yaml");
-        assert!(matches!(err, BundleError::MissingPipelineYaml));
+        let err = read_bundle(&path).expect_err("v1 bundle must be refused");
+        match &err {
+            BundleError::IncompatibleVersion { found, expected } => {
+                assert_eq!((*found, *expected), (1, CURRENT_BUNDLE_VERSION));
+            },
+            other => panic!("expected IncompatibleVersion, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains('1') && msg.contains(&CURRENT_BUNDLE_VERSION.to_string()),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn future_format_version_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("future.ndjson");
+        std::fs::write(
+            &path,
+            "{\"type\":\"bundle_header\",\"format_version\":999}\n",
+        )
+        .unwrap();
+
+        let err = read_bundle(&path).expect_err("must reject incompatible version");
+        assert!(
+            matches!(err, BundleError::IncompatibleVersion { found: 999, .. }),
+            "{err:?}",
+        );
     }
 
     #[test]
     fn corrupt_line_is_rejected_with_line_number() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"bundle_header","format_version":{CURRENT_BUNDLE_VERSION}}}"#,
-        )
-        .unwrap();
-        writeln!(f, "{{not json").unwrap();
-        f.flush().unwrap();
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
+        lines.insert(1, "{not json".to_string());
+        rewrite(&path, &lines);
 
-        let err = read_bundle(f.path()).expect_err("corrupt line must be rejected");
-        match err {
+        match read_bundle(&path).expect_err("corrupt line must be rejected") {
             BundleError::ParseError { line, .. } => assert_eq!(line, 2),
             other => panic!("expected ParseError, got {other:?}"),
         }
     }
 
     #[test]
-    fn future_format_version_is_rejected() {
-        // Defense against silent misinterpretation: a bundle written by
-        // a future build with new entry types must not be replayed by an
-        // older reader that would skip them as `BundleHeader { .. }`.
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, r#"{{"type":"bundle_header","format_version":999}}"#).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"pipeline_yaml","content":"version: 1\nnodes: []\n"}}"#
-        )
-        .unwrap();
-        f.flush().unwrap();
-
-        let err = read_bundle(f.path()).expect_err("must reject incompatible version");
-        match err {
-            BundleError::IncompatibleVersion { found, expected } => {
-                assert_eq!(found, 999);
-                assert_eq!(expected, CURRENT_BUNDLE_VERSION);
-            },
-            other => panic!("expected IncompatibleVersion, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn header_uses_current_bundle_version_constant() {
-        // Pin the wire-format version emitted by `write_bundle` to the
-        // public constant so an unintentional bump is caught here
-        // before it escapes a release.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).unwrap();
-
-        let raw = std::fs::read_to_string(out.path()).unwrap();
-        let header_line = raw.lines().next().expect("bundle has at least one line");
+        let (_dir, path) = fresh_bundle();
+        let lines = bundle_lines(&path);
         assert!(
-            header_line.contains(&format!(r#""format_version":{CURRENT_BUNDLE_VERSION}"#)),
-            "header line `{header_line}` must encode CURRENT_BUNDLE_VERSION = {CURRENT_BUNDLE_VERSION}",
+            lines[0].contains(&format!(r#""format_version":{CURRENT_BUNDLE_VERSION}"#)),
+            "header line `{}` must encode CURRENT_BUNDLE_VERSION = {CURRENT_BUNDLE_VERSION}",
+            lines[0],
         );
     }
 
     #[test]
+    fn failed_write_leaves_no_file_at_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("bundle.ndjson");
+        let missing_tape = dir.path().join("missing.ndjson");
+
+        write(YAML, Some(&missing_tape), None, &out).expect_err("missing tape must fail");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "partial output left behind: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn failed_write_keeps_the_previous_bundle_intact() {
+        let (dir, path) = fresh_bundle();
+        let before = std::fs::read(&path).unwrap();
+
+        let missing_tape = dir.path().join("missing.ndjson");
+        write(YAML, Some(&missing_tape), None, &path).expect_err("missing tape must fail");
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn bearer_token_is_scrubbed_in_bundle() {
-        // Real-world threat: a debug bundle gets shared in a bug
-        // report, leaking the bearer token verbatim. Scrub on write
-        // must replace the literal value with the placeholder.
         let yaml_body = "\
 version: 1
 mcp_servers:
@@ -745,10 +1063,11 @@ nodes:
     kind: shell
     command: \"true\"
 ";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("bundle.ndjson");
+        write(yaml_body, None, None, &out).expect("bundle write");
 
-        let read = read_bundle(out.path()).expect("bundle read");
+        let read = read_bundle(&out).expect("bundle read");
         assert!(
             !read.pipeline_yaml.contains("sk-very-secret-bearer-abc123"),
             "literal bearer token must not survive bundle write: {}",
@@ -762,10 +1081,43 @@ nodes:
     }
 
     #[test]
+    fn stdio_env_headers_and_basic_password_are_scrubbed() {
+        let yaml_body = "\
+version: 1
+mcp_servers:
+  local:
+    transport: stdio
+    command: [srv]
+    env:
+      API_THING: literal-env-value
+  remote:
+    transport: http
+    url: https://mcp.example.com
+    headers:
+      Authorization: Bearer literal-header-value
+    auth:
+      kind: basic
+      user: bob
+      password: literal-basic-pw
+nodes:
+  - id: n
+    kind: shell
+    command: \"true\"
+";
+        let scrubbed = scrub_pipeline_secrets(yaml_body).expect("scrub");
+        for leaked in [
+            "literal-env-value",
+            "literal-header-value",
+            "literal-basic-pw",
+        ] {
+            assert!(!scrubbed.contains(leaked), "{leaked} leaked: {scrubbed}");
+        }
+        assert!(scrubbed.contains("bob"), "username is not a credential");
+    }
+
+    #[test]
     fn templated_bearer_token_is_left_intact() {
-        // Templates are placeholders — `secrets.X` resolves at run /
-        // replay time. Scrubbing them would break replay because the
-        // template would no longer exist for the renderer to fill in.
+        // Templates are placeholders — `secrets.X` resolves at run time.
         let yaml_body = "\
 version: 1
 secrets:
@@ -782,10 +1134,11 @@ nodes:
     kind: shell
     command: \"true\"
 ";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("bundle.ndjson");
+        write(yaml_body, None, None, &out).expect("bundle write");
 
-        let read = read_bundle(out.path()).expect("bundle read");
+        let read = read_bundle(&out).expect("bundle read");
         assert!(
             read.pipeline_yaml.contains("{{ secrets.PROD_TOKEN }}"),
             "template-form token must be preserved verbatim: {}",
@@ -800,9 +1153,7 @@ nodes:
 
     #[test]
     fn pipeline_with_no_bearer_auth_is_not_modified() {
-        // Common-case no-op: a pipeline with no MCP HTTP bearer auth
-        // must round-trip the YAML byte-for-byte so comments and
-        // whitespace survive for human inspection of the bundle.
+        // Comments and whitespace survive for human inspection.
         let yaml_body = "\
 # top-of-file comment
 version: 1
@@ -811,10 +1162,11 @@ nodes:
     kind: shell
     command: \"true\"   # trailing comment
 ";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("bundle.ndjson");
+        write(yaml_body, None, None, &out).unwrap();
 
-        let read = read_bundle(out.path()).unwrap();
+        let read = read_bundle(&out).unwrap();
         assert_eq!(
             read.pipeline_yaml, yaml_body,
             "no-bearer pipeline must be embedded verbatim",
@@ -822,157 +1174,53 @@ nodes:
     }
 
     #[test]
-    fn bundle_round_trip_integrity_verified() {
-        // BS4 contract: a pristine bundle written by `write_bundle` must
-        // round-trip through `read_bundle` without tripping the BLAKE3
-        // integrity check. Sanity: the pipeline YAML survives intact and
-        // both tape vectors come back populated, proving the trailer's
-        // digest covers the body lines but does not reject them.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let llm = vec![sample_tape_entry("alpha"), sample_tape_entry("beta")];
-        let tools = vec![sample_tool_entry("aaaa", "out-a")];
-
-        let llm_tape = write_tape(&llm);
-        let tool_tape = write_tape(&tools);
-        let out = tempfile::NamedTempFile::new().unwrap();
-
-        write_bundle(
-            yaml_body,
-            Some(llm_tape.path()),
-            Some(tool_tape.path()),
-            out.path(),
-        )
-        .expect("bundle write");
-
-        let read = read_bundle(out.path()).expect("bundle read must verify integrity");
-        assert_eq!(read.pipeline_yaml, yaml_body);
-        assert_eq!(read.llm_entries.len(), 2);
-        assert_eq!(read.tool_entries.len(), 1);
-    }
-
-    #[test]
     fn bundle_tampered_body_is_rejected() {
-        // BS4 anti-tamper guarantee: flipping a single byte inside a body
-        // line must surface as `BundleError::IntegrityMismatch` so a
-        // shared bundle cannot be silently mutated between record and
-        // replay. Mutate the `pipeline_yaml` line so the tampered bundle
-        // remains structurally valid JSON-per-line and the reader still
-        // recomputes the BLAKE3 hash to compare against the trailer.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
-
-        let raw = std::fs::read_to_string(out.path()).expect("read raw bundle");
-        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
-
-        // Find and corrupt the pipeline_yaml line. Replacing a substring
-        // that is guaranteed to be present keeps the JSON parseable
-        // (so the corruption surfaces as IntegrityMismatch and not as
-        // ParseError).
+        let (_dir, path) = fresh_bundle();
+        let mut lines = bundle_lines(&path);
         let yaml_idx = lines
             .iter()
             .position(|l| l.contains(r#""type":"pipeline_yaml""#))
             .expect("pipeline_yaml line must be present");
         lines[yaml_idx] = lines[yaml_idx].replace("version: 1", "version: 2");
+        rewrite(&path, &lines);
 
-        let tampered = lines.join("\n") + "\n";
-        std::fs::write(out.path(), tampered).expect("rewrite tampered bundle");
-
-        let err = read_bundle(out.path()).expect_err("tampered bundle must be rejected");
-        match err {
-            BundleError::IntegrityMismatch { expected, actual } => {
-                assert_ne!(
-                    expected, actual,
-                    "expected vs actual digests must differ on a tampered body",
-                );
-            },
+        match read_bundle(&path).expect_err("tampered bundle must be rejected") {
+            BundleError::IntegrityMismatch { expected, actual } => assert_ne!(expected, actual),
             other => panic!("expected IntegrityMismatch, got {other:?}"),
         }
     }
 
     #[test]
-    fn bundle_missing_trailer_warns_but_succeeds() {
-        // BS4 forward-compat path: pre-BS4 bundles (and bundles truncated
-        // mid-write) have no `bundle_trailer` line. The reader logs a
-        // `tracing::warn!` and returns `Ok` rather than rejecting, so old
-        // bundles still replay. Strip the last line — which is always the
-        // trailer for a freshly written bundle — and assert read succeeds.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
-
-        let raw = std::fs::read_to_string(out.path()).expect("read raw bundle");
-        let mut lines: Vec<&str> = raw.lines().collect();
-        let last = lines.pop().expect("bundle has at least one line");
-        assert!(
-            last.contains(r#""type":"bundle_trailer""#),
-            "last line of a fresh bundle must be the trailer: {last}",
-        );
-
-        let truncated = lines.join("\n") + "\n";
-        std::fs::write(out.path(), truncated).expect("rewrite truncated bundle");
-
-        let read = read_bundle(out.path())
-            .expect("missing trailer must warn rather than error so pre-BS4 bundles still replay");
-        assert_eq!(read.pipeline_yaml, yaml_body);
-    }
-
-    #[test]
     fn read_bundle_rejects_post_trailer_content() {
-        // Anti-tamper guarantee: lines appearing after a valid integrity
-        // trailer are outside the hashed body and must not be silently
-        // dropped. An attacker who appends a structurally valid NDJSON
-        // entry must surface as `ExtraContentAfterTrailer`, not as the
-        // misleading downstream errors that arise from dropping the bytes.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let llm = vec![sample_tape_entry("alpha")];
-        let llm_tape = write_tape(&llm);
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, Some(llm_tape.path()), None, out.path()).expect("bundle write");
+        let llm_tape = write_tape(&[llm_entry("k", "a")]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bundle.ndjson");
+        write(YAML, Some(llm_tape.path()), None, &path).expect("bundle write");
 
-        // Append a structurally valid bundle line after the trailer. The
-        // appended bytes are not covered by the trailer's BLAKE3 digest,
-        // so a permissive reader would silently process them.
-        let appended = sample_tape_entry("appended");
-        let extra_line =
-            serde_json::to_string(&BundleEntry::LlmEntry(appended)).expect("serialize entry");
-        let mut existing = std::fs::read_to_string(out.path()).expect("read raw bundle");
-        existing.push_str(&extra_line);
+        let extra = serde_json::to_string(&BundleEntry::LlmEntry(llm_entry("late", "b"))).unwrap();
+        let mut existing = std::fs::read_to_string(&path).unwrap();
+        existing.push_str(&extra);
         existing.push('\n');
-        std::fs::write(out.path(), existing).expect("rewrite bundle with post-trailer line");
+        std::fs::write(&path, existing).unwrap();
 
-        let err = read_bundle(out.path()).expect_err("post-trailer content must be rejected");
-        match err {
-            BundleError::ExtraContentAfterTrailer { line_count } => {
-                assert_eq!(line_count, 1, "exactly one line was appended");
-            },
+        match read_bundle(&path).expect_err("post-trailer content must be rejected") {
+            BundleError::ExtraContentAfterTrailer { line_count } => assert_eq!(line_count, 1),
             other => panic!("expected ExtraContentAfterTrailer, got {other:?}"),
         }
     }
 
     #[test]
     fn read_bundle_rejects_garbage_after_trailer() {
-        // The post-trailer guard must fire before the JSON parse so
-        // garbage bytes after the trailer surface as
-        // `ExtraContentAfterTrailer`, not as `ParseError`. Without this
-        // ordering, an attacker appending non-JSON would get a misleading
-        // parse error message that hides the integrity violation.
-        let yaml_body = "version: 1\nnodes:\n  - id: n\n    kind: shell\n    command: \"true\"\n";
-        let out = tempfile::NamedTempFile::new().unwrap();
-        write_bundle(yaml_body, None, None, out.path()).expect("bundle write");
-
-        let mut existing = std::fs::read_to_string(out.path()).expect("read raw bundle");
+        // The guard fires before the JSON parse, so garbage surfaces as
+        // tampering rather than a parse error.
+        let (_dir, path) = fresh_bundle();
+        let mut existing = std::fs::read_to_string(&path).unwrap();
         existing.push_str("not valid json !!!!\n");
-        std::fs::write(out.path(), existing).expect("rewrite bundle with garbage trailer line");
+        std::fs::write(&path, existing).unwrap();
 
-        let err = read_bundle(out.path()).expect_err("garbage after trailer must be rejected");
-        match err {
-            BundleError::ExtraContentAfterTrailer { line_count } => {
-                assert_eq!(line_count, 1);
-            },
-            other => panic!(
-                "expected ExtraContentAfterTrailer (guard must fire before JSON parse), got {other:?}",
-            ),
+        match read_bundle(&path).expect_err("garbage after trailer must be rejected") {
+            BundleError::ExtraContentAfterTrailer { line_count } => assert_eq!(line_count, 1),
+            other => panic!("expected ExtraContentAfterTrailer, got {other:?}"),
         }
     }
 }

@@ -1,6 +1,6 @@
 # How to tighten the budget
 
-Budget knobs are how you bound cost before any spend. This guide shows how to size each knob, how to detect breaches early, and how to reduce a runaway pipeline to a known ceiling.
+Budget knobs bound cost before any spend happens. This guide covers how to size each knob, how to spot a breach early, and how to pin a runaway pipeline to a known ceiling.
 
 ## The four budget knobs
 
@@ -9,25 +9,25 @@ Every agent has four budget-related fields under `policy:`:
 | Knob                  | Bounds                                                  | Breach event                          |
 | --------------------- | ------------------------------------------------------- | ------------------------------------- |
 | `max_iterations`      | Loop turns (model → tools → loop)                       | `IterationLimitExceeded`              |
-| `max_total_tokens`    | Sum of all LLM token usage in this agent's loop         | `BudgetExceeded { kind: Tokens }`     |
-| `max_tool_calls`      | Count of every attempted tool call (incl. denied ones)  | `BudgetExceeded { kind: ToolCalls }`  |
+| `max_total_tokens`    | Sum of all LLM token usage across the agent and its subagent tree | `BudgetExceeded { kind: Tokens }`     |
+| `max_tool_calls`      | Count of every attempted tool call (incl. denied ones, and every subagent's) | `BudgetExceeded { kind: ToolCalls }`  |
 | `max_subagent_depth`  | Recursion depth for `subagent.<name>` calls             | `SubagentDepthExceeded` (denial)      |
 
-A fifth, related, knob lives at the **node** level:
+A fifth, related knob lives at the **node** level:
 
 | Knob       | Bounds                                                  | Breach event   |
 | ---------- | ------------------------------------------------------- | -------------- |
 | `timeout:` | Wall-clock deadline (applies to agent and shell nodes)  | `NodeTimedOut` |
 
-## Step 1 — Use `orno plan` to see the worst case
+## Step 1: Use `orno plan` to see the worst case
 
-Before running anything, get a worst-case ceiling for the entire pipeline:
+Before running anything, get a worst-case ceiling for the whole pipeline:
 
 ```bash
 orno plan pipeline.yaml | jq '.'
 ```
 
-The `plan_summary` line gives the totals across all nodes:
+The `plan_summary` line gives totals across all nodes:
 
 ```json
 {
@@ -42,11 +42,11 @@ The `plan_summary` line gives the totals across all nodes:
 }
 ```
 
-This is the ceiling. The actual run will spend less; it will never spend more. Treat `max_tokens_total` as the upper bound for cost estimation.
+That's the ceiling. A real run spends less and never more, so use `max_tokens_total` as the upper bound when you estimate cost.
 
-## Step 2 — Size each knob
+## Step 2: Size each knob
 
-The right approach is "set bounds slightly above your observed peak." Recommended starting points by agent shape:
+Set each bound slightly above the peak you've observed. If you haven't observed anything yet, these starting points work by agent shape.
 
 ### Cheap, tool-free agent (greeter, classifier, summarizer)
 
@@ -58,7 +58,7 @@ policy:
   max_subagent_depth: 0
 ```
 
-One turn, no tools. Maximum spend: a single LLM round-trip.
+One turn, no tools. The most it can spend is a single LLM round-trip.
 
 ### Read-only agent with WebFetch / Read
 
@@ -70,7 +70,7 @@ policy:
   max_subagent_depth: 0
 ```
 
-Up to six turns; expects to do at most a handful of reads or fetches per turn. Headroom for a few false starts.
+Up to six turns, with at most a handful of reads or fetches per turn. That leaves room for a few false starts.
 
 ### Mutating agent (Edit, Write, Bash)
 
@@ -82,7 +82,7 @@ policy:
   max_subagent_depth: 0
 ```
 
-Coding-style workloads need iteration headroom — the model often probes the codebase for several turns before committing changes.
+Coding workloads need more iterations. The model often probes the codebase for several turns before it commits to a change.
 
 ### Parent reviewer with subagents
 
@@ -94,28 +94,30 @@ policy:
   max_subagent_depth: 1
 ```
 
-Parent's `max_total_tokens` covers only its own LLM turns. Subagent token spend is counted against the **child's** `max_total_tokens`, not the parent's.
+`max_total_tokens` and `max_tool_calls` cover the whole subagent tree. A child's spend and tool calls count against the parent and every ancestor, and the child's own cap applies on top. Iterations stay per loop.
 
-## Step 3 — Watch the actual spend
+## Step 3: Watch the actual spend
 
-During a run, every `agent_iteration_finished` envelope reports the cumulative usage so far:
+During a run, every `llm_response_received` envelope carries that call's `usage`. Pull the per-call numbers with `jq`:
 
 ```bash
 orno run pipeline.yaml --secrets-file .env.secrets \
-  | jq -c 'select(.event.type == "agent_iteration_finished") | {iter: .event.iteration, tokens: .event.cumulative_tokens, calls: .event.cumulative_tool_calls}'
+  | jq -c 'select(.event.type == "llm_response_received") | {node: .event.node_id, tokens: .event.usage.total_tokens}'
 ```
 
-You'll see the trajectory:
+`usage` is `null` when the provider omits token counts. The token budget can't charge such a response, and orno logs a warning.
+
+The output shows the trajectory:
 
 ```json
-{"iter":1,"tokens":2150,"calls":2}
-{"iter":2,"tokens":4982,"calls":5}
-{"iter":3,"tokens":8123,"calls":7}
+{"node":"review","tokens":2150}
+{"node":"review","tokens":2832}
+{"node":"review","tokens":3141}
 ```
 
-If the trajectory is steeper than you expected, the bound will trip eventually. Decide whether to raise the bound or fix the prompt.
+If it climbs faster than you expected, the bound will trip eventually. Decide whether to raise the bound or fix the prompt.
 
-## Step 4 — Read a budget breach
+## Step 4: Read a budget breach
 
 When a budget trips, the loop terminates and the node ends with a typed failure:
 
@@ -130,19 +132,19 @@ Output:
 {
   "event": {
     "type": "node_finished",
+    "run_id": "run_...",
     "node_id": "review",
+    "node_kind": "agent",
     "ok": false,
     "failure": {
-      "kind": "BudgetExceeded",
-      "budget_kind": "Tokens",
-      "limit": 30000,
-      "consumed": 30214
+      "kind": "budget_exceeded",
+      "budget_kind": "tokens"
     }
   }
 }
 ```
 
-The `budget_kind` discriminates `Tokens` vs. `ToolCalls`, so a downstream alerting system can branch on the dimension that breached without parsing the human-readable error message.
+`budget_kind` is either `tokens` or `tool_calls`. A downstream alerting system can branch on it without parsing the human-readable error message.
 
 For `IterationLimitExceeded`:
 
@@ -150,39 +152,40 @@ For `IterationLimitExceeded`:
 {
   "event": {
     "type": "node_finished",
+    "run_id": "run_...",
     "node_id": "review",
+    "node_kind": "agent",
     "ok": false,
     "failure": {
-      "kind": "IterationLimitExceeded",
-      "limit": 10,
-      "iterations": 10
+      "kind": "iteration_limit_exceeded",
+      "max_iterations": 10
     }
   }
 }
 ```
 
-## Step 5 — Tighten an over-provisioned bound
+## Step 5: Tighten an over-provisioned bound
 
-Once you have a few representative runs, tighten the bounds. Rule of thumb:
+Once you have a few representative runs, tighten the bounds. A rule of thumb:
 
 ```
 new_bound = ceil(observed_p99 × 1.2)
 ```
 
-A 20% headroom over the p99 catches reasonable variance without leaving slack a runaway model can exploit.
+Twenty percent over the p99 absorbs ordinary variance and leaves little slack for a runaway model to use.
 
-For example, if your reviewer never spent more than 24,000 tokens across 50 representative runs:
+Say your reviewer never spent more than 24,000 tokens across 50 representative runs:
 
 ```yaml
 policy:
   max_total_tokens: 30_000      # ceil(24_000 * 1.2) = 28_800, round up
 ```
 
-A run that suddenly spends 50,000 tokens trips the budget and terminates instead of completing — that's the desired behavior. Cost is bounded; investigation can find why the spend spiked.
+A run that suddenly spends 50,000 tokens trips the budget and terminates instead of completing. That's what you want: cost stays bounded, and you can investigate the spike afterward.
 
-## Step 6 — Wall-clock as a separate dimension
+## Step 6: Wall-clock as a separate dimension
 
-`policy` has no `max_wall_clock` field — by design. Wall-clock is a node-level attribute:
+`policy` has no `max_wall_clock` field, by design. Wall-clock is a node-level attribute:
 
 ```yaml
 nodes:
@@ -192,34 +195,32 @@ nodes:
     timeout: 300         # seconds; applies to agent and shell nodes alike
 ```
 
-Why separate? Because wall-clock is an executor concern, not an agent-loop concern. A shell node can also time out; the field lives on the node, not the policy.
+Why separate? Wall-clock is an executor concern, not an agent-loop concern. Shell nodes can time out too, so the field lives on the node, not the policy.
 
-A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. It does **not** fire when an agent is mid-LLM-call; orno polls for the deadline between turns. To kill mid-call you need OS-level signals (e.g., `timeout` wrapper around `orno run`).
+A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. The deadline wraps the whole node, so it also cuts off an LLM call or tool call still in flight, and it kills a shell node's process group. A timed-out shell node still reports the tail of its stderr in `failure.stderr_tail`.
 
-## Step 7 — Counting denied calls
+## Step 7: Counting denied calls
 
-`max_tool_calls` includes denied calls. A model that emits 20 forbidden tool names burns 20 tool-call budget entries even though none of them executed. This is intentional: a malicious or confused model cannot exhaust the budget by spamming denied calls without paying for them.
+`max_tool_calls` includes denied calls. A model that emits 20 forbidden tool names burns 20 tool-call budget entries even though none of them ran. This is intentional. A malicious or confused model can't exhaust the budget by spamming denied calls for free.
 
-If you're seeing budget breaches with no successful tool calls:
+If you see budget breaches with no successful tool calls, look for denials:
 
 ```bash
 orno run pipeline.yaml --secrets-file .env.secrets \
   | jq -c 'select(.event.type == "tool_denied")'
 ```
 
-You'll see the denials. The model is calling forbidden tools — usually because the prompt didn't tell it which tools it has, or because the tool surface is misconfigured. Fix the prompt or the surface, not the budget.
+The model is calling forbidden tools, usually because the prompt didn't say which tools it has or because the tool surface is misconfigured. Fix the prompt or the surface, not the budget.
 
-## Step 8 — Subagent budget composition
+## Step 8: Subagent budget composition
 
-A subagent's spend does **not** count against its parent's `max_total_tokens`. Each agent has its own budget. The parent's loop sees the child's spend reflected as a single tool result.
+A subagent's spend **does** count against its parent. Tokens and tool calls are charged up the whole chain, so grandchild spend lands on the root. The tightest limit up the chain applies to each request.
 
-This means a parent with `max_total_tokens: 10_000` can dispatch three subagents that each spend 30,000 tokens, for an effective tree spend of 100,000 tokens. To bound the tree's total spend, set each child's budget conservatively.
+The root's `max_total_tokens` therefore bounds the tree's total spend, and each child's own cap still bounds that child. `orno plan` reports `max_tokens_total` as the sum across agents, which is a looser ceiling than the root's cap.
 
-A useful heuristic for trees: `parent_budget + (subagent_count × child_budget)` is the worst case. `orno plan` reports `max_tokens_total` as the sum across all agents, which is exactly this number.
+## Recipe 1: emergency lockdown
 
-## Recipe 1 — emergency lockdown
-
-You suspect a runaway agent. Reduce its budget to the absolute minimum:
+You suspect a runaway agent. Cut its budget to the minimum:
 
 ```yaml
 policy:
@@ -229,11 +230,11 @@ policy:
   max_subagent_depth: 0
 ```
 
-This forces the agent to one or two productive turns. If it still trips the budget, the problem is the prompt, not the agent — re-prompt or re-architect.
+That leaves the agent one or two productive turns. If it still trips the budget, the problem is the prompt, not the agent. Re-prompt or re-architect.
 
-## Recipe 2 — exploration session
+## Recipe 2: exploration session
 
-You're iterating on a prompt and don't yet know the right bounds. Allow generous headroom and watch:
+You're iterating on a prompt and don't know the right bounds yet. Allow generous headroom and watch:
 
 ```yaml
 policy:
@@ -246,16 +247,16 @@ on_parse_error: retry_once
 
 After 5–10 runs, tighten to the observed p99 + 20%.
 
-## Recipe 3 — cost-capped CI run
+## Recipe 3: cost-capped CI run
 
-A scheduled CI job needs a hard cost ceiling. Compute the worst-case cost from `orno plan`:
+A scheduled CI job needs a hard cost ceiling. Get the worst-case token count from `orno plan`:
 
 ```bash
-orno plan pipeline.yaml | jq -r '.[] | select(.type == "plan_summary") | .max_tokens_total'
+orno plan pipeline.yaml | jq -r 'select(.type == "plan_summary") | .max_tokens_total'
 # 130000
 ```
 
-At ~$0.001 per 1000 tokens for a cheap model, that's $0.13 worst-case. If the budget needs to be lower, edit the policy fields and re-plan.
+At ~$0.001 per 1000 tokens for a cheap model, that's $0.13 worst-case. To go lower, edit the policy fields and re-plan.
 
 ## Failure modes summary
 
@@ -269,6 +270,6 @@ At ~$0.001 per 1000 tokens for a cheap model, that's $0.13 worst-case. If the bu
 
 ## See also
 
-- [Pipeline YAML › `policy` semantics](../reference/pipeline-yaml.md#policy-semantics) — every policy field with its default.
-- [Events › `agent_iteration_finished`](../reference/events.md#agent_iteration_finished) — the schema you read for usage telemetry.
-- [Strict agentic loops › Bounded resources](../explanation/strict-agentic-loops.md#4-bounded-resources) — rationale.
+- [Pipeline YAML › `policy` semantics](../reference/pipeline-yaml.md#policy-semantics): every policy field with its default.
+- [Events › `llm_response_received`](../reference/events.md#llm_response_received): the schema you read for usage telemetry.
+- [Strict agentic loops › Bounded resources](../explanation/strict-agentic-loops.md#4-bounded-resources): rationale.
