@@ -64,7 +64,7 @@ impl ToolHandler for ReadHandler {
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_file(root, &path).await?
         } else {
-            // BS1: empty roots means no jail boundary — refuse rather than
+            // Empty roots means no jail boundary — refuse rather than
             // allowing unrestricted host filesystem access.
             return Err(ToolError::Denied {
                 reason: "Read tool requires a non-empty `roots` list; \

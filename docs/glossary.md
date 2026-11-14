@@ -72,8 +72,6 @@ Vocabulary you will see in the docs, in the codebase, and in event logs. Terms a
 
 **`nodes.<id>.state.<key>`.** Scoped state key written by an upstream agent's `SetState` call.
 
-**`nodes.<id>.status`.** Terminal `NodeStatus` for any completed upstream node: `completed | failed | timed_out | skipped`.
-
 ## MCP
 
 **MCP.** Model Context Protocol — the protocol for connecting agents to tool servers. orno acts as the MCP client.

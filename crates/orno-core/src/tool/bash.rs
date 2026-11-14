@@ -155,7 +155,7 @@ impl ToolHandler for BashHandler {
             command = %command,
             timeout_secs,
             cwd = cwd.as_deref().unwrap_or(""),
-            call_id = %inv.call_id,
+            tool.call_id = %inv.call_id,
             "invoking shell command",
         );
 
@@ -391,7 +391,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn no_cwd_with_empty_roots_is_allowed() {
-        // Regression guard for the audit fix's scope: the empty-roots
+        // Regression guard for the deny scope: the empty-roots
         // deny path must fire ONLY when the LLM passes an explicit `cwd`.
         // A bash call without `cwd` has no chdir to jail, so it must
         // continue to succeed even when the agent has no roots

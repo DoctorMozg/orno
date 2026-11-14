@@ -28,9 +28,8 @@ reqwest = { workspace = true }
 rmcp = { workspace = true }
 aho-corasick = { workspace = true }
 base64 = { workspace = true }
-hex = { workspace = true }
 lru = { workspace = true }
-async-trait = "0.1"
+async-trait = { workspace = true }
 # `tempfile::NamedTempFile` is used by the `EditHandler` / `WriteHandler`
 # atomic-write path in production, so the dep stays in `[dependencies]`
 # rather than `[dev-dependencies]`.

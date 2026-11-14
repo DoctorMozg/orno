@@ -10,7 +10,7 @@ Every `agent` node enforces five guarantees at runtime. A breach terminates the 
 
 1. **Bounded iteration.** `policy.max_iterations` caps how many times the agent loop can turn. Hit the cap → `IterationLimitExceeded` → terminate.
 2. **Bounded tool surface.** `allowed_tools` is the closed set of names the model may call. Anything else → `UnknownToolCalled` → terminate.
-3. **Bounded effects.** `policy.allow_mutations`, `policy.allow_network`, and `policy.allowed_domains` / `blocked_domains` gate what tools can actually do. Violation → `MutatingCallBlocked` / `NetworkBlocked` / `DomainBlocked`, and the model sees the denial as a tool result.
+3. **Bounded effects.** `policy.allow_mutations`, `policy.allow_network`, and `policy.allowed_domains` / `blocked_domains` gate what tools can actually do. Violation → a `tool_denied` event, and the model sees the denial as a tool result.
 4. **Bounded resources.** `policy.max_total_tokens` and `policy.max_tool_calls` cap LLM and tool consumption. Subagent depth is capped by `policy.max_subagent_depth`. Wall-clock deadlines are a node-level `timeout:` attribute and apply to agent and shell nodes alike.
 5. **Bounded non-determinism.** Every LLM request, every tool call, and every MCP exchange can be recorded into a bundle (`orno run --record-bundle`), and the bundle can be replayed (`orno replay`) to reproduce outputs, exit code, and event log byte-for-byte.
 

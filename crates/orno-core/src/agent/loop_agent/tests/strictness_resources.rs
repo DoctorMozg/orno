@@ -206,7 +206,7 @@ async fn max_tokens_decrements_across_iterations() {
 
 #[tokio::test]
 async fn tool_output_truncated_in_conversation_history() {
-    // WU-3.1 regression: a tool result whose byte length exceeds
+    // A tool result whose byte length exceeds
     // `policy.max_tool_output_bytes` must be head-truncated to the cap and an
     // ellipsis marker appended before being pushed onto `messages`. The
     // assertion targets the messages observed by the SECOND `complete()` call

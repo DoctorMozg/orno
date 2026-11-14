@@ -224,7 +224,7 @@ impl LlmTransport for RecordingScriptedTransport {
         self.systems_seen
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")
-            .push(req.system.clone());
+            .push(req.system.as_deref().map(str::to_string));
         self.messages_seen
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")

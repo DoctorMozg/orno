@@ -1,4 +1,4 @@
-//! Canned `LlmTransport` for the skeleton and for tests — returns a
+//! Canned `LlmTransport` for tests and offline CI — returns a
 //! deterministic response without touching the network.
 
 use std::collections::VecDeque;
@@ -11,6 +11,8 @@ use crate::error::LlmError;
 
 use super::{LlmRequest, LlmResponse, LlmTransport, OrnoChatToolCall, Usage};
 
+/// Returns the same canned reply for every request, echoing the model and
+/// the start of the prompt.
 #[derive(Debug, Default, Clone)]
 pub struct DummyTransport;
 
@@ -44,6 +46,7 @@ pub struct ScriptedTransport {
 }
 
 impl ScriptedTransport {
+    /// Serve `responses` in order, one per `complete` call.
     #[must_use]
     pub fn new(responses: Vec<LlmResponse>) -> Self {
         Self {
@@ -107,14 +110,7 @@ mod tests {
     use serde_json::json;
 
     fn sample_request() -> LlmRequest {
-        LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hello".into(),
-            None,
-            None,
-            None,
-        )
+        LlmRequest::from_prompt("openai", "gpt-5", "hello")
     }
 
     #[tokio::test]

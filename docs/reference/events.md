@@ -30,7 +30,7 @@ Every event is wrapped in:
 
 ### `run_started`
 
-Always the first event. Emitted before any node-level events.
+The first event once a run has started, emitted before any node-level event. A failure while loading the pipeline or resolving env and secrets happens earlier and emits no events at all: stdout stays empty and the error goes to stderr.
 
 ```json
 { "type": "run_started", "run_id": "run_01J5K9..." }
@@ -42,7 +42,9 @@ Always the first event. Emitted before any node-level events.
 
 ### `run_finished`
 
-Always the last event. Emitted after every node settles.
+Emitted after every node settles. Once a run has started it is always emitted, with `ok: false` when the run fails before or between nodes (the `vars:` render fails, the DAG walker fails, an MCP server fails its handshake, or SIGINT arrives).
+
+It is the last node-level event, not strictly the last line: MCP shutdown events (`mcp_server_shutting_down`, `mcp_server_exited`) follow it, because servers are drained after the engine returns.
 
 ```json
 {
@@ -61,7 +63,9 @@ Always the last event. Emitted after every node settles.
 | `failed_nodes`  | array of string | Node ids that finished `ok: false`, in causal order.                                                     |
 | `skipped_nodes` | array of string | Node ids that emitted `node_skipped`, in causal order.                                                   |
 
-A tail-line read of `run_finished` summarizes the run's failure footprint without folding the full envelope log.
+On SIGINT, `failed_nodes` is the sentinel `["<interrupted>"]`. See [exit codes](exit-codes.md#orno-run).
+
+`run_finished` summarizes the run's failure footprint without folding the full envelope log. Read the last `run_finished` line, not the last line of the stream.
 
 ### `node_started`
 
@@ -429,7 +433,7 @@ Carried on `node_finished.failure` exactly when `ok: false`. Internally tagged o
 | `no_executor_registered`  | `node_kind: string`                                     | The node's `kind:` had no registered executor — configuration mismatch between YAML and the embedder's registry.                     |
 | `template_render_failed`  | `error: string`                                         | MiniJinja rendering of the node's request failed (unknown variable, malformed expression, type mismatch).                            |
 | `executor_error`          | `error: string`                                         | The executor returned `Err`. Process spawn, transport error, etc.                                                                    |
-| `node_payload_failure`    | `exit_code: int?`, `stderr_tail: string?`               | The executor returned `Ok` but the payload signaled failure (today, only shell with non-zero exit). `stderr_tail` is bounded.        |
+| `node_payload_failure`    | `exit_code: int?`, `signal: int?`, `stderr_tail: string?` | The executor returned `Ok` but the payload signaled failure (today, only shell with non-zero exit). A normal exit sets `exit_code` and leaves `signal` null; a process killed by a signal (Unix) sets `signal` (e.g. `9`) and leaves `exit_code` null. `stderr_tail` is bounded. |
 | `iteration_limit_exceeded`| `max_iterations: int`                                   | Agent reached `max_iterations` without converging on a `stop` finish reason.                                                         |
 | `budget_exceeded`         | `budget_kind: "tokens" \| "tool_calls"`                 | Running budget breached.                                                                                                             |
 | `tool_denied`             | `tool_name: string`, `reason: string`                   | Reserved for future strict-mode use. Today, denials are non-terminal and fed back to the model.                                      |

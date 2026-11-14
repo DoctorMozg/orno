@@ -31,7 +31,7 @@ Even within the allowed tool set, what those tools may do is gated by `policy.al
 
 ### 4. Domain bounds
 
-`policy.allowed_domains` and `policy.blocked_domains` filter network-capable tool calls at the URL level. A model that successfully calls `WebFetch` to an unexpected domain — the OWASP top-cause SSRF vector — gets a `DomainBlocked` denial, not a request.
+`policy.allowed_domains` and `policy.blocked_domains` filter network-capable tool calls at the URL level. A model that successfully calls `WebFetch` to an unexpected domain — the OWASP top-cause SSRF vector — is denied with a `tool_denied` event, not a request.
 
 ### 5. Resource ceilings
 
@@ -47,7 +47,7 @@ A recorded bundle replays byte-for-byte against tape. A tape miss is a hard erro
 
 ### 8. Secret redaction
 
-Secrets passed via `--secrets-file` (or the `secrets:` block) are redacted from every event body, every tracing line, and every recorded tape. The redactor matches by **value** before serialization, so a secret accidentally echoed in a tool result, an LLM response, or an error message is replaced with `[REDACTED]` before the envelope hits stdout. Tool argv is similarly scrubbed: a secret used as a CLI argument by `Bash` does not leak into the event stream's `tool_invoked.arguments` field.
+Secrets passed via `--secrets-file` (or the `secrets:` block) are redacted from every event body, every tracing line, and every recorded tape. The redactor matches by **value** before serialization, so a secret accidentally echoed in a tool result, an LLM response, or an error message is replaced with `***` before the envelope hits stdout. Tool argv is similarly scrubbed: a secret used as a CLI argument by `Bash` does not leak into the `input_excerpt` of `tool_call_recorded`.
 
 ### 9. Stream isolation
 
@@ -105,14 +105,14 @@ Replay tapes record requests and responses verbatim (with secrets redacted). A r
 
 The full surface for secrets:
 
-1. **Declaration.** Pipeline declares `secrets:` with a list of names. Names are normalized to UPPER_SNAKE_CASE.
-2. **Source.** `--secrets-file path.env` provides values from a `KEY=VALUE` file. Provider-specific keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`) are auto-discovered when the relevant provider is configured.
+1. **Declaration.** Pipeline declares `secrets:` with a list of names.
+2. **Source.** `--secrets-file path.env` provides values from a `KEY=VALUE` file. Every key in the file must be declared in `secrets:`. Provider keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read from the process env and redacted automatically for the providers a pipeline uses. Names are not normalized.
 3. **Render scope.** Secrets are available only inside MiniJinja templates that explicitly reference them (`{{ secrets.NAME }}`). They are **not** in `vars.*` or `env.*`.
-4. **Redaction.** Before any event is serialized, the rendered text is scanned for known secret values and replaced with `[REDACTED]`. This applies to event bodies, tracing logs, recorded LLM tapes, and recorded tool tapes.
-5. **Argv scrubbing.** When a tool (notably `Bash`) takes a rendered argv that includes a secret, the secret is redacted from `tool_invoked.arguments` before emission.
+4. **Redaction.** Before any event is serialized, the rendered text is scanned for known secret values and replaced with `***`. This applies to event bodies, tracing logs, recorded LLM tapes, and recorded tool tapes.
+5. **Argv scrubbing.** When a tool (notably `Bash`) takes a rendered argv that includes a secret, the secret is redacted from the `tool_call_recorded` input excerpt before emission.
 6. **Replay tape integrity.** Recorded tapes contain redacted bodies. Replaying a bundle does **not** re-fetch the original secret value; the model and tools see the redacted form. This is intentional — replay is for postmortems, not credential reuse.
 7. **No environment leakage.** Secrets are not injected into the host process environment. Tools that need a secret receive it via rendered template arguments.
-8. **Bundle bearer scrub.** When `--record-bundle` writes the embedded pipeline YAML, any literal MCP HTTP `auth.kind: bearer` token is replaced with `<REDACTED>` before the bundle is written. Tokens written as templates (`{{ secrets.X }}`) are preserved verbatim because they are placeholders, not the secret. This is defense-in-depth for the case where an operator writes a literal token directly into the YAML and later shares the bundle as a repro artifact.
+8. **Bundle scrub.** When `--record-bundle` writes the embedded pipeline YAML, every literal MCP `env` value, `headers` value and `auth` token or password is replaced with `<REDACTED>` before the bundle is written (this marker is specific to the pipeline YAML copy; events and tapes use `***`). Tokens written as templates (`{{ secrets.X }}`) are preserved verbatim because they are placeholders, not the secret. This is defense-in-depth for the case where an operator writes a literal token directly into the YAML and later shares the bundle as a repro artifact.
 
 A secret that is never referenced in a template is loaded into memory but never rendered, never logged, and never recorded. It is harmless if unused — but unused secrets should be removed for hygiene.
 

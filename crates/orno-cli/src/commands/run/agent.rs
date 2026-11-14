@@ -11,9 +11,8 @@ use orno_core::events::{EventSink, Redactor};
 use orno_core::execution::Engine;
 use orno_core::execution::EngineConfig;
 use orno_core::llm::LlmTransport;
-use orno_core::node::NodeRegistry;
 use orno_core::node::agent::AgentExecutor;
-use orno_core::node::shell::ShellExecutor;
+use orno_core::node::{NodeExecutor, NodeRegistry};
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
@@ -41,24 +40,16 @@ pub(super) fn assemble_builtin_tools(
     tools
 }
 
-/// Register the `shell` and `agent` node executors against a fresh
-/// `NodeRegistry`, build the template engine, and wire everything into
-/// the final [`Engine`]. Consumes `engine_config` so the caller cannot
-/// accidentally read tunables that have already been threaded into the
-/// engine.
-pub(super) fn build_engine(
+/// Wire the `shell` executor and the agent executor into an [`Engine`].
+/// Replay passes a refusing shell executor, `run` a real one.
+pub(crate) fn build_engine(
     sink: Arc<dyn EventSink>,
     loop_agent: Arc<LoopAgent>,
+    shell: Arc<dyn NodeExecutor>,
     engine_config: EngineConfig,
 ) -> Engine {
     let mut registry = NodeRegistry::new();
-    registry.register(
-        "shell",
-        Arc::new(ShellExecutor::with_config(
-            sink.clone(),
-            engine_config.max_node_output_bytes,
-        )),
-    );
+    registry.register("shell", shell);
     let agent: Arc<dyn Agent> = loop_agent;
     registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
     let registry = Arc::new(registry);
@@ -108,7 +99,7 @@ pub(super) fn wrap_tool_tape(
 
 /// Inputs for [`build_loop_agent`]. Grouped to keep the call site
 /// under the four-parameter threshold (CLAUDE.md convention).
-pub(super) struct BuildLoopAgentArgs<'a> {
+pub(crate) struct BuildLoopAgentArgs<'a> {
     pub transport: Arc<dyn LlmTransport>,
     pub builtin_tools: Vec<Arc<dyn ToolHandler>>,
     pub pipeline: &'a Pipeline,
@@ -127,7 +118,7 @@ pub(super) struct BuildLoopAgentArgs<'a> {
 /// One handler per entry in `pipeline.agents`: the YAML form
 /// `subagent.<name>` is the same string the parent's `allowed_tools`
 /// references, so registration key = handler name = allowlist entry.
-pub(super) fn build_loop_agent(args: BuildLoopAgentArgs<'_>) -> Arc<LoopAgent> {
+pub(crate) fn build_loop_agent(args: BuildLoopAgentArgs<'_>) -> Arc<LoopAgent> {
     let BuildLoopAgentArgs {
         transport,
         builtin_tools,

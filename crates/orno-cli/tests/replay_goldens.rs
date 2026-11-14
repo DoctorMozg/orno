@@ -33,8 +33,8 @@ fn orno() -> Command {
 
 /// Walk a parsed NDJSON envelope and overwrite the two
 /// non-deterministic envelope fields in place:
-/// - `run_id`: ULID minted per process (ADR 0019 form).
-/// - `timestamp`: RFC 3339 UTC wall-clock (ADR 0018).
+/// - `run_id`: ULID minted per process.
+/// - `timestamp`: RFC 3339 UTC wall-clock.
 ///
 /// Values are replaced with stable string sentinels so the snapshot
 /// remains structurally faithful (the keys still exist, the type is

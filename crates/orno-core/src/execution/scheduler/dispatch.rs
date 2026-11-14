@@ -1,36 +1,21 @@
-//! Per-node dispatch — the inner loop of `Engine::run`.
-//!
-//! Kept in a sibling file because dispatch concerns (executor lookup,
-//! template render, timeout wrapping, payload classification) are
-//! orthogonal to `Engine::run`'s orchestration of the walker and the
-//! run-level aggregates. The inherent `impl Engine` block here adds
-//! `dispatch_node` + `on_payload_failure`; the free helpers
-//! (`render_error_chain`, `node_response_ok`) stay
-//! module-private and get their unit coverage in the test submodule
-//! below. `DispatchOutcome` is `pub(super)` so `Engine::run` in
-//! `mod.rs` can destructure it.
-//!
-//! The split is size-driven (CLAUDE.md's 300-LOC soft cap on
-//! non-test LOC); there is no behavioral change versus the original
-//! monolithic `scheduler.rs`.
+//! Per-node dispatch: executor lookup, template render, timeout and
+//! payload classification for one ready node.
 
-use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::error::NodeError;
 use crate::events::redactor::Keep;
 use crate::events::{Event, NodeFailure};
-use crate::execution::context::Context;
-use crate::node::{NodeResponse, kind_str, render_request};
+use crate::node::{NodeExecutor, NodeRequest, NodeResponse, kind_str, render_request};
 use crate::pipeline::schema::NodeKind;
 
-use super::Engine;
+use super::{Engine, RunState};
 
-/// Result of `Engine::dispatch_node`. A struct rather than a tuple
-/// because the success/failure invariant is now load-bearing
-/// (`failure.is_some() ⇔ !ok`) and the field count grew from two
-/// to three when `Phase 2` started recording payload-on-failure.
+/// Result of `Engine::dispatch_node`. Invariant: `failure.is_some()` iff
+/// `!ok`.
 pub(super) struct DispatchOutcome {
     pub(super) ok: bool,
     pub(super) failure: Option<NodeFailure>,
@@ -46,8 +31,7 @@ impl DispatchOutcome {
         }
     }
 
-    /// A failure with no executor output to record — used for the
-    /// no-executor, template-render, and executor-Err paths.
+    /// A failure with no executor output to record.
     fn failed(failure: NodeFailure) -> Self {
         Self {
             ok: false,
@@ -58,28 +42,14 @@ impl DispatchOutcome {
 }
 
 impl Engine {
-    /// Dispatch a single ready node. Every failure mode (missing
-    /// executor, template render error, executor error, non-zero shell
-    /// exit) collapses to `ok = false` with a populated `failure` and
-    /// a structured WARN on stderr. The executor's payload is returned
-    /// even on failure so the engine can fold it into `Context` —
-    /// downstream templates that read `node.<id>.stderr` for recovery
-    /// branches must see the data even when the producer node failed.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "dispatch requires full context; collapsing into a struct would add indirection without simplifying calls"
-    )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "dispatch enumerates every failure mode inline to keep event sequencing visible"
-    )]
+    /// Dispatch a single ready node. Every failure mode collapses to
+    /// `ok = false` with a populated `failure` and a structured WARN. The
+    /// executor payload is returned even on failure so downstream
+    /// templates can read `nodes.<id>.stderr` of a failed producer.
     pub(super) async fn dispatch_node(
         &self,
-        run_id: &str,
+        run: &RunState<'_>,
         node: &crate::pipeline::Node,
-        context: &Context,
-        agents: &BTreeMap<String, crate::pipeline::AgentConfig>,
-        redactor: &crate::events::Redactor,
     ) -> DispatchOutcome {
         let kind = kind_str(&node.kind);
         let Some(exec) = self.registry.get(kind) else {
@@ -93,13 +63,17 @@ impl Engine {
             });
         };
 
-        let req = match render_request(&node.kind, &self.templates, context, agents) {
+        let req = match render_request(
+            &node.kind,
+            &self.templates,
+            &run.context,
+            &run.pipeline.agents,
+        ) {
             Ok(req) => req,
             Err(err) => {
-                // Redact before logging: a template error's Display chain
-                // can quote the offending expression, which may include a
-                // rendered `secrets.*` value.
-                let error = redactor.redact(&format!("{err:#}")).into_owned();
+                // A template error can quote the offending expression,
+                // which may include a rendered `secrets.*` value.
+                let error = run.redactor.redact(&format!("{err:#}")).into_owned();
                 tracing::warn!(
                     node.id = %node.id,
                     node.kind = kind,
@@ -110,81 +84,86 @@ impl Engine {
             },
         };
 
-        let started = std::time::Instant::now();
-        let result = if let Some(limit) = node.timeout {
-            match tokio::time::timeout(
-                Duration::from_secs(limit),
-                exec.execute(run_id, &node.id, req),
-            )
-            .await
-            {
-                Ok(inner) => inner,
-                Err(_elapsed) => {
-                    let elapsed_ms =
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    self.sink
-                        .record(Event::NodeTimedOut {
-                            run_id: run_id.to_string(),
-                            node_id: node.id.clone(),
-                            limit_secs: limit,
-                            elapsed_ms,
-                        })
-                        .await;
-                    tracing::warn!(
-                        node.id = %node.id,
-                        node.kind = kind,
-                        limit_secs = limit,
-                        elapsed_ms,
-                        "node exceeded wall-clock budget",
-                    );
-                    return DispatchOutcome::failed(NodeFailure::TimedOut { limit_secs: limit });
-                },
-            }
-        } else {
-            exec.execute(run_id, &node.id, req).await
-        };
-
-        match result {
-            Ok(resp) => {
-                if node_response_ok(&node.kind, &resp) {
-                    return DispatchOutcome::ok(resp.output);
-                }
-                self.on_payload_failure(node, kind, resp, redactor)
-            },
-            Err(err) => {
-                // Walk the full `source()` chain — thiserror's Display
-                // only renders the top-level variant, so a `NodeError::
-                // Execution { source: AgentError::BudgetExceeded(...) }`
-                // would otherwise surface as the opaque
-                // ``node `digest` failed`` without the underlying cause
-                // that the operator actually needs to see. Redact and
-                // cap because an LLM transport error can surface a
-                // multi-KB HTML body and a rendered prompt can carry
-                // a secret value.
-                let error = redactor.redact_bounded(
-                    &render_error_chain(&err),
-                    self.config.max_output_bytes,
-                    Keep::Tail,
-                );
-                tracing::warn!(
-                    node.id = %node.id,
-                    node.kind = kind,
-                    error = %error,
-                    "node execution failed",
-                );
-                DispatchOutcome::failed(NodeFailure::ExecutorError { error })
-            },
+        match self.execute(run, node, &exec, req).await {
+            Ok(resp) if node_response_ok(&node.kind, &resp) => DispatchOutcome::ok(resp.output),
+            Ok(resp) => self.on_payload_failure(node, kind, resp, &run.redactor),
+            Err(outcome) => outcome,
         }
     }
 
-    /// Format the shell-payload-failure branch of `dispatch_node`. A
-    /// shell node that ran and exited non-zero used to silently drop
-    /// its stderr/stdout; this branch emits a typed `NodeFailure` on
-    /// the wire, logs a structured WARN, and still hands `resp.output`
-    /// back to Context so a downstream `gate` / recovery node can read
-    /// `node.<id>.stderr` and decide what to do. Extracted from
-    /// `dispatch_node` because the wire-formatting concern is distinct
-    /// from dispatch orchestration.
+    /// Run the executor under the node's wall-clock limit. Timeouts and
+    /// executor errors come back as the failed outcome to report.
+    async fn execute(
+        &self,
+        run: &RunState<'_>,
+        node: &crate::pipeline::Node,
+        exec: &Arc<dyn NodeExecutor>,
+        req: NodeRequest,
+    ) -> Result<NodeResponse, DispatchOutcome> {
+        let kind = kind_str(&node.kind);
+        let started = std::time::Instant::now();
+        let result = match node.timeout {
+            Some(limit) => {
+                let call = exec.execute(run.run_id, &node.id, req);
+                match tokio::time::timeout(Duration::from_secs(limit), call).await {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        let elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        self.sink
+                            .record(Event::NodeTimedOut {
+                                run_id: run.run_id.to_string(),
+                                node_id: node.id.clone(),
+                                limit_secs: limit,
+                                elapsed_ms,
+                            })
+                            .await;
+                        tracing::warn!(
+                            node.id = %node.id,
+                            node.kind = kind,
+                            limit_secs = limit,
+                            elapsed_ms,
+                            "node exceeded wall-clock budget",
+                        );
+                        return Err(DispatchOutcome::failed(NodeFailure::TimedOut {
+                            limit_secs: limit,
+                        }));
+                    },
+                }
+            },
+            None => exec.execute(run.run_id, &node.id, req).await,
+        };
+
+        result.map_err(|err| self.executor_failure(node, kind, &err, &run.redactor))
+    }
+
+    fn executor_failure(
+        &self,
+        node: &crate::pipeline::Node,
+        kind: &str,
+        err: &NodeError,
+        redactor: &crate::events::Redactor,
+    ) -> DispatchOutcome {
+        // `Display` shows only the top-level variant, so walk the chain to
+        // surface the underlying cause. Redacted and capped because a
+        // transport error can carry a multi-KB body and a rendered prompt.
+        let error = redactor.redact_bounded(
+            &render_error_chain(err),
+            self.config.max_output_bytes,
+            Keep::Tail,
+        );
+        tracing::warn!(
+            node.id = %node.id,
+            node.kind = kind,
+            error = %error,
+            "node execution failed",
+        );
+        DispatchOutcome::failed(NodeFailure::ExecutorError { error })
+    }
+
+    /// A shell node that ran and exited non-zero: emit a typed
+    /// `NodeFailure`, log a WARN, and hand `resp.output` back so
+    /// recovery nodes can read `nodes.<id>.stderr`.
     fn on_payload_failure(
         &self,
         node: &crate::pipeline::Node,
@@ -294,6 +273,7 @@ mod tests {
     use crate::events::truncate_tail;
     use crate::pipeline::schema::{AgentNode, ShellNode};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn shell_kind() -> NodeKind {
         NodeKind::Shell(ShellNode {

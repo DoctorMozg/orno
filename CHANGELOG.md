@@ -87,6 +87,17 @@ once the first tagged release ships.
 - `orno run` emits `run_finished { ok: false }` when the DAG walker or
   the `vars:` render fails before the first node, and engine errors no
   longer skip MCP shutdown or tape flushing.
+- Ready nodes run in YAML source order among ties, as documented. The
+  walker used to pick the most recently unblocked node first, so `a`, `b`,
+  `c` (needs `a`) ran `a`, `c`, `b`.
+- `LlmRequest.provider`, `model`, `prompt` and `system` are `Arc<str>`, and
+  `LlmRequest::from_prompt` takes only provider, model and prompt. The
+  serialized request, and so the tape key, is unchanged.
+- `expand_mcp_wildcards` returns `()` instead of a `Result` that could not
+  fail.
+- `ReplayMcpStubHandler` moves from `tool::mcp_handler` to `tool::replay`
+  (still exported from `orno_core::tool`).
+- The `docs` CI job builds rustdoc with `-D warnings`.
 
 ### Fixed
 
@@ -140,6 +151,13 @@ once the first tagged release ships.
 - `AgentError::SubagentDepthExceeded` and `LlmError::NotImplemented`
   (never constructed).
 - The uncompiled `orno_core::config` module.
+- Unused public items: `Context::merge`, `Context::empty`,
+  `ContextConflict`, `orno_core::telemetry` (`run_span`),
+  `SubagentHandler::child_agent_name`, `impl Clone for Redactor`,
+  `AgentError::UnsupportedYet`, `NodeError::UnsupportedYet`,
+  `NodeError::UnknownKind` and `McpError::{ServerCrashed, ShutdownTimeout,
+  UnknownTool}`. `DagWalker::is_done` and `statuses` are test-only. The
+  `hex` dependency is gone.
 
 ### Fixed
 
@@ -282,7 +300,7 @@ once the first tagged release ships.
 
 - **`roots` field required for file tools** (`Read`, `Write`, `Edit`). Any pipeline agent that
   uses these tools must now declare a `roots:` list in its `AgentPolicy`. Agents that omit
-  `roots:` will receive a `ToolError::PolicyViolation` on every file-tool call. Migration:
+  `roots:` will receive a `ToolError::Denied` on every file-tool call. Migration:
   add `roots: ["/path/to/project"]` to the agent's policy block in your YAML.
 
 - **`ORNO_TEST_LLM_TRANSPORT` env var gated behind `test-transport` feature**. The escape hatch
@@ -301,7 +319,7 @@ once the first tagged release ships.
 - Bash tool environment isolation: cleared `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`,
   `DYLD_LIBRARY_PATH`, and `PYTHONPATH` before exec to prevent library-injection attacks.
 - Path jail (`jail_path`) enforced on all file tools; symlink traversal outside the jail now
-  returns `ToolError::PolicyViolation`.
+  returns `ToolError::Denied`.
 - Write and Edit tools now use `NamedTempFile` + atomic rename instead of direct `fs::write` to
   prevent partial-write corruption and toctou races.
 - Tape file creation now uses `O_EXCL` (`create_new(true)`) and `mode(0o600)` on Unix so stale
@@ -325,7 +343,7 @@ once the first tagged release ships.
 ### Other changes
 
 - `AgentPolicy.max_message_history_bytes` (default 4 MiB) bounds per-agent conversation history;
-  oldest messages are evicted when the cap is exceeded, keeping at least the first two.
+  the oldest messages are evicted when the cap is exceeded, keeping at least the most recent two.
 - `LoopAgentRequest` fields `initial_prompt`, `system`, `provider`, `model` changed to `Arc<str>`
   to eliminate per-iteration `String` clones on the hot path.
 - Template engine LRU cache capacity fixed: now correctly removes evicted templates from the
@@ -334,5 +352,7 @@ once the first tagged release ships.
   existing LLM and tool tape layers still use their own I/O (migration deferred).
 - `orno-cli`'s `run.rs` split into `run/mod.rs`, `run/agent.rs`, `run/secrets.rs`,
   `run/transport.rs` for maintainability.
+
+## 0.1.0
 
 - Initial release.

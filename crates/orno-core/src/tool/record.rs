@@ -218,7 +218,7 @@ impl ToolHandler for RecordingToolHandler {
         self.inner.effect()
     }
 
-    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), call_id = %inv.call_id))]
+    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let key = tool_tape_key(self.inner.name(), inv.call_id, &args, Some(&self.redactor));
         let seq = self.seq.next(&key);
@@ -236,7 +236,7 @@ impl ToolHandler for RecordingToolHandler {
             tracing::warn!(
                 error = %e,
                 tool.name = self.inner.name(),
-                path = %self.tape.path().display(),
+                file.path = %self.tape.path().display(),
                 "tool tape write failed — replay bundle is incomplete",
             );
             return Err(ToolError::Invocation {

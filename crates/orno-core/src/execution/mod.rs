@@ -6,7 +6,7 @@ pub mod context;
 pub mod scheduler;
 pub mod walker;
 
-pub use context::{Context, ContextConflict};
+pub use context::Context;
 pub use scheduler::{Engine, EngineConfig, RunInputs};
 pub use walker::{DagWalker, NodeState};
 

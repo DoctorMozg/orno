@@ -9,8 +9,8 @@ Every agent has four budget-related fields under `policy:`:
 | Knob                  | Bounds                                                  | Breach event                          |
 | --------------------- | ------------------------------------------------------- | ------------------------------------- |
 | `max_iterations`      | Loop turns (model → tools → loop)                       | `IterationLimitExceeded`              |
-| `max_total_tokens`    | Sum of all LLM token usage in this agent's loop         | `BudgetExceeded { kind: Tokens }`     |
-| `max_tool_calls`      | Count of every attempted tool call (incl. denied ones)  | `BudgetExceeded { kind: ToolCalls }`  |
+| `max_total_tokens`    | Sum of all LLM token usage across the agent and its subagent tree | `BudgetExceeded { kind: Tokens }`     |
+| `max_tool_calls`      | Count of every attempted tool call (incl. denied ones, and every subagent's) | `BudgetExceeded { kind: ToolCalls }`  |
 | `max_subagent_depth`  | Recursion depth for `subagent.<name>` calls             | `SubagentDepthExceeded` (denial)      |
 
 A fifth, related, knob lives at the **node** level:
@@ -94,23 +94,25 @@ policy:
   max_subagent_depth: 1
 ```
 
-Parent's `max_total_tokens` covers only its own LLM turns. Subagent token spend is counted against the **child's** `max_total_tokens`, not the parent's.
+`max_total_tokens` and `max_tool_calls` cover the whole subagent tree: a child's spend and tool calls count against the parent and every ancestor, and the child's own cap applies on top. Iterations stay per loop.
 
 ## Step 3 — Watch the actual spend
 
-During a run, every `agent_iteration_finished` envelope reports the cumulative usage so far:
+During a run, every `llm_response_received` envelope carries that call's `usage`. Keep a running sum with `jq`:
 
 ```bash
 orno run pipeline.yaml --secrets-file .env.secrets \
-  | jq -c 'select(.event.type == "agent_iteration_finished") | {iter: .event.iteration, tokens: .event.cumulative_tokens, calls: .event.cumulative_tool_calls}'
+  | jq -c 'select(.event.type == "llm_response_received") | {node: .event.node_id, tokens: .event.usage.total_tokens}'
 ```
+
+`usage` is `null` when the provider omits token counts; the token budget cannot charge such a response, and orno logs a warning.
 
 You'll see the trajectory:
 
 ```json
-{"iter":1,"tokens":2150,"calls":2}
-{"iter":2,"tokens":4982,"calls":5}
-{"iter":3,"tokens":8123,"calls":7}
+{"node":"review","tokens":2150}
+{"node":"review","tokens":2832}
+{"node":"review","tokens":3141}
 ```
 
 If the trajectory is steeper than you expected, the bound will trip eventually. Decide whether to raise the bound or fix the prompt.
@@ -130,19 +132,19 @@ Output:
 {
   "event": {
     "type": "node_finished",
+    "run_id": "run_...",
     "node_id": "review",
+    "node_kind": "agent",
     "ok": false,
     "failure": {
-      "kind": "BudgetExceeded",
-      "budget_kind": "Tokens",
-      "limit": 30000,
-      "consumed": 30214
+      "kind": "budget_exceeded",
+      "budget_kind": "tokens"
     }
   }
 }
 ```
 
-The `budget_kind` discriminates `Tokens` vs. `ToolCalls`, so a downstream alerting system can branch on the dimension that breached without parsing the human-readable error message.
+The `budget_kind` discriminates `tokens` vs. `tool_calls`, so a downstream alerting system can branch on the dimension that breached without parsing the human-readable error message.
 
 For `IterationLimitExceeded`:
 
@@ -150,12 +152,13 @@ For `IterationLimitExceeded`:
 {
   "event": {
     "type": "node_finished",
+    "run_id": "run_...",
     "node_id": "review",
+    "node_kind": "agent",
     "ok": false,
     "failure": {
-      "kind": "IterationLimitExceeded",
-      "limit": 10,
-      "iterations": 10
+      "kind": "iteration_limit_exceeded",
+      "max_iterations": 10
     }
   }
 }
@@ -211,11 +214,9 @@ You'll see the denials. The model is calling forbidden tools — usually because
 
 ## Step 8 — Subagent budget composition
 
-A subagent's spend does **not** count against its parent's `max_total_tokens`. Each agent has its own budget. The parent's loop sees the child's spend reflected as a single tool result.
+A subagent's spend **does** count against its parent: tokens and tool calls are charged up the whole chain, so grandchild spend lands on the root. The tightest limit up the chain applies to each request.
 
-This means a parent with `max_total_tokens: 10_000` can dispatch three subagents that each spend 30,000 tokens, for an effective tree spend of 100,000 tokens. To bound the tree's total spend, set each child's budget conservatively.
-
-A useful heuristic for trees: `parent_budget + (subagent_count × child_budget)` is the worst case. `orno plan` reports `max_tokens_total` as the sum across all agents, which is exactly this number.
+The tree's total spend is therefore bounded by the root's `max_total_tokens`. Each child's own cap still bounds that child. `orno plan` reports `max_tokens_total` as the sum across agents, a looser ceiling than the root's cap.
 
 ## Recipe 1 — emergency lockdown
 
@@ -270,5 +271,5 @@ At ~$0.001 per 1000 tokens for a cheap model, that's $0.13 worst-case. If the bu
 ## See also
 
 - [Pipeline YAML › `policy` semantics](../reference/pipeline-yaml.md#policy-semantics) — every policy field with its default.
-- [Events › `agent_iteration_finished`](../reference/events.md#agent_iteration_finished) — the schema you read for usage telemetry.
+- [Events › `llm_response_received`](../reference/events.md#llm_response_received) — the schema you read for usage telemetry.
 - [Strict agentic loops › Bounded resources](../explanation/strict-agentic-loops.md#4-bounded-resources) — rationale.

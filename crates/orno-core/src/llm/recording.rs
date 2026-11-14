@@ -36,6 +36,8 @@ use super::{LlmRequest, LlmResponse, LlmTransport, OrnoChatTool};
 /// excerpt regardless of caller configuration.
 const RECORDED_API_BODY_EXCERPT_BYTES: usize = 4096;
 
+/// Decorator that forwards each call to `inner` and appends the redacted
+/// outcome to a tape for `ReplayTransport`.
 pub struct RecordingTransport {
     inner: Arc<dyn LlmTransport>,
     tape: TapeFile,
@@ -220,7 +222,7 @@ impl LlmTransport for RecordingTransport {
                 // so it is not lost.
                 if let Err(tape_err) = self.write_entry(&entry) {
                     tracing::warn!(
-                        error = ?err,
+                        error = %err,
                         "original LLM error masked by tape-write failure",
                     );
                     return Err(tape_err);
@@ -251,26 +253,12 @@ mod tests {
         )
         .unwrap();
 
-        rec.complete(LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hello".into(),
-            None,
-            None,
-            None,
-        ))
-        .await
-        .unwrap();
-        rec.complete(LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "world".into(),
-            None,
-            None,
-            None,
-        ))
-        .await
-        .unwrap();
+        rec.complete(LlmRequest::from_prompt("openai", "gpt-5", "hello"))
+            .await
+            .unwrap();
+        rec.complete(LlmRequest::from_prompt("openai", "gpt-5", "world"))
+            .await
+            .unwrap();
 
         rec.flush().unwrap();
         drop(rec);
@@ -310,12 +298,9 @@ mod tests {
         .unwrap();
 
         rec.complete(LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "my key is sk-secret-abc123".into(),
-            None,
-            None,
-            None,
+            "openai",
+            "gpt-5",
+            "my key is sk-secret-abc123",
         ))
         .await
         .unwrap();
@@ -382,14 +367,7 @@ mod tests {
         .unwrap();
 
         let err = rec
-            .complete(LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                "hi".into(),
-                None,
-                None,
-                None,
-            ))
+            .complete(LlmRequest::from_prompt("openai", "gpt-5", "hi"))
             .await
             .expect_err("transport returned Err — caller must see it");
         assert!(
@@ -434,15 +412,8 @@ mod tests {
         .unwrap();
 
         drop(
-            rec.complete(LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                "hi".into(),
-                None,
-                None,
-                None,
-            ))
-            .await,
+            rec.complete(LlmRequest::from_prompt("openai", "gpt-5", "hi"))
+                .await,
         );
         rec.flush().unwrap();
         drop(rec);
@@ -495,15 +466,8 @@ mod tests {
         .unwrap();
 
         drop(
-            rec.complete(LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                "hi".into(),
-                None,
-                None,
-                None,
-            ))
-            .await,
+            rec.complete(LlmRequest::from_prompt("openai", "gpt-5", "hi"))
+                .await,
         );
         rec.flush().unwrap();
         drop(rec);
@@ -529,8 +493,8 @@ mod tests {
 
     #[tokio::test]
     async fn entries_store_the_key_not_the_request() {
-        // Entries used to carry the whole request, so a tape grew
-        // quadratically with the message history.
+        // Storing the whole request would grow the tape quadratically
+        // with the message history.
         use crate::llm::OrnoChatMessage;
 
         let tmp_dir = tempfile::TempDir::new().unwrap();
@@ -541,14 +505,7 @@ mod tests {
             Arc::new(Redactor::default()),
         )
         .unwrap();
-        let mut req = LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hi".into(),
-            None,
-            None,
-            None,
-        );
+        let mut req = LlmRequest::from_prompt("openai", "gpt-5", "hi");
         req.messages = Arc::new(vec![OrnoChatMessage::User {
             content: "distinctive-history-marker".into(),
         }]);
@@ -581,15 +538,8 @@ mod tests {
             schema: serde_json::json!({"type": "object"}),
         };
         for prompt in ["one", "two"] {
-            let req = LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                prompt.into(),
-                None,
-                None,
-                None,
-            )
-            .with_tools(vec![tool.clone()]);
+            let req =
+                LlmRequest::from_prompt("openai", "gpt-5", prompt).with_tools(vec![tool.clone()]);
             rec.complete(req).await.unwrap();
         }
         rec.flush().unwrap();

@@ -95,11 +95,9 @@ fn count_event_type(stdout: &str, event_type: &str) -> usize {
         .count()
 }
 
-// ─── pr-review.yaml validation ──────────────────────────────────────────────
-
 #[test]
 fn validate_pr_review_yaml_succeeds() {
-    // Exercises: MCP server allowlist cross-check (WU-7) — each `mcp.*`
+    // Exercises: MCP server allowlist cross-check: each `mcp.*`
     // tool referenced in an agent must name a server declared in
     // `mcp_servers`. Subagent compose-down enforcement: a child agent
     // may not have broader `allow_mutations`/`allow_network` than its
@@ -111,8 +109,6 @@ fn validate_pr_review_yaml_succeeds() {
         .stdout(contains("ok: version=1 nodes=2"));
 }
 
-// ─── Record / replay determinism ────────────────────────────────────────────
-
 #[test]
 fn record_then_replay_produces_identical_event_type_sequence() {
     // `NamedTempFile::new()` creates the file immediately; `create_new(true)`
@@ -122,7 +118,7 @@ fn record_then_replay_produces_identical_event_type_sequence() {
     let tape_path_buf = tape_dir.path().join("tape.ndjson");
     let tape_path = tape_path_buf.to_str().expect("utf8 tape path");
 
-    // Phase 1: record — run hello.yaml with DummyTransport and capture the
+    // Record: run hello.yaml with DummyTransport and capture the
     // LLM tape. `--record-tape` wraps DummyTransport in RecordingTransport
     // which writes one NDJSON entry per LLM call.
     let record_assert = orno_with_dummy_transport()
@@ -146,7 +142,7 @@ fn record_then_replay_produces_identical_event_type_sequence() {
         "record tape should be non-empty after a run with an agent node",
     );
 
-    // Phase 2: replay — replay the tape without DummyTransport. The
+    // Replay: run the tape without DummyTransport. The
     // ReplayTransport replaces the live transport entirely.
     let replay_assert = orno()
         .args([
@@ -200,7 +196,7 @@ fn record_then_replay_produces_identical_event_type_sequence() {
 fn replay_tape_miss_is_reported_as_node_failure() {
     // An empty tape causes every LLM call to miss. ReplayTransport returns
     // LlmError::ReplayMiss, which the LoopAgent surfaces as a node failure.
-    // After WU-2.4 the CLI also exits non-zero whenever the run reports
+    // The CLI also exits non-zero whenever the run reports
     // `ok: false`, so the process-level signal matches the stream-level
     // signal — `orno run --replay-tape … && next-step` short-circuits on
     // a tape miss instead of silently proceeding.
@@ -279,8 +275,6 @@ nodes:
     );
 }
 
-// ─── Three-subagent record / replay ─────────────────────────────────────────
-
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -315,7 +309,7 @@ fn three_subagent_run_record_then_replay_preserves_event_sequence() {
     let tape_path_buf = tape_dir.path().join("tape.ndjson");
     let tape_path = tape_path_buf.to_str().expect("utf8 tape path");
 
-    // Phase 1: record — run three-lens.yaml with ScriptedTransport and
+    // Record: run three-lens.yaml with ScriptedTransport and
     // capture the LLM tape.
     let record_assert = orno()
         .env("ORNO_TEST_LLM_TRANSPORT", "scripted")
@@ -355,7 +349,7 @@ fn three_subagent_run_record_then_replay_preserves_event_sequence() {
         "LLM tape must be non-empty after subagent run"
     );
 
-    // Phase 2: replay — no ScriptedTransport; ReplayTransport takes over.
+    // Replay: no ScriptedTransport; ReplayTransport takes over.
     let replay_assert = orno()
         .args([
             "run",

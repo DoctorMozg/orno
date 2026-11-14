@@ -151,15 +151,6 @@ impl SubagentHandler {
         }
         Ok((system, policy))
     }
-
-    /// Accessor for the child agent's name. Used by `LoopAgent` when
-    /// emitting `SubagentDepthExceeded` before the call reaches
-    /// `invoke` — the parent already knows the handler by YAML name
-    /// and needs the raw agent identifier for the event.
-    #[must_use]
-    pub fn child_agent_name(&self) -> &str {
-        &self.child_agent_name
-    }
 }
 
 #[async_trait]
@@ -247,8 +238,8 @@ impl ToolHandler for SubagentHandler {
         };
 
         debug!(
-            child_agent = %self.child_agent_name,
-            child_depth,
+            subagent.child = %self.child_agent_name,
+            subagent.depth = child_depth,
             "entering subagent loop",
         );
 
@@ -291,10 +282,9 @@ impl ToolHandler for SubagentHandler {
 }
 
 /// Map a child agent's `(allow_mutations, allow_network)` pair to the
-/// `ToolEffect` variant the parent's policy gate should evaluate (ADR
-/// 0027). The four-quadrant table is the full contract — any future
-/// `AgentPolicy` boolean that gates an effect class must surface here
-/// or in a dedicated helper, never silently.
+/// `ToolEffect` variant the parent's policy gate should evaluate. Any
+/// future `AgentPolicy` boolean that gates an effect class must surface
+/// here, never silently.
 fn effect_from_policy(policy: &AgentPolicy) -> ToolEffect {
     match (policy.allow_mutations, policy.allow_network) {
         (false, false) => ToolEffect::ReadOnly,

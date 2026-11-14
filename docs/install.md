@@ -43,10 +43,10 @@ The supplemental tools (`cargo deny`, `cargo machete`, `typos`) are not required
 
 ## Smoke-test against the dummy transport
 
-`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter, but you can exercise it against a deterministic dummy transport without needing a key:
+`examples/hello/pipeline.yaml` calls a real LLM via OpenRouter, but you can exercise it against a deterministic dummy transport without needing a key. The dummy transport only exists in a build with `--features test-transport`; release binaries and a plain `cargo install` ignore `ORNO_TEST_LLM_TRANSPORT`:
 
 ```bash
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport -- run examples/hello/pipeline.yaml
 ```
 
 You should see NDJSON event envelopes on stdout terminating in a `run_finished` envelope with `"ok": true`.
@@ -54,8 +54,8 @@ You should see NDJSON event envelopes on stdout terminating in a `run_finished` 
 ## Smoke-test against a real LLM
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
-cargo run -p orno-cli -- run examples/hello/pipeline.yaml --secrets-file .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
+cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
 The OpenRouter key is auto-discovered when an agent's `provider:` is `openrouter`. orno will redact the key from every event body and tracing line.

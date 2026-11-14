@@ -129,41 +129,43 @@ Revert the change. The compose-down rule is what makes "multi-agent in CI" audit
 
 ## Step 4 — Run the pipeline
 
-Set up environment and secrets, then run:
+Export the key and the PR number, then run:
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
 export PR_NUMBER=482
-orno run examples/pr-review/pipeline.yaml --secrets-file .env.secrets
+orno run examples/pr-review/pipeline.yaml
 ```
 
 The event stream will show:
 
 1. `run_started` — opens the run.
-2. `mcp_server_started` — the filesystem MCP server is spawned.
+2. `mcp_server_starting` / `mcp_server_handshaked` — the filesystem MCP server is spawned and its tools listed.
 3. `node_started` (id: `collect_diff`) → `node_finished` — git diff captured to `nodes.collect_diff.stdout`.
 4. `node_started` (id: `review`) — parent agent loop begins.
-5. Parent's first iteration: `agent_iteration_started`, `llm_request_succeeded` (parent's first turn — likely emits a `subagent.security_lens` tool call).
-6. `subagent_started` — child agent loop begins. Has its own `agent_iteration_*` events nested under it.
-7. `subagent_finished` — returns child's final message.
+5. Parent's first iteration: `agent_iteration_started`, `llm_request_started`, `llm_response_received` (parent's first turn — likely emits a `subagent.security_lens` tool call).
+6. `subagent_started` — child agent loop begins. Its own `agent_iteration_started` and `llm_*` events follow, tagged with the parent's `node_id`.
+7. `subagent_completed` — returns child's final message.
 8. Parent's next iteration consumes the child's result, emits the next subagent call.
 9. Repeat for `performance_lens` and `docs_lens`.
 10. Parent's final iteration synthesizes all three into the JSON verdict.
 11. `node_finished` (id: `review`, `ok: true`).
-12. `mcp_server_stopped` — MCP server shut down.
-13. `run_finished`.
+12. `run_finished`.
+13. `mcp_server_shutting_down` / `mcp_server_exited` — the MCP server is drained after the engine returns, so these follow `run_finished`.
 
-The parent's JSON verdict is in `nodes.review.output`.
+The parent's JSON verdict is in `nodes.review.output`, available to downstream nodes that list `review` in `needs:`.
 
 ## Step 5 — Read the verdict
 
-Extract the verdict from the event stream:
+`node_finished` carries no output. The verdict reaches the stream as the `content_excerpt` of the parent's last `llm_response_received`, which is redacted and truncated (2 KB by default; raise it with `--stderr-tail-bytes`):
 
 ```bash
-orno run examples/pr-review/pipeline.yaml --secrets-file .env.secrets \
-  | jq -r 'select(.event.type == "node_finished" and .event.node_id == "review") | .event.output' \
+orno run examples/pr-review/pipeline.yaml \
+  | jq -r 'select(.event.type == "llm_response_received" and .event.node_id == "review" and .event.finish_reason == "stop") | .event.content_excerpt' \
   | jq '.'
 ```
+
+For the full text, add a downstream `kind: shell` node that writes `{{ nodes.review.output }}` to a file.
 
 You'll get a structured verdict:
 
@@ -187,23 +189,22 @@ This is what makes the pattern useful: each lens contributes findings in a struc
 
 ## Step 6 — Inspect the recursion depth
 
-Re-run with `--record-bundle` and inspect the bundle:
+Re-run with `--record-bundle` and filter the event stream for subagent events:
 
 ```bash
 orno run examples/pr-review/pipeline.yaml \
-  --secrets-file .env.secrets \
-  --record-bundle pr-review.bundle.ndjson
+  --record-bundle pr-review.bundle.ndjson > events.ndjson
 
-jq -c 'select(.event.type | startswith("subagent_"))' pr-review.bundle.ndjson | head
+jq -c 'select(.event.type | startswith("subagent_"))' events.ndjson | head
 ```
 
-You'll see `subagent_started` and `subagent_finished` envelopes for each lens, with `parent_node_id` pointing back to `review`. The `depth` field shows how deep in the recursion this child is — `1` for our lenses (one level below the root).
+You'll see `subagent_started` and `subagent_completed` envelopes for each lens, with `parent_node_id` pointing back to `review`. The `depth` field shows how deep in the recursion this child is — `1` for our lenses (one level below the root).
 
-If you tried to set `max_subagent_depth: 2` on the parent and a lens *also* delegated, that lens's call would fail with `SubagentDepthExceeded` returned to it as a tool denial — non-terminal, the parent can recover. Only the bound is enforced; the child can decide what to do with the denial.
+If you tried to set `max_subagent_depth: 2` on the parent and a lens *also* delegated, that lens's call would emit `subagent_depth_exceeded` and return a denial to it as a tool result — non-terminal, the parent can recover. Only the bound is enforced; the child can decide what to do with the denial.
 
 ## Step 7 — Adjust the budget
 
-The parent has `max_total_tokens: 40000` for itself. A subagent's tokens are counted against the **child's** cap, not the parent's. The parent's loop sees the child's spend reflected as a single tool result.
+The parent has `max_total_tokens: 40000` for itself. Subagent spend counts against the parent too: tokens and tool calls are charged up the whole chain, so the root's `max_total_tokens` and `max_tool_calls` bound the entire tree. A child's own cap applies on top.
 
 If you reduce the parent's budget too far:
 
@@ -213,16 +214,16 @@ pr_reviewer:
     max_total_tokens: 5000
 ```
 
-You'll get a `BudgetExceeded { kind: Tokens }` mid-run as the parent terminates. The lens subagents that already returned results stay in the partial bundle; the parent's final synthesis is missing.
+You'll get a `budget_exceeded` failure (`budget_kind: tokens`) mid-run, possibly inside a lens, and the parent terminates. The lens subagents that already returned results stay in the partial bundle; the parent's final synthesis is missing.
 
-This is the cost ceiling working: each agent's budget is enforced independently, and a runaway agent cannot bankrupt others.
+This is the cost ceiling working: the root's budget bounds the whole tree, so a runaway lens cannot outspend it.
 
 ## What you've learned
 
 - Multi-agent in orno is recursive single-agent loops via `subagent.<name>`.
 - The compose-down rule prevents children from doing more than their parents.
 - `max_subagent_depth` caps recursion; `0` disables subagents entirely.
-- Each agent has its own token and tool-call budget; budgets are checked independently.
+- Token and tool-call budgets cover the whole subagent tree; iterations are counted per loop.
 - A subagent's final assistant message returns to the parent like any other tool result.
 
 ## Next steps

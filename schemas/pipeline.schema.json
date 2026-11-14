@@ -343,7 +343,7 @@
       "type": "object",
       "oneOf": [
         {
-          "description": "Agent node — references a named entry in `Pipeline.agents`. Inline\nagent configuration at the node level is a v0.2+ convenience and is\nnot in the v0.1 schema (see `docs/yaml-spec.md`).",
+          "description": "Agent node — references a named entry in `Pipeline.agents`. Inline\nagent configuration at the node level is a v0.2+ convenience and is\nnot in the schema.",
           "type": "object",
           "properties": {
             "agent": {

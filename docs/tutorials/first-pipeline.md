@@ -99,17 +99,17 @@ orno plan hello.yaml | jq '.'
 
 ## Step 4 — Run without an API key (smoke test)
 
-orno ships a deterministic dummy LLM transport for testing. Set the env var and run:
+orno has a deterministic dummy LLM transport for testing. It is compiled in only with the `test-transport` feature, so run from a source checkout (`orno` in a release binary ignores the variable and calls the real API):
 
 ```bash
-ORNO_TEST_LLM_TRANSPORT=dummy orno run hello.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport -- run hello.yaml
 ```
 
 You'll see NDJSON event envelopes on stdout. The shape of a run is always:
 
 1. `run_started` — opens the run.
 2. `node_started` — opens the agent node.
-3. `agent_iteration_started` / `llm_request_started` / `llm_request_succeeded` / `agent_iteration_finished` — one cycle of the loop.
+3. `agent_iteration_started` / `llm_request_started` / `llm_response_received` — one cycle of the loop. A turn that calls tools adds `tool_call_recorded` events.
 4. `node_finished` — closes the node with `ok: true`.
 5. `run_finished` — closes the run.
 
@@ -120,13 +120,13 @@ Every envelope carries `schema_version`, `seq`, and `timestamp`. The `seq` field
 Get an OpenRouter API key (https://openrouter.ai), then:
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
-orno run hello.yaml --secrets-file .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
+orno run hello.yaml
 ```
 
-The `--secrets-file` flag tells orno to load credentials from a `KEY=VALUE` file. Provider-specific keys like `OPENROUTER_API_KEY` are auto-discovered when an agent's `provider:` matches.
+orno reads the provider key (`OPENROUTER_API_KEY` for `provider: openrouter`) from the process env and redacts it from every event. To keep the key in a file instead, declare `secrets: [OPENROUTER_API_KEY]` in the pipeline and pass `--secrets-file`; a `--secrets-file` key that the pipeline does not declare is an error.
 
-The output is the same shape as the dummy run, but the `content_excerpt` field on `llm_request_succeeded` will contain the model's actual response.
+The output is the same shape as the dummy run, but the `content_excerpt` field on `llm_response_received` will contain the model's actual response.
 
 ## Step 6 — Read the model's reply
 

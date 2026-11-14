@@ -1548,7 +1548,6 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "genai",
- "hex",
  "lru",
  "minijinja",
  "reqwest",

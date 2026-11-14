@@ -32,10 +32,10 @@ use net_guard::DomainRules;
 
 pub use bash::BashHandler;
 pub use edit::EditHandler;
-pub use mcp_handler::{McpToolHandler, McpToolHandlerConfig, ReplayMcpStubHandler};
+pub use mcp_handler::{McpToolHandler, McpToolHandlerConfig};
 pub use read::ReadHandler;
 pub use record::{RecordingToolHandler, ToolTapeEntry};
-pub use replay::ReplayToolHandler;
+pub use replay::{ReplayMcpStubHandler, ReplayToolHandler};
 pub use set_state::SetStateHandler;
 pub use subagent::SubagentHandler;
 pub use web_fetch::WebFetchHandler;
@@ -268,7 +268,7 @@ pub trait ToolHandler: Send + Sync {
     /// tool in `allowed_tools` returns `true` here and `policy.roots` is
     /// empty. Override this on every handler that performs filesystem I/O
     /// relative to `roots`; the default of `false` keeps third-party
-    /// handlers compatible (BS3).
+    /// handlers compatible.
     fn requires_jail(&self) -> bool {
         false
     }

@@ -1,14 +1,7 @@
 //! Policy gate and parse-error retry for [`LoopAgent`].
 //!
-//! Split out of `run.rs` so the effect-based denial logic and the
-//! parse-error retry wrapper stay readable. Effect-based denials are
-//! *non-terminal* — the denial string is fed back to the model as a
-//! `ToolResult`, and the enclosing loop in `run.rs` continues.
-//!
-//! Visibility: the single entry point `invoke_with_parse_retry` is
-//! `pub(super)` because `run.rs` (a sibling) calls it; the helpers
-//! `check_policy_and_invoke` and `deny` stay private to this file
-//! because they are only reached through the retry wrapper.
+//! Effect-based denials are non-terminal: the denial string goes back
+//! to the model as a `ToolResult` and the loop continues.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,6 +45,30 @@ fn collect_urls(value: &Value, key: Option<&str>, out: &mut Vec<reqwest::Url>) {
         Value::Array(items) => items.iter().for_each(|v| collect_urls(v, key, out)),
         Value::Object(map) => map.iter().for_each(|(k, v)| collect_urls(v, Some(k), out)),
         _ => {},
+    }
+}
+
+/// One model-issued tool call with everything the policy gate needs.
+pub(super) struct ToolCall<'a> {
+    pub(super) handler: &'a Arc<dyn ToolHandler>,
+    pub(super) tool_call: &'a OrnoChatToolCall,
+    pub(super) policy: &'a AgentPolicy,
+    pub(super) wire_to_yaml: &'a HashMap<String, String>,
+}
+
+/// Why the policy flags forbid `effect`, or `None` when it may run.
+fn effect_denial(effect: ToolEffect, policy: &AgentPolicy) -> Option<&'static str> {
+    match effect {
+        ToolEffect::Mutations | ToolEffect::MutationsAndNetwork if !policy.allow_mutations => {
+            Some("allow_mutations=false")
+        },
+        ToolEffect::Network | ToolEffect::MutationsAndNetwork if !policy.allow_network => {
+            Some("allow_network=false")
+        },
+        ToolEffect::ContextSelf if !policy.allow_context_writes => {
+            Some("allow_context_writes=false")
+        },
+        _ => None,
     }
 }
 
@@ -113,11 +130,15 @@ impl LoopAgent {
     /// or `None` to allow the call through.
     async fn gate_network_url(
         &self,
-        tool_call: &OrnoChatToolCall,
-        policy: &AgentPolicy,
+        call: &ToolCall<'_>,
         inv: &ToolInvocation<'_>,
-        wire_to_yaml: &HashMap<String, String>,
     ) -> Option<String> {
+        let ToolCall {
+            tool_call,
+            policy,
+            wire_to_yaml,
+            ..
+        } = *call;
         // A subagent's arguments are a prompt, not a destination; its own
         // loop gates whatever it calls.
         if wire_to_yaml
@@ -205,105 +226,35 @@ impl LoopAgent {
         }
     }
 
-    /// Apply the effect-based policy gate and invoke the handler. A
-    /// policy denial is *not* a terminal error — it is fed back to the
-    /// model as a `ToolResult` denial string so the model can adapt. So is
-    /// a recoverable handler error ([`ToolError::is_recoverable`]); any
-    /// other handler error terminates the loop via [`AgentError::Tool`].
-    /// `wire_to_yaml` is the per-`run()` reverse map used by `deny` to
-    /// surface the YAML-form name on every denial event and feed-back
-    /// string.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "policy gate enumerates every ToolEffect variant inline"
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "wire_to_yaml is per-run; threading through deny call sites — see plan WU-W2C"
-    )]
+    /// Apply the effect-based policy gate and invoke the handler. Policy
+    /// denials and recoverable handler errors ([`ToolError::is_recoverable`])
+    /// are fed back to the model as the tool result; any other handler
+    /// error terminates the loop via [`AgentError::Tool`].
     async fn check_policy_and_invoke(
         &self,
-        handler: &Arc<dyn ToolHandler>,
-        tool_call: &OrnoChatToolCall,
-        policy: &AgentPolicy,
+        call: &ToolCall<'_>,
         inv: ToolInvocation<'_>,
-        wire_to_yaml: &HashMap<String, String>,
     ) -> Result<String, AgentError> {
-        match handler.effect() {
-            ToolEffect::Mutations => {
-                if !policy.allow_mutations {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_mutations=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-            },
-            ToolEffect::Network => {
-                if !policy.allow_network {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_network=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                if let Some(denial) = self
-                    .gate_network_url(tool_call, policy, &inv, wire_to_yaml)
-                    .await
-                {
-                    return Ok(denial);
-                }
-            },
-            ToolEffect::MutationsAndNetwork => {
-                if !policy.allow_mutations {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_mutations=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                if !policy.allow_network {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_network=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-                if let Some(denial) = self
-                    .gate_network_url(tool_call, policy, &inv, wire_to_yaml)
-                    .await
-                {
-                    return Ok(denial);
-                }
-            },
-            ToolEffect::ContextSelf => {
-                if !policy.allow_context_writes {
-                    return Ok(self
-                        .deny(
-                            &inv,
-                            &tool_call.fn_name,
-                            "allow_context_writes=false".into(),
-                            wire_to_yaml,
-                        )
-                        .await);
-                }
-            },
-            ToolEffect::ReadOnly => {},
+        let tool_call = call.tool_call;
+        let effect = call.handler.effect();
+        if let Some(reason) = effect_denial(effect, call.policy) {
+            return Ok(self
+                .deny(&inv, &tool_call.fn_name, reason.into(), call.wire_to_yaml)
+                .await);
+        }
+        if matches!(
+            effect,
+            ToolEffect::Network | ToolEffect::MutationsAndNetwork
+        ) && let Some(denial) = self.gate_network_url(call, &inv).await
+        {
+            return Ok(denial);
         }
 
-        match handler.invoke(inv, tool_call.fn_arguments.clone()).await {
+        match call
+            .handler
+            .invoke(inv, tool_call.fn_arguments.clone())
+            .await
+        {
             Ok(output) => Ok(output),
             Err(err) if err.is_recoverable() => Ok(recoverable_feedback(&tool_call.fn_name, &err)),
             Err(source) => Err(AgentError::Tool {
@@ -313,35 +264,23 @@ impl LoopAgent {
         }
     }
 
-    /// Run `check_policy_and_invoke` with a single parse-error retry
-    /// budget per `call_id`, honoring `AgentPolicy.on_parse_error`.
-    /// `RetryOnce` feeds the `InvalidArgs` message back to the model as
-    /// a tool result; the second breach on the same `call_id`
-    /// terminates with [`AgentError::ParseFailed`]. `wire_to_yaml` is
-    /// forwarded into the policy gate so denial events surface the
-    /// YAML-form tool name operators wrote.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "parse-retry wraps check_policy_and_invoke; collapsing into a struct would add indirection without simplifying calls"
-    )]
+    /// Run `check_policy_and_invoke` with a single parse-error retry per
+    /// `call_id`, honoring `AgentPolicy.on_parse_error`. `RetryOnce` feeds
+    /// the `InvalidArgs` message back as a tool result; a second breach on
+    /// the same `call_id` terminates with [`AgentError::ParseFailed`].
     pub(super) async fn invoke_with_parse_retry(
         &self,
-        handler: &Arc<dyn ToolHandler>,
-        tool_call: &OrnoChatToolCall,
-        policy: &AgentPolicy,
+        call: &ToolCall<'_>,
         inv: ToolInvocation<'_>,
         retried: &mut HashSet<String>,
-        wire_to_yaml: &HashMap<String, String>,
     ) -> Result<String, AgentError> {
-        match self
-            .check_policy_and_invoke(handler, tool_call, policy, inv, wire_to_yaml)
-            .await
-        {
+        let tool_call = call.tool_call;
+        match self.check_policy_and_invoke(call, inv).await {
             Ok(s) => Ok(s),
             Err(AgentError::Tool {
                 name,
                 source: ToolError::InvalidArgs { message, .. },
-            }) => match policy.on_parse_error {
+            }) => match call.policy.on_parse_error {
                 crate::pipeline::OnParseError::RetryOnce
                     if !retried.contains(&tool_call.call_id) =>
                 {

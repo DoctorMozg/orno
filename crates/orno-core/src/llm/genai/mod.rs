@@ -1,21 +1,10 @@
-//! Production `LlmTransport` implementation wrapping the `genai` crate.
+//! Production `LlmTransport` wrapping the `genai` crate. Every `genai::*`
+//! import lives in this module tree; the public surface returns only
+//! `LlmResponse` / `LlmError`.
 //!
-//! `genai` types are kept behind this trait — every `genai::*` import
-//! lives in this submodule tree, `Client::default()` / `Client::builder()`
-//! stay internal, and the public surface returns only `LlmResponse` /
-//! `LlmError`. Adding a provider means adding a match arm to
-//! [`convert::build_client`]; the caller sees no churn.
-//!
-//! Provider routing honors `AgentConfig.provider`. Each provider key is
-//! pinned to a specific `AdapterKind` via a `ServiceTargetResolver`, so
-//! `model: "gpt-5"` with `provider: anthropic` fails fast at the API
-//! rather than silently routing to `OpenAI` because the model prefix
-//! matched.
-//!
-//! The file split keeps `mod.rs` focused on the transport struct and
-//! trait impl. Provider client construction, message/tool conversion,
-//! and error mapping live in [`convert`] next to the only `genai::*`
-//! imports they need.
+//! Each provider key is pinned to one `AdapterKind`, so `model: "gpt-5"`
+//! with `provider: anthropic` fails at the API instead of silently routing
+//! to `OpenAI` on the model prefix.
 
 mod convert;
 
@@ -55,6 +44,7 @@ const RETRY_BASE_DELAY_MS: u64 = 500;
 /// a connection that hangs forever, not to bound normal latency.
 const LLM_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
+/// Production transport: one pinned `genai` client per provider in use.
 #[derive(Debug)]
 pub struct GenAiTransport {
     clients: HashMap<String, Arc<Client>>,
@@ -103,7 +93,7 @@ impl LlmTransport for GenAiTransport {
         ),
     )]
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
-        let client = self.clients.get(&req.provider).ok_or_else(|| {
+        let client = self.clients.get(&*req.provider).ok_or_else(|| {
             LlmError::ConfigError(format!(
                 "provider `{}` was not registered at transport construction — known: {}",
                 req.provider,
@@ -159,9 +149,9 @@ impl LlmTransport for GenAiTransport {
 }
 
 fn build_chat(req: &LlmRequest) -> ChatRequest {
-    let mut chat = ChatRequest::new(vec![ChatMessage::user(req.prompt.clone())]);
+    let mut chat = ChatRequest::new(vec![ChatMessage::user(&*req.prompt)]);
     if let Some(system) = &req.system {
-        chat = chat.with_system(system.clone());
+        chat = chat.with_system(&**system);
     }
     for msg in req.messages.iter() {
         chat = chat.append_message(orno_msg_to_genai(msg));
@@ -185,7 +175,7 @@ async fn exec_chat_with_retry(
     req: &LlmRequest,
     options: &ChatOptions,
 ) -> Result<ChatResponse, LlmError> {
-    let (provider, model) = (req.provider.as_str(), req.model.as_str());
+    let (provider, model) = (&*req.provider, &*req.model);
     let mut attempt: u32 = 0;
     loop {
         let call = client.exec_chat(model, build_chat(req), Some(options));

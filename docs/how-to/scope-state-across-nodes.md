@@ -147,15 +147,15 @@ It does **not** check that the agent will actually publish all the keys you refe
 - **Keys** must match `^[A-Za-z_][A-Za-z0-9_]*` — letters, digits, underscores; cannot start with a digit. `severity_score` is fine; `severity-score` and `1st_check` are not.
 - **Values** are JSON. Strings, numbers, booleans, arrays, objects — all valid.
 - **Size cap** — there's a per-node total size cap on state. An attempted write that would exceed it returns `StateTooLarge` to the model as a tool denial; the loop continues. The model can recover by writing smaller values.
-- **Multiple writes to the same key** — the latest write wins. The intermediate values are recorded in the event log (every `tool_invoked` is captured) but only the last one is what downstream templates see.
+- **Multiple writes to the same key** — the latest write wins. The intermediate values are recorded in the event log (every call is captured as a `tool_call_recorded` event) but only the last one is what downstream templates see.
 
 ## Recipe — bug triage with structured handoff
 
 The full `examples/scoped-state/pipeline.yaml` is the canonical recipe for this pattern. To run it:
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
-orno run examples/scoped-state/pipeline.yaml --secrets-file .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
+orno run examples/scoped-state/pipeline.yaml
 cat target/orno-scoped-state/triage-summary.md
 ```
 
@@ -202,7 +202,7 @@ nodes:
            "--owner",    "{{ nodes.classify.state.suggested_owner }}"]
 ```
 
-Both downstream nodes consume specific fields. They run in parallel (no `needs:` between them). A downstream node that wants the agent's free-form summary still uses `nodes.classify.output`.
+Both downstream nodes consume specific fields. Neither depends on the other (no `needs:` between them); the engine runs nodes one at a time. A downstream node that wants the agent's free-form summary still uses `nodes.classify.output`.
 
 ## Failure modes
 

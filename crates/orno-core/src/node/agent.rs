@@ -4,12 +4,13 @@
 //! delegates to an `Arc<dyn Agent>`, and packages the `AgentOutput` back
 //! into `NodeResponse` JSON. All loop behavior — LLM dispatch, event
 //! emission, policy checks — lives inside the injected `Agent` impl
-//! (`LoopAgent` today; Phase 5 grows it).
+//! (`LoopAgent` today).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tracing::instrument;
 
 use crate::agent::{Agent, AgentOutput, AgentRequest, LoopAgent, LoopAgentConfig};
 use crate::error::{AgentError, NodeError};
@@ -55,6 +56,10 @@ impl AgentExecutor {
 
 #[async_trait]
 impl NodeExecutor for AgentExecutor {
+    #[instrument(
+        skip(self, req),
+        fields(node.id = %node_id, node.kind = "agent", pipeline.run_id = %run_id),
+    )]
     async fn execute(
         &self,
         run_id: &str,
@@ -113,22 +118,11 @@ impl NodeExecutor for AgentExecutor {
     }
 }
 
-/// Translate an [`AgentError`] into a [`NodeError`] preserving the
-/// two user-facing distinctions that the dispatch layer already
-/// surfaces: "feature not ready yet" stays `UnsupportedYet` so strict
-/// pipelines get the same classification they got pre-adapter;
-/// everything else collapses into `Execution` with the agent error as
-/// the `source()` chain.
+/// The agent error stays reachable through the `source()` chain.
 fn agent_error_to_node(id: &str, err: AgentError) -> NodeError {
-    match err {
-        AgentError::UnsupportedYet(feature) => NodeError::UnsupportedYet {
-            id: id.to_string(),
-            feature,
-        },
-        other => NodeError::Execution {
-            id: id.to_string(),
-            source: Box::new(other),
-        },
+    NodeError::Execution {
+        id: id.to_string(),
+        source: Box::new(err),
     }
 }
 
@@ -284,27 +278,6 @@ mod tests {
         assert_eq!(resp.output["output"], "hello");
         assert_eq!(resp.output["state"]["plan"]["status"], "ready");
         assert_eq!(resp.output["state"]["count"], 3);
-    }
-
-    #[tokio::test]
-    async fn unsupported_yet_error_preserves_node_classification() {
-        // The adapter must keep the "feature not ready" distinction that
-        // strict pipelines rely on — collapsing it into Execution would
-        // make unrelated failures indistinguishable from policy drift.
-        let fake = FakeAgent::err(AgentError::UnsupportedYet("allowed_tools (Phase 5)".into()));
-        let exec = AgentExecutor::from_agent(fake);
-
-        let err = exec
-            .execute("run_test", "n", agent_node_request())
-            .await
-            .expect_err("UnsupportedYet must propagate");
-        match err {
-            NodeError::UnsupportedYet { id, feature } => {
-                assert_eq!(id, "n");
-                assert!(feature.contains("allowed_tools"));
-            },
-            other => panic!("expected UnsupportedYet, got {other:?}"),
-        }
     }
 
     #[tokio::test]

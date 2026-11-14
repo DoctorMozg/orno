@@ -56,8 +56,8 @@ impl ToolHandler for WriteHandler {
         // path. Creating directories before the jail check would let an
         // LLM with `allow_mutations` mkdir anywhere the process can,
         // even if the subsequent write is rejected — a containment
-        // violation independent of the actual file content (F1).
-        // BS1: fail closed when roots is empty — no boundary, no write.
+        // violation independent of the actual file content.
+        // Fail closed when roots is empty — no boundary, no write.
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_file(root, &path).await?
         } else {

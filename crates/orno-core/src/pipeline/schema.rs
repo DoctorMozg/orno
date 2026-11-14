@@ -1,8 +1,7 @@
 //! User-facing pipeline schema. Keep every variant explicit; no untagged
 //! enums over bool-ish strings (the Norway problem).
 //!
-//! Shape targets the v0.1.0 YAML documented in `docs/yaml-spec.md`. Two
-//! node kinds live here — `agent` and `shell`. The agent kind covers
+//! Two node kinds live here — `agent` and `shell`. The agent kind covers
 //! pure LLM calls and tool-using loops alike; HTTP, parsing, and
 //! assertions happen inside agent tooling rather than as sibling kinds.
 
@@ -169,7 +168,7 @@ pub enum NodeKind {
 
 /// Agent node — references a named entry in `Pipeline.agents`. Inline
 /// agent configuration at the node level is a v0.2+ convenience and is
-/// not in the v0.1 schema (see `docs/yaml-spec.md`).
+/// not in the schema.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentNode {

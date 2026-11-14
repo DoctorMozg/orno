@@ -64,36 +64,10 @@ impl EventEnvelope {
     }
 }
 
-/// Wire-format version.
-///
-/// **3 → 4.** Two breaking changes shipped together:
-///
-/// 1. `Event::NodeOutputTruncated.captured_bytes` is renamed to
-///    `total_bytes`; it always carried the total the child wrote, not
-///    the retained prefix.
-/// 2. `Event::BudgetExceeded` was removed; budget breaches surface as
-///    a failed node with a typed `NodeFailure`.
-///
-/// **2 → 3 (PR #3, pre-opensource hardening pass).** Adds
-/// `Event::NodeOutputTruncated`, emitted when a `kind: shell` node's
-/// captured `stdout` or `stderr` exceeded the engine's new
-/// `max_node_output_bytes` cap. The variant is purely additive — it
-/// only fires on a new failure mode that previously could not occur
-/// (the prior `wait_with_output` path captured everything in memory),
-/// so existing replay files at version 2 remain readable as long as
-/// the consumer treats unknown event types non-fatally.
-///
-/// **1 → 2 (PR #2).** Two additive changes shipped together so the
-/// version only incremented once:
-///
-/// 1. `NodeStarted`, `NodeFinished`, `NodeSkipped`, and
-///    `AgentIterationStarted` now carry a `node_kind: String` field
-///    so downstream consumers can branch on agent-vs-shell without
-///    cross-referencing the pipeline YAML.
-/// 2. `NodePayloadFailure` carries an additional `signal: Option<i32>`
-///    field. On Unix, a process killed by a signal now reports
-///    `signal = Some(n)` and `exit_code = None` — previously
-///    `exit_code` was rolled to `-1` and the signal was lost.
+/// Wire-format version, bumped on any change that breaks readers. Version 4
+/// renamed `NodeOutputTruncated.captured_bytes` to `total_bytes` and removed
+/// `Event::BudgetExceeded`; budget breaches now surface as a failed node
+/// with a typed `NodeFailure`.
 pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Keep the leading `max_bytes` of a string on a UTF-8 boundary,

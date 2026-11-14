@@ -10,7 +10,7 @@
 //! - `secrets` — dotenv parsing, inline `-e` handling, `resolve_inputs`
 //! - `transport` — `GenAiTransport` / `ReplayTransport` / `RecordingTransport` selection
 
-mod agent;
+pub(crate) mod agent;
 mod secrets;
 mod transport;
 
@@ -30,6 +30,7 @@ use orno_core::execution::scheduler::RunOutcome;
 use orno_core::execution::{EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::{BundleRunInputs, BundleSources, RecordingTransport, write_bundle};
 use orno_core::mcp::{McpClient, McpTool, McpToolCallResult, RmcpClient};
+use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::schema::McpServerConfig;
@@ -78,12 +79,6 @@ type McpSpawn = (
 /// delay the operator's cancel; the OS reaps any stragglers when the
 /// parent exits.
 const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Sentinel inserted into `RunFinished.failed_nodes` on SIGINT so a
-/// downstream consumer reading the NDJSON stream can tell an
-/// interrupted run apart from a node-level failure without needing
-/// out-of-band exit-code context.
-const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
 
 /// Mutex-guarded wrapper that lets the orchestrator hold a single MCP
 /// client behind `Arc<dyn McpClient>` for `McpToolHandler` dispatch while
@@ -238,8 +233,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     // Expand `mcp.<server>.*` wildcards before agent construction so
     // the cloned `AgentConfig` each `SubagentHandler` receives carries
     // the expanded list. See `pipeline::load::expand_mcp_wildcards`.
-    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
-        .context("expanding MCP tool wildcards in agent allowed_tools")?;
+    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names);
 
     let builtin_tools = assemble_builtin_tools(&redactor, body_excerpt_max_bytes, mcp_tools);
     let (builtin_tools, tool_tape_to_flush) = wrap_tool_tape(builtin_tools, &flags, &redactor)?;
@@ -251,7 +245,11 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         redactor,
         body_excerpt_max_bytes,
     });
-    let engine = build_engine(sink.clone(), loop_agent, engine_config);
+    let shell = Arc::new(ShellExecutor::with_config(
+        sink.clone(),
+        engine_config.max_node_output_bytes,
+    ));
+    let engine = build_engine(sink.clone(), loop_agent, shell, engine_config);
 
     let run_result = tokio::select! {
         biased;
@@ -324,7 +322,7 @@ fn finish_run(
             Err(run_err.into())
         },
         (Ok(_), Err(flush_err)) => Err(flush_err),
-        (Ok(report), Ok(())) => finalize_run(streaming_sink, &report),
+        (Ok(report), Ok(())) => super::finalize_run(streaming_sink, &report, "run"),
     }
 }
 
@@ -430,10 +428,8 @@ async fn spawn_mcp_servers(
                 // Reuses the same shutdown sequence as the success path
                 // at the bottom of `run()`.
                 shutdown_mcp_servers(sink, run_id, &mcp_clients).await;
-                // No nodes ran on this path, so the lifecycle aggregate
-                // vectors are empty. The CLI owns the `RunStarted` /
-                // `RunFinished { ok: false }` pair on the crash path
-                // because `Engine::run` never gets a chance to (H2).
+                // No nodes ran, and `Engine::run` never will, so the CLI
+                // owns the `RunStarted` / `RunFinished { ok: false }` pair.
                 emit_run_lifecycle_failure(sink, run_id, Vec::new(), Vec::new()).await;
                 return Err(e);
             },
@@ -597,22 +593,16 @@ async fn handle_sigint(
     tool_tape_to_flush: Option<&ToolTapeHandle>,
     mcp_clients: &[Arc<SharedMcpClient>],
 ) {
-    sink.record(Event::RunFinished {
-        run_id: run_id.to_string(),
-        ok: false,
-        failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
-        skipped_nodes: Vec::new(),
-    })
-    .await;
+    super::emit_interrupted(sink, run_id).await;
     if let Some(rec) = recording_transport
         && let Err(e) = rec.flush()
     {
-        tracing::warn!(error = ?e, "flushing LLM tape on SIGINT failed");
+        tracing::warn!(error = %e, "flushing LLM tape on SIGINT failed");
     }
     if let Some(tape) = tool_tape_to_flush
         && let Err(e) = tape.flush()
     {
-        tracing::warn!(error = ?e, "flushing tool tape on SIGINT failed");
+        tracing::warn!(error = %e, "flushing tool tape on SIGINT failed");
     }
     let shutdown_fut = shutdown_mcp_servers(sink, run_id, mcp_clients);
     if tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, shutdown_fut)
@@ -624,31 +614,6 @@ async fn handle_sigint(
             "MCP shutdown exceeded grace window on SIGINT"
         );
     }
-}
-
-/// Translate the engine's outcome and the streaming sink's broken
-/// state into the CLI's process-level exit code. The streaming sink
-/// swallows write errors during the run so a single EPIPE does not
-/// poison every subsequent `record` — but a broken sink still owes
-/// the operator a non-zero exit. Checked after MCP shutdown so the
-/// shutdown envelopes had a chance to fail too.
-fn finalize_run(streaming_sink: &Arc<StreamingSink>, run_outcome: &RunOutcome) -> Result<()> {
-    if streaming_sink.is_broken() {
-        bail!("event stream write failed (downstream closed?); run output is incomplete");
-    }
-
-    // Skipped descendants are visible in the stream as `node_skipped`
-    // envelopes; we do not re-list them here to keep the CLI message tight.
-    if !run_outcome.ok {
-        let names = if run_outcome.failed_nodes.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            run_outcome.failed_nodes.join(", ")
-        };
-        bail!("run failed: nodes [{names}] reported ok:false");
-    }
-
-    Ok(())
 }
 
 /// Emit the `RunStarted` + `RunFinished { ok: false, .. }` pair the CLI
@@ -697,8 +662,8 @@ async fn shutdown_mcp_servers(
         .await;
         if let Err(e) = client.inner.lock().await.shutdown().await {
             tracing::warn!(
-                server = %client.server,
-                error = ?e,
+                mcp.server = %client.server,
+                error = %e,
                 "MCP server shutdown failed",
             );
         }

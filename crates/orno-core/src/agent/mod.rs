@@ -1,5 +1,5 @@
 //! Agent-loop seam. Every `kind: agent` node routes through an
-//! [`Agent`] implementation. The skeleton ships one impl,
+//! [`Agent`] implementation. The one impl is
 //! [`LoopAgent`], which drives the bounded iteration loop with tool
 //! dispatch and full five-dimension enforcement of the strictness
 //! contract.

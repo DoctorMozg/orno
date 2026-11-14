@@ -81,6 +81,28 @@ impl ShellExecutor {
     pub fn with_config(sink: Arc<dyn EventSink>, cap: usize) -> Self {
         Self { cap, sink }
     }
+
+    /// Warn and emit one `NodeOutputTruncated` for an overflowed pipe.
+    async fn emit_truncation(&self, run_id: &str, id: &str, stream: &str, total: usize) {
+        let cap = self.cap;
+        warn!(
+            node.id = %id,
+            stream = stream,
+            total_bytes = total,
+            cap_bytes = cap,
+            "shell node output truncated to cap",
+        );
+        self.sink
+            .record(Event::NodeOutputTruncated {
+                run_id: run_id.to_string(),
+                node_id: id.to_string(),
+                node_kind: "shell".to_string(),
+                stream: stream.to_string(),
+                total_bytes: total as u64,
+                cap_bytes: cap as u64,
+            })
+            .await;
+    }
 }
 
 #[async_trait]
@@ -175,10 +197,12 @@ impl NodeExecutor for ShellExecutor {
         // alongside the captured total so a downstream tool can
         // surface "captured / cap" without a follow-up query.
         if stdout_total > cap {
-            emit_truncation(&self.sink, run_id, id, "stdout", stdout_total, cap).await;
+            self.emit_truncation(run_id, id, "stdout", stdout_total)
+                .await;
         }
         if stderr_total > cap {
-            emit_truncation(&self.sink, run_id, id, "stderr", stderr_total, cap).await;
+            self.emit_truncation(run_id, id, "stderr", stderr_total)
+                .await;
         }
 
         let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
@@ -202,43 +226,6 @@ impl NodeExecutor for ShellExecutor {
             }),
         })
     }
-}
-
-/// Log and emit a single `NodeOutputTruncated` envelope for one of the
-/// child's pipes. The captured total is reported alongside the cap so
-/// downstream tools can render "captured / cap" without a follow-up
-/// lookup.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "private helper extracted from execute(); each arg is a distinct \
-              primitive identifier (run_id, node id, stream name, totals, cap) \
-              and bundling them into a struct would only push the same six \
-              fields one indirection away"
-)]
-async fn emit_truncation(
-    sink: &Arc<dyn EventSink>,
-    run_id: &str,
-    id: &str,
-    stream: &str,
-    total: usize,
-    cap: usize,
-) {
-    warn!(
-        node.id = %id,
-        stream = stream,
-        total_bytes = total,
-        cap_bytes = cap,
-        "shell node output truncated to cap",
-    );
-    sink.record(Event::NodeOutputTruncated {
-        run_id: run_id.to_string(),
-        node_id: id.to_string(),
-        node_kind: "shell".to_string(),
-        stream: stream.to_string(),
-        total_bytes: total as u64,
-        cap_bytes: cap as u64,
-    })
-    .await;
 }
 
 /// Extract the terminating signal number from a child process exit

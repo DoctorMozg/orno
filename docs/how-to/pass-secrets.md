@@ -12,7 +12,7 @@ secrets:
 
 agents:
   reviewer:
-    provider: openrouter           # OPENROUTER_API_KEY auto-discovered
+    provider: openrouter           # key read from OPENROUTER_API_KEY
     allowed_tools: [WebFetch]
     # ...
 
@@ -44,7 +44,7 @@ secrets:
   - SCANNER_TOKEN
 ```
 
-Names are normalized to UPPER_SNAKE_CASE. The list is the **allowlist** of secret names the pipeline acknowledges; an unrelated env var or unrelated entry in the secrets file is ignored.
+The list is the **allowlist** of secret names the pipeline acknowledges. An unrelated process env var is ignored, and a `--secrets-file` key that is not listed is an error.
 
 A name in `secrets:` does not require a value to be present. Unused secrets are loaded into memory but never rendered, never logged, never recorded — they are harmless if absent. Use this to make optional credentials optional without code changes.
 
@@ -78,11 +78,11 @@ agents:
 
 They are **not** in `vars.*` or `env.*`. A template that wants a secret writes `{{ secrets.NAME }}` and nothing else.
 
-Provider-specific keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`) are auto-discovered when the agent's `provider:` matches. You do not need to template them into the agent config — they're picked up at the transport boundary.
+Provider keys (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are read at the transport boundary when the agent's `provider:` matches; you do not template them into the agent config. They are redacted whether or not you declare them under `secrets:`.
 
 ### 4. Redaction at emission
 
-Before any event envelope hits stdout (or any tracing line hits stderr, or any tape is recorded), every rendered string is scanned for known secret values. Every match is replaced with `[REDACTED]`.
+Before any event envelope hits stdout (or any tracing line hits stderr, or any tape is recorded), every rendered string is scanned for known secret values. Every match is replaced with `***`.
 
 This applies to:
 
@@ -92,11 +92,11 @@ This applies to:
 - **Tool tapes** — recorded tool call/result pairs.
 - **MCP tapes** — recorded MCP exchanges.
 
-A secret accidentally echoed by the model in its content (e.g. it parrots back the token in its reply) is also redacted. The model's view is the *original* value; the audit log's view is `[REDACTED]`.
+A secret accidentally echoed by the model in its content (e.g. it parrots back the token in its reply) is also redacted. The model's view is the *original* value; the audit log's view is `***`.
 
 ## Argv scrubbing
 
-When a tool — typically `Bash` — uses a secret as a CLI argument, the secret is scrubbed from `tool_invoked.arguments` before the event is emitted:
+When a tool — typically `Bash` — uses a secret as a CLI argument, the secret is scrubbed from the `input_excerpt` of `tool_call_recorded` before the event is emitted:
 
 ```yaml
 - id: deploy
@@ -105,30 +105,28 @@ When a tool — typically `Bash` — uses a secret as a CLI argument, the secret
   args: ["--token", "{{ secrets.DEPLOY_TOKEN }}"]
 ```
 
-The shell process receives the actual token; the event log shows `["--token", "[REDACTED]"]`.
+The shell process receives the actual token; the event log shows `***` in place of the token.
 
-This is a separate code path from string-content redaction because the secret value is known at template-render time. The runtime scrubs by reference, not just by string match.
+This is a separate code path from string-content redaction because the secret value is known at template-render time. The redactor matches by value, including encoded forms (base64, hex, percent-encoded, JSON-escaped).
 
 ## Auto-discovery for LLM providers
 
-You do **not** need to template provider keys into the agent config. orno's transport layer reads them from the secret store at request time:
+You do **not** need to template provider keys into the agent config. orno's transport layer reads them at request time (from the process env, or from `--secrets-file` when the name is declared under `secrets:`):
 
 | Provider key                                 | Recognized when an agent has...                                 |
 | -------------------------------------------- | ---------------------------------------------------------------- |
 | `OPENROUTER_API_KEY`                         | `provider: openrouter`                                           |
 | `ANTHROPIC_API_KEY`                          | `provider: anthropic`                                            |
 | `OPENAI_API_KEY`                             | `provider: openai`                                               |
-| `GEMINI_API_KEY`                             | `provider: gemini`                                               |
-| `GROQ_API_KEY`                               | `provider: groq`                                                 |
-| `XAI_API_KEY`                                | `provider: xai`                                                  |
+| `OLLAMA_HOST` (address, not a key)            | `provider: ollama`                                               |
 
-If the secret is missing at request time, the LLM call fails with `LlmFailure::AuthFailed`.
+If the key is missing, the call fails with a `config_error` that names the env var to set. A key the provider rejects is `auth_failed`. `ollama` needs no key.
 
 ## What does *not* leak
 
-- Secrets are not in `env.*`. Even though the secrets file looks like `KEY=VALUE`, the values are not exposed via the `env.*` template namespace. A pipeline that wants a value as both a secret and a regular env var must declare it in both `secrets:` and `pass_env:` and provide the value through the appropriate channel.
+- Secrets are not in `env.*`. Even though the secrets file looks like `KEY=VALUE`, the values are not exposed via the `env.*` template namespace. A name listed in both `secrets:` and `pass_env:` fails validation; keep it in `secrets:` only.
 - Secrets are not in the host environment. Tools spawned by orno (like `Bash`'s subprocess) inherit only the env variables you explicitly pass via the tool's argv or `env:` block, never the secret store.
-- Secrets are not in replay tapes. A bundle replays with `[REDACTED]` in place of every recorded secret value. The model and tools see the redacted form during replay; the original credentials are gone.
+- Secrets are not in replay tapes. A bundle replays with `***` in place of every recorded secret value. The model and tools see the redacted form during replay; the original credentials are gone.
 
 ## What still leaks
 
@@ -212,7 +210,7 @@ nodes:
       Authorization: Bearer {{ secrets.GITHUB_TOKEN }}
 ```
 
-The token is rendered into the prompt verbatim, the model emits a `WebFetch` call with the token in the header, and the event log shows `[REDACTED]` everywhere the token appeared.
+The token is rendered into the prompt verbatim, the model emits a `WebFetch` call with the token in the header, and the event log shows `***` everywhere the token appeared.
 
 ## Recipe 4 — bearer auth on an MCP server
 
@@ -229,7 +227,7 @@ mcp_servers:
       token: "{{ secrets.MCP_TOKEN }}"
 ```
 
-The token renders into the `Authorization: Bearer <token>` header at request time; the bundle records `[REDACTED]`.
+The token renders into the `Authorization: Bearer <token>` header at request time; the bundle records the template, never the value.
 
 ## Recipe 5 — running in CI
 

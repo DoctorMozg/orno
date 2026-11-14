@@ -75,7 +75,7 @@ impl ToolHandler for ReplayToolHandler {
         self.inner.effect()
     }
 
-    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), call_id = %inv.call_id))]
+    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), tool.call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
         let key = tool_tape_key(self.inner.name(), inv.call_id, &args, None);
         let outcome = self.index.take(&key).ok_or_else(|| ToolError::Invocation {
@@ -85,6 +85,65 @@ impl ToolHandler for ReplayToolHandler {
             ))),
         })?;
         outcome.into_result(self.inner.name())
+    }
+}
+
+/// Replay stand-in for one MCP tool. Its name, description and schema must
+/// match the recorded `OrnoChatTool` so the replayed request hashes to the
+/// recorded tape key. A wrapping `ReplayToolHandler` serves the calls;
+/// invoking the stub directly returns an error.
+pub struct ReplayMcpStubHandler {
+    name: String,
+    description: String,
+    schema: Value,
+}
+
+impl std::fmt::Debug for ReplayMcpStubHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplayMcpStubHandler")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayMcpStubHandler {
+    /// `name` is the YAML form (`mcp.<server>.<tool>`) so it matches the
+    /// agent's `allowed_tools`.
+    #[must_use]
+    pub fn new(name: String, description: String, schema: Value) -> Self {
+        Self {
+            name,
+            description,
+            schema,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReplayMcpStubHandler {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::MutationsAndNetwork
+    }
+
+    async fn invoke(&self, _inv: ToolInvocation<'_>, _args: Value) -> Result<String, ToolError> {
+        Err(ToolError::Invocation {
+            name: self.name.clone(),
+            source: Box::new(std::io::Error::other(
+                "ReplayMcpStubHandler::invoke called directly — must be wrapped in ReplayToolHandler so the tool tape serves the response",
+            )),
+        })
     }
 }
 
@@ -433,6 +492,41 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn replay_stub_exposes_yaml_name_and_recorded_metadata() {
+        let stub = ReplayMcpStubHandler::new(
+            "mcp.fs.read_file".to_string(),
+            "Read a file".to_string(),
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        );
+        assert_eq!(stub.name(), "mcp.fs.read_file");
+        assert_eq!(stub.description(), "Read a file");
+        assert_eq!(stub.schema()["type"], "object");
+        // Effect must match the live `McpToolHandler` so the agent
+        // loop's policy gate behaves identically in replay vs. record.
+        assert_eq!(stub.effect(), ToolEffect::MutationsAndNetwork);
+    }
+
+    #[tokio::test]
+    async fn replay_stub_invoke_called_directly_returns_clear_error() {
+        // Direct invocation should never happen in practice — every
+        // stub gets wrapped in `ReplayToolHandler`. But if it does,
+        // we want a readable error, not a panic.
+        let stub =
+            ReplayMcpStubHandler::new("mcp.fs.read_file".to_string(), String::new(), json!({}));
+        let err = stub
+            .invoke(ToolInvocation::for_test("c1"), json!({}))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Invocation { name, source } => {
+                assert_eq!(name, "mcp.fs.read_file");
+                assert!(source.to_string().contains("ReplayToolHandler"));
+            },
+            other => panic!("expected ToolError::Invocation, got {other:?}"),
         }
     }
 }

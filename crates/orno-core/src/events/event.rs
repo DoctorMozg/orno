@@ -1,9 +1,7 @@
 //! Lifecycle event variants.
 //!
-//! Split out of `mod.rs` so the enum can grow without pushing the
-//! module file past the 300-LOC soft cap. The enum is the only public
-//! surface here; re-exported from the parent module so consumer paths
-//! stay `crate::events::Event`.
+//! The enum is re-exported from the parent module as
+//! `crate::events::Event`.
 
 use serde::{Deserialize, Serialize};
 

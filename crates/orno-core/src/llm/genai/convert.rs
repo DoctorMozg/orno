@@ -115,97 +115,66 @@ fn warn_if_ollama_remote(host: Option<&str>) {
         .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "::1" | "[::1]"));
     if !is_loopback {
         tracing::warn!(
-            ollama_host = %raw,
+            llm.ollama_host = %raw,
             "OLLAMA_HOST points to a non-loopback address; \
              prompts and tool-call payloads will leave this machine in cleartext",
         );
     }
 }
 
-/// Adapter-pinning resolver: every client holds a closure that fixes
-/// the `AdapterKind` (and, for openrouter, the endpoint + auth env)
-/// regardless of what genai's prefix detection would otherwise pick.
-/// This is what makes `provider: anthropic + model: gpt-5` fail at the
-/// provider rather than silently routing to `OpenAI`.
-///
-/// Each auth'd closure captures its `AuthData` by move so the genai
-/// resolver has no reason to consult `std::env` at request time when
-/// the CLI already resolved the secret. `AuthData::clone()` returns
-/// a fresh owned value per call; the capture stays `Fn`, not `FnMut`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "single dispatch table over the four supported providers; \
-              splitting per-provider helpers would obscure the side-by-side \
-              comparison that catches drift between adapter wirings"
-)]
+/// Build a client pinned to one adapter and endpoint, so `provider:
+/// anthropic` with `model: gpt-5` fails at the provider instead of
+/// silently routing to `OpenAI` by genai's prefix detection. The auth is
+/// captured by clone, so the resolver never consults `std::env` at
+/// request time.
+fn pinned_client(endpoint: &Endpoint, auth: &AuthData, adapter: AdapterKind) -> Client {
+    let (endpoint, auth) = (endpoint.clone(), auth.clone());
+    Client::builder()
+        .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
+            move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                Ok(ServiceTarget {
+                    endpoint: endpoint.clone(),
+                    auth: auth.clone(),
+                    model: ModelIden::new(adapter, st.model.model_name),
+                })
+            },
+        ))
+        .build()
+}
+
 pub(super) fn build_client(
     provider: &str,
     secrets: &BTreeMap<String, String>,
 ) -> Result<Client, LlmError> {
-    match provider {
-        "openai" => {
-            let auth = resolve_auth(OPENAI_KEY_ENV, secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://api.openai.com/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
-        },
-        "anthropic" => {
-            let auth = resolve_auth(ANTHROPIC_KEY_ENV, secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://api.anthropic.com/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::Anthropic, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
-        },
+    Ok(match provider {
+        "openai" => pinned_client(
+            &Endpoint::from_static("https://api.openai.com/v1/"),
+            &resolve_auth(OPENAI_KEY_ENV, secrets),
+            AdapterKind::OpenAI,
+        ),
+        "anthropic" => pinned_client(
+            &Endpoint::from_static("https://api.anthropic.com/v1/"),
+            &resolve_auth(ANTHROPIC_KEY_ENV, secrets),
+            AdapterKind::Anthropic,
+        ),
         "ollama" => {
             let host_env = std::env::var("OLLAMA_HOST").ok();
             warn_if_ollama_remote(host_env.as_deref());
-            let endpoint = ollama_endpoint(host_env.as_deref());
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_owned(endpoint.clone()),
-                            auth: AuthData::None,
-                            model: ModelIden::new(AdapterKind::Ollama, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
+            let endpoint = Endpoint::from_owned(ollama_endpoint(host_env.as_deref()));
+            pinned_client(&endpoint, &AuthData::None, AdapterKind::Ollama)
         },
-        "openrouter" => {
-            let auth = resolve_auth(OPENROUTER_KEY_ENV, secrets);
-            Ok(Client::builder()
-                .with_service_target_resolver(ServiceTargetResolver::from_resolver_fn(
-                    move |st: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
-                        Ok(ServiceTarget {
-                            endpoint: Endpoint::from_static("https://openrouter.ai/api/v1/"),
-                            auth: auth.clone(),
-                            model: ModelIden::new(AdapterKind::OpenAI, st.model.model_name),
-                        })
-                    },
-                ))
-                .build())
+        "openrouter" => pinned_client(
+            &Endpoint::from_static("https://openrouter.ai/api/v1/"),
+            &resolve_auth(OPENROUTER_KEY_ENV, secrets),
+            AdapterKind::OpenAI,
+        ),
+        other => {
+            return Err(LlmError::ConfigError(format!(
+                "unknown provider `{other}`; known: {}",
+                KNOWN_PROVIDERS.join(", "),
+            )));
         },
-        other => Err(LlmError::ConfigError(format!(
-            "unknown provider `{other}`; known: {}",
-            KNOWN_PROVIDERS.join(", "),
-        ))),
-    }
+    })
 }
 
 /// Classify a `genai::Error` as transient (worth retrying) vs

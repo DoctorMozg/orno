@@ -12,7 +12,7 @@ A live run depends on:
 - Tool side-effects reproducing (file system state, network responses, MCP server availability).
 - API tokens being available and not exhausted.
 
-A replayed run depends on **none of that**. The bundle is a self-contained tape of every external interaction. Replay is bit-for-bit deterministic against the bundle. Use it for:
+A replayed run depends on **none of that**. The bundle is a self-contained tape of every external interaction. Replay serves every recorded LLM and tool result from the bundle, so the event stream is reproducible. Use it for:
 
 - **Postmortems** — examine what an agent saw and did without re-spending tokens.
 - **Integration testing** — re-run a known-good pipeline in CI as a regression test.
@@ -41,19 +41,19 @@ Have a look at `pipeline.yaml`. The relevant bits:
 
 ## Step 2 — Run live (one-time spend)
 
-Set up your secrets and execute the pipeline normally:
+Export your key (orno reads the provider key from the environment and redacts it) and execute the pipeline normally:
 
 ```bash
-echo 'OPENROUTER_API_KEY=sk-or-v1-...' > .env.secrets
-orno run examples/mcp-http-demo/pipeline.yaml --secrets-file .env.secrets
+export OPENROUTER_API_KEY=sk-or-v1-...
+orno run examples/mcp-http-demo/pipeline.yaml
 ```
 
-This is a regular run. You'll see `run_started`, MCP handshake events, an `llm_request_succeeded` with a content excerpt, an MCP tool call, another `llm_request_succeeded`, and `run_finished` with `ok: true`.
+This is a regular run. You'll see `run_started`, `mcp_server_starting` / `mcp_server_handshaked`, an `llm_response_received` with a content excerpt, an `mcp_tool_call_sent` / `mcp_tool_call_completed` pair, another `llm_response_received`, and `run_finished` with `ok: true`.
 
 This is your reference output. Save it for comparison:
 
 ```bash
-orno run examples/mcp-http-demo/pipeline.yaml --secrets-file .env.secrets \
+orno run examples/mcp-http-demo/pipeline.yaml \
   > live-events.ndjson 2> live-trace.log
 ```
 
@@ -63,7 +63,6 @@ The flag tells orno to capture every external interaction into a bundle file:
 
 ```bash
 orno run examples/mcp-http-demo/pipeline.yaml \
-  --secrets-file .env.secrets \
   --record-bundle bundle.ndjson
 ```
 
@@ -73,11 +72,11 @@ Have a look:
 
 ```bash
 wc -l bundle.ndjson
-head -1 bundle.ndjson | jq '.kind'
-grep -c llm_request_succeeded bundle.ndjson
+head -1 bundle.ndjson | jq '.type'          # "bundle_header"
+grep -c '"type":"llm_entry"' bundle.ndjson
 ```
 
-The bundle contains every LLM request/response pair, every MCP exchange, every tool call/result, the final event log, and metadata about the original run. Secrets are redacted (the OpenRouter key is replaced with `[REDACTED]`).
+A bundle is one JSON object per line, tagged on `type`: a `bundle_header` (`format_version: 2`), one `pipeline_yaml` line with the pipeline text, one `run_inputs` line (rendered `vars`, `env`, and secret names with masked values), then `llm_entry` and `tool_entry` lines, each `{key, seq, outcome}`, and a closing `bundle_trailer` with a BLAKE3 digest. It does not contain the event log; replay regenerates it. Secret values never enter the bundle: entries are recorded with secrets masked as `***`, and literal MCP credentials in the embedded pipeline YAML become `<REDACTED>`.
 
 ## Step 4 — Replay offline
 
@@ -108,13 +107,13 @@ Compare the live and replayed event streams modulo the two known differences:
 orno replay bundle.ndjson > replay-events.ndjson
 
 # Strip run_id and timestamp before diffing.
-jq -c 'del(.run_id, .timestamp)' live-events.ndjson > live-stripped.ndjson
-jq -c 'del(.run_id, .timestamp)' replay-events.ndjson > replay-stripped.ndjson
+jq -c 'del(.timestamp, .event.run_id)' live-events.ndjson > live-stripped.ndjson
+jq -c 'del(.timestamp, .event.run_id)' replay-events.ndjson > replay-stripped.ndjson
 
 diff live-stripped.ndjson replay-stripped.ndjson
 ```
 
-A clean diff (no output) confirms byte-level reproduction of every other field.
+A clean diff (no output) confirms every other field matches.
 
 ## Step 6 — Try a tape miss
 
@@ -125,7 +124,7 @@ What happens if you replay a bundle but change the pipeline? Try editing `pipeli
 orno replay bundle.ndjson
 ```
 
-The first iteration that diverges from the recorded tape will fail with an `LlmFailure::ReplayMiss` (or a tool-tape-miss error). This is intentional: a tape miss is a **hard error**, not a fallback to the live API.
+The first iteration that diverges from the recorded tape fails with an `llm_request_failed` carrying `failure.kind: replay_miss` (or a tool-tape-miss error), the node finishes `ok: false`, and `orno replay` exits `1`. This is intentional: a tape miss is a **hard error**, not a fallback to the live API.
 
 The reason: a soft fallback would silently turn an audit replay into a re-run and erase the determinism guarantee. Better to fail loudly and force the operator to reconcile.
 
@@ -149,8 +148,8 @@ The bundle is checked in alongside the pipeline. A code change that breaks the p
 A bundle is a deterministic record of one specific (provider × model × orno build) combination. It is **not** a portable transcript that can be replayed across tooling boundaries. Concretely:
 
 - **Per-provider.** The tool-tape key is `blake3(tool_name : call_id : args)`, and `call_id` values are emitted by the LLM provider. Anthropic and OpenAI use different ID formats for the same logical call, so an Anthropic-recorded bundle replayed against an OpenAI-configured pipeline will surface cascading `ReplayMiss` errors. Re-record per provider rather than swap.
-- **Per-orno-version.** Bundles carry a `format_version` field in the `bundle_header` line. Each bump of `CURRENT_BUNDLE_VERSION` indicates an incompatible change to the wire format or to the tape-key derivation; an older bundle replayed by a newer reader is rejected up front with `BundleError::IncompatibleVersion` rather than silently misinterpreting the contents. Re-record after upgrading orno across a format boundary.
-- **Pipeline-fingerprint sensitivity.** The LLM tape key hashes the canonical JSON form of the entire request, including the tool list, the system prompt, and any sampling parameters. Any change to the pipeline that alters those fields — adding a tool, editing the system prompt, switching to a different sampling temperature — invalidates every existing tape entry. The replay then surfaces `LlmFailure::ReplayMiss` on the first iteration that diverges.
+- **Per-orno-version.** Bundles carry a `format_version` field in the `bundle_header` line (currently `2`). Each bump of `CURRENT_BUNDLE_VERSION` indicates an incompatible change to the wire format or to the tape-key derivation; a bundle of any other version, including version 1, is rejected up front with `BundleError::IncompatibleVersion` naming both versions rather than silently misinterpreting the contents. Re-record after upgrading orno across a format boundary.
+- **Pipeline-fingerprint sensitivity.** The LLM tape key is `provider:model:` plus a BLAKE3 hash of the canonical JSON form of the request with secrets masked, including the tool list, the system prompt, and any sampling parameters. Any change to the pipeline that alters those fields — adding a tool, editing the system prompt, switching to a different sampling temperature — invalidates every existing tape entry. The replay then surfaces a `replay_miss` failure on the first iteration that diverges.
 
 The format-version gate is intentional: it converts what would otherwise be a silent misinterpretation into a structured error the operator can act on. Treat the bundle as a per-pipeline, per-build artifact, and re-record after any of the boundaries above is crossed.
 
@@ -159,7 +158,7 @@ The format-version gate is intentional: it converts what would otherwise be a si
 - `orno run --record-bundle <file>` captures a run into a bundle.
 - `orno replay <file>` re-executes the pipeline from the bundle with no LLM, no network.
 - Tape misses are hard errors, not soft fallbacks.
-- Replays differ from live runs only on `run_id` and timestamps.
+- Replays differ from live runs only on `run_id` and timestamps. `kind: shell` nodes cannot be replayed.
 - Bundles are useful for postmortems, regression tests, and audit trails.
 - Bundles are per-provider, per-orno-version, and per-pipeline-fingerprint — re-record across any of those boundaries.
 

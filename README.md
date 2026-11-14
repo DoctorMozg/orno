@@ -56,7 +56,7 @@ Run an orno pipeline from a workflow without bringing your own binary:
 - uses: DoctorMozg/orno@v0.2.0
   with:
     pipeline: examples/hello/pipeline.yaml
-    command: run                # run | plan | validate (default: run)
+    command: run                # run | plan | validate | replay (default: run)
     secrets-file: .env.secrets  # optional
     args: --record-bundle run.ndjson  # optional, forwarded to orno
 ```
@@ -76,11 +76,13 @@ cargo build --release -p orno-cli
 
 ### Run an example
 
-`examples/hello/pipeline.yaml` calls a real LLM through OpenRouter. If you don't have an API key handy, point it at the dummy transport. It returns a deterministic canned response and skips the network entirely:
+`examples/hello/pipeline.yaml` calls a real LLM through OpenRouter. If you don't have an API key handy, build with the `test-transport` feature and point it at the dummy transport. It returns a deterministic canned response and skips the network entirely:
 
 ```bash
-ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli -- run examples/hello/pipeline.yaml
+ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport -- run examples/hello/pipeline.yaml
 ```
+
+Release binaries and builds without the feature ignore `ORNO_TEST_LLM_TRANSPORT` and call the real API.
 
 For a real run:
 
@@ -128,7 +130,8 @@ Templates are MiniJinja. They see three namespaces: `vars.*` for declared variab
 ## Commands
 
 - **`orno run <pipeline.yaml>`** — execute a pipeline. NDJSON events to stdout, tracing JSON to stderr.
-  Key flags: `-e KEY=VAL`, `--env-file`, `--secrets-file`, `-v` / `--verbose`, `--stderr-tail-bytes`, `--record-bundle`, `--record-tape`, `--replay-tape`, `--record-tool-tape`, `--replay-tool-tape`.
+  Key flags: `-e KEY=VAL`, `--env-file`, `--secrets-file`, `-v` / `--verbose`, `--stderr-tail-bytes`, `--max-node-output-bytes`, `--record-bundle`, `--record-tape`, `--replay-tape`, `--record-tool-tape`, `--replay-tool-tape`.
+- **`orno replay <bundle.ndjson>`** — re-execute a run recorded with `--record-bundle`. No live LLM calls, no network, no MCP servers; refuses `kind: shell` nodes and version 1 bundles.
 - **`orno validate <pipeline.yaml>`** — load and validate the full policy surface (tool names, agent and MCP references, budget fields).
 - **`orno plan <pipeline.yaml>`** — static preview. No LLM or network. Emits `plan_node` and `plan_summary` NDJSON.
 - **`orno schema`** — print the pipeline JSON Schema to stdout. Used to regenerate `schemas/pipeline.schema.json`.

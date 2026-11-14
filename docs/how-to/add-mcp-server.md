@@ -161,17 +161,17 @@ agents:
       blocked_domains: []
 ```
 
-A model that emits a tool call to a different MCP tool gets `UnknownToolCalled` and the loop terminates. A model that somehow makes an unauthorized HTTP request to a different host (via a separate `WebFetch` call, say) gets `DomainBlocked`.
+A model that emits a tool call to a different MCP tool gets `AgentError::UnknownToolCalled` and the node terminates. A model that somehow makes an unauthorized HTTP request to a different host (via a separate `WebFetch` call, say) is denied: a `tool_denied` event is emitted and the loop continues.
 
 ## Failure modes
 
 | Failure                          | What it looks like in the event stream                                  |
 | -------------------------------- | ----------------------------------------------------------------------- |
-| Server fails to spawn (stdio)    | `mcp_server_failed` envelope with the spawn error.                       |
-| Handshake fails                  | `mcp_server_failed` with the handshake error; pipeline terminates.       |
-| Tool call fails                  | `tool_failed` for the specific call; loop continues.                     |
-| Network error mid-run (http)     | `tool_failed` with the network error; loop continues.                    |
-| Wildcard expansion finds zero    | `mcp_server_started` with `tools_advertised: 0`; agent has no MCP tools. |
+| Server fails to spawn (stdio)    | `mcp_server_starting`, then `mcp_server_crashed` with the spawn error; the run ends with `run_started` / `run_finished { ok: false }`. |
+| Handshake fails                  | `mcp_server_crashed` with the handshake error; no node runs.             |
+| Tool reports `isError: true`     | `mcp_tool_call_completed { ok: false }`; the model sees `error: ...` and the loop continues. |
+| Call times out (`call_timeout_secs`, default 30) or the transport fails | `mcp_tool_call_completed { ok: false }`; the call fails as `McpError::CallFailed`. |
+| Wildcard expansion finds zero    | `mcp_server_handshaked` with `tool_count: 0`; agent has no MCP tools.    |
 
 ## See also
 

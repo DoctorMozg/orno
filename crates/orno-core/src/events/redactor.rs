@@ -51,10 +51,19 @@ pub(crate) enum Keep {
 /// Aho-Corasick automaton with `LeftmostLongest` semantics.
 #[derive(Default)]
 pub struct Redactor {
-    /// Patterns registered with the automaton, kept so `Clone` can rebuild it.
+    /// Patterns registered with the automaton; `Debug` reports their count.
     values: Vec<String>,
     /// `None` when no secrets were registered so the no-op path costs nothing.
     ac: Option<AhoCorasick>,
+}
+
+/// Lowercase hex of `bytes`, without a dependency for one call.
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        write!(out, "{b:02x}").expect("writing to a String cannot fail");
+        out
+    })
 }
 
 impl Redactor {
@@ -79,7 +88,7 @@ impl Redactor {
             patterns.push(STANDARD.encode(bytes));
             patterns.push(STANDARD_NO_PAD.encode(bytes));
             patterns.push(URL_SAFE_NO_PAD.encode(bytes));
-            let hex_lower = hex::encode(bytes);
+            let hex_lower = lower_hex(bytes);
             patterns.push(hex_lower.to_uppercase());
             patterns.push(hex_lower);
 
@@ -247,15 +256,6 @@ impl fmt::Debug for Redactor {
     }
 }
 
-// `AhoCorasick` itself is `Clone` (cheap `Arc` bump), but rebuilding
-// from `values` keeps the public field set tight and avoids relying on
-// implementation details of the upstream crate.
-impl Clone for Redactor {
-    fn clone(&self) -> Self {
-        Self::from_values(self.values.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,18 +346,6 @@ mod tests {
         // must drop them so the resulting redactor is a no-op.
         let r = redactor_with(&[("blank", "")]);
         assert!(r.is_noop());
-    }
-
-    #[test]
-    fn clone_produces_equivalent_redactor() {
-        // `Clone` rebuilds the automaton from the retained pattern list
-        // rather than relying on `AhoCorasick`'s own `Clone`. The cloned
-        // redactor must redact identically — same patterns, same output.
-        let r = redactor_with(&[("k", "abracadabra")]);
-        let clone = r.clone();
-        let input = "say abracadabra now";
-        assert_eq!(r.redact(input), clone.redact(input));
-        assert_eq!(clone.redact(input).into_owned(), "say *** now");
     }
 
     #[test]

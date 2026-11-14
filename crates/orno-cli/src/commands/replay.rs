@@ -1,60 +1,35 @@
-//! `orno replay <bundle.ndjson>` — re-run a recorded pipeline from a
-//! single bundle file. No live LLM, no MCP servers, no env/secrets
-//! resolution: every external interaction was already captured into
-//! the bundle by `orno run --record-bundle`.
+//! `orno replay <bundle.ndjson>`: re-run a recorded pipeline from one
+//! bundle file with no live LLM, MCP servers or env/secrets resolution.
 //!
-//! Replay reuses the same engine, agent loop, and node executors as
-//! `orno run`. The only differences are:
-//! - Transport is `ReplayTransport`, seeded from the bundle's LLM tape.
-//! - Each builtin tool handler is wrapped in `ReplayToolHandler`,
-//!   seeded from the bundle's tool tape.
-//! - MCP servers are not spawned. For every `mcp.*` tool the pipeline
-//!   declares in any agent's `allowed_tools`, a `ReplayMcpStubHandler`
-//!   is registered with the recorded `OrnoChatTool` description and
-//!   schema (lifted from the LLM tape). The stub is wrapped in
-//!   `ReplayToolHandler` so actual dispatch reads from the tool tape
-//!   exactly like a builtin would.
-//! - `RunInputs` comes from the bundle's `run_inputs` line: the rendered
-//!   `vars`, the `env` namespace, and the `secrets` namespace with every
-//!   value masked, so templates render the same prompts as the recorded
-//!   run without a real secret being available.
+//! It reuses `orno run`'s engine, agent loop and node executors; the
+//! differences are:
+//! - the transport is `ReplayTransport`, seeded from the bundle's LLM tape;
+//! - every tool handler is wrapped in `ReplayToolHandler`, seeded from the
+//!   bundle's tool tape;
+//! - each `mcp.*` tool an agent allows gets a stub carrying the recorded
+//!   description and schema, so the replayed request matches the tape key;
+//! - `RunInputs` comes from the bundle, with every secret value masked.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use orno_core::agent::loop_agent::wire_name_from_yaml;
-use orno_core::agent::{Agent, LoopAgent, LoopAgentConfig};
-use orno_core::events::{Event, EventSink, Redactor, StreamingSink};
-use orno_core::execution::{Engine, EngineConfig, RunInputs, new_run_id};
+use orno_core::events::{EventSink, Redactor, StreamingSink};
+use orno_core::execution::{EngineConfig, RunInputs, new_run_id};
 use orno_core::llm::recording::TapeEntry;
 use orno_core::llm::{LlmTransport, OrnoChatTool, ReplayTransport, read_bundle};
-use orno_core::node::NodeRegistry;
-use orno_core::node::agent::AgentExecutor;
 use orno_core::node::shell::DenyShellExecutor;
 use orno_core::pipeline;
-use orno_core::pipeline::template::TemplateEngine;
-use orno_core::tool::{
-    ReplayMcpStubHandler, ReplayToolHandler, SubagentHandler, ToolHandler, builtin_handlers,
-};
+use orno_core::tool::{ReplayMcpStubHandler, ReplayToolHandler, ToolHandler, builtin_handlers};
 
-/// Default body-excerpt cap shared with `orno run`'s non-verbose mode.
-/// Replay does not surface new failure tails (every payload was
-/// recorded), but the agent loop still uses this constant for prompt
-/// and response excerpt truncation so emitted events match the
-/// original recording's truncation policy.
+use super::run::agent::{BuildLoopAgentArgs, build_engine, build_loop_agent};
+
+/// Same excerpt cap as `orno run`'s non-verbose mode, so replayed events
+/// truncate prompts and responses the way the recording did.
 const REPLAY_BODY_EXCERPT_BYTES: usize = 2048;
 
-/// Sentinel inserted into `RunFinished.failed_nodes` on SIGINT.
-/// Same value as `commands::run::INTERRUPTED_FAILED_NODE` — keeps the
-/// stream-level signal identical across `run` and `replay`.
-const INTERRUPTED_FAILED_NODE: &str = "<interrupted>";
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "replay() mirrors run()'s top-level orchestration; splitting it would add indirection without reducing conceptual load"
-)]
 pub async fn run(bundle_path: &Path) -> Result<()> {
     let bundle = read_bundle(bundle_path)
         .with_context(|| format!("reading bundle `{}`", bundle_path.display()))?;
@@ -62,27 +37,74 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     let mut pipeline = pipeline::load::load_from_str(&bundle.pipeline_yaml)
         .with_context(|| "parsing pipeline from bundle")?;
 
-    // Lift MCP tool definitions from the recorded LLM tape before
-    // moving the entries into the transport — the stub registration
-    // block below needs the description and schema each declared
-    // `mcp.*` tool was registered with so the replayed
-    // `LlmRequest.tools` byte-equals the recorded one.
+    // Lifted before the entries move into the transport: the stubs need
+    // each tool's recorded description and schema.
     let mcp_tool_defs = discover_mcp_tool_definitions(&bundle.llm_entries);
 
-    // Expand `mcp.<server>.*` wildcards using the per-server tool lists
-    // recovered from the recorded tape. Without this, an agent that
-    // declared a wildcard at recording time would fail pre-flight on
-    // replay with `UnknownToolCalled` because the post-load `allowed_tools`
-    // would still contain the literal `mcp.<server>.*` string.
+    // Without this, a wildcard recorded in `allowed_tools` stays literal
+    // and fails pre-flight with `UnknownToolCalled`.
     let server_tool_names = derive_server_tools(&mcp_tool_defs, &pipeline);
-    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names)
-        .context("expanding MCP tool wildcards from recorded tape")?;
+    pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names);
+    disable_live_effects(&mut pipeline);
 
-    // Replay must never mutate the host filesystem or hit the network,
-    // regardless of what the bundle's embedded pipeline YAML claims.
-    // Force both policy flags off on every agent config so a malicious
-    // or stale bundle cannot smuggle a live mutation past replay's
-    // bounded-non-determinism guarantee.
+    // A tape miss surfaces as `LlmError::ReplayMiss`; there is no fallback
+    // to the live API.
+    let transport: Arc<dyn LlmTransport> = Arc::new(
+        ReplayTransport::from_entries(bundle.llm_entries)
+            .context("indexing LLM entries from bundle")?,
+    );
+
+    // `secrets.*` is never resolved on replay, so the redactor is a no-op.
+    let redactor = Arc::new(Redactor::default());
+    let tools = replay_tools(&pipeline, &mcp_tool_defs, &bundle.tool_entries, &redactor)?;
+
+    // Typed handle so the broken flag can be read after the engine returns.
+    let streaming_sink = Arc::new(StreamingSink::stdout());
+    let sink: Arc<dyn EventSink> = streaming_sink.clone();
+    let run_id = new_run_id();
+
+    let loop_agent = build_loop_agent(BuildLoopAgentArgs {
+        transport,
+        builtin_tools: tools,
+        pipeline: &pipeline,
+        sink: sink.clone(),
+        redactor,
+        body_excerpt_max_bytes: REPLAY_BODY_EXCERPT_BYTES,
+    });
+    // Shell side effects are not in the bundle, so shell nodes are refused
+    // rather than run live.
+    let engine = build_engine(
+        sink.clone(),
+        loop_agent,
+        Arc::new(DenyShellExecutor),
+        EngineConfig::default(),
+    );
+
+    // Recorded namespaces stand in for the live env and secrets: vars come
+    // back rendered, and secret values are the placeholder the recorded
+    // requests were keyed with.
+    let mut inputs = RunInputs::default();
+    inputs.env = bundle.run_inputs.env;
+    inputs.secrets = bundle.run_inputs.secrets;
+    inputs.rendered_vars = Some(bundle.run_inputs.vars);
+
+    // Nothing to flush or drain on replay, so SIGINT only closes the stream
+    // and `main` maps `Interrupted` to exit 130.
+    let outcome = tokio::select! {
+        biased;
+        () = super::sigint_with_warning() => {
+            super::emit_interrupted(&sink, &run_id).await;
+            return Err(super::Interrupted.into());
+        }
+        res = engine.run(&run_id, &pipeline, inputs) => res?,
+    };
+
+    super::finalize_run(&streaming_sink, &outcome, "replay")
+}
+
+/// A bundle must not mutate the host or reach the network whatever its
+/// embedded YAML claims, so both flags are forced off on every agent.
+fn disable_live_effects(pipeline: &mut pipeline::Pipeline) {
     let had_mutations = pipeline.agents.values().any(|a| a.policy.allow_mutations);
     let had_network = pipeline.agents.values().any(|a| a.policy.allow_network);
     for agent_cfg in pipeline.agents.values_mut() {
@@ -93,60 +115,37 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
         tracing::info!(
             had_mutations,
             had_network,
-            "replay: allow_mutations and allow_network overridden to false (bundle cannot mutate or access network)"
+            "replay: allow_mutations and allow_network overridden to false"
         );
     }
+}
 
-    // Replay transport is seeded directly from the bundle entries; a
-    // tape miss surfaces as `LlmError::ReplayMiss` at call time.
-    // No fallback to the live API — non-determinism is bounded.
-    let transport: Arc<dyn LlmTransport> = Arc::new(
-        ReplayTransport::from_entries(bundle.llm_entries)
-            .context("indexing LLM entries from bundle")?,
-    );
-
-    // No live secrets in replay — `secrets.*` values are not resolved
-    // at replay time, so the redactor is a no-op. Constructing one
-    // anyway keeps `LoopAgent`'s constructor signature unchanged and
-    // costs nothing at runtime (`Redactor::is_noop()` short-circuits).
-    let redactor = Arc::new(Redactor::default());
-    let body_excerpt_max_bytes = REPLAY_BODY_EXCERPT_BYTES;
-
-    // Mirrors `orno run`: keep a typed handle so the CLI can read
-    // the broken flag after `engine.run` returns.
-    let streaming_sink = Arc::new(StreamingSink::stdout());
-    let sink: Arc<dyn EventSink> = streaming_sink.clone();
-    let run_id = new_run_id();
-
-    let tool_entries = bundle.tool_entries;
-
-    // Each builtin handler gets its own `ReplayToolHandler` wrapping
-    // the same tape entries. The replay handler keys on
-    // `(tool_name, call_id, args)` so siblings sharing the entry list
-    // never collide — a `Bash` call and a `Read` call with the same
-    // call_id index different tape rows.
-    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> = Vec::new();
-    for handler in builtin_handlers(&redactor, body_excerpt_max_bytes) {
-        let replay = ReplayToolHandler::from_entries(handler, tool_entries.clone())
+/// Builtin handlers plus one stub per declared `mcp.*` tool, each wrapped
+/// in a `ReplayToolHandler` keyed on `(tool_name, call_id, args)` so
+/// handlers sharing the tape never collide.
+fn replay_tools(
+    pipeline: &pipeline::Pipeline,
+    mcp_tool_defs: &[OrnoChatTool],
+    tool_entries: &[orno_core::tool::ToolTapeEntry],
+    redactor: &Arc<Redactor>,
+) -> Result<Vec<Arc<dyn ToolHandler>>> {
+    let wrap = |handler: Arc<dyn ToolHandler>| -> Result<Arc<dyn ToolHandler>> {
+        let replay = ReplayToolHandler::from_entries(handler, tool_entries.to_vec())
             .context("indexing tool entries from bundle")?;
-        builtin_tools.push(Arc::new(replay));
+        Ok(Arc::new(replay))
+    };
+
+    let mut tools = Vec::new();
+    for handler in builtin_handlers(redactor, REPLAY_BODY_EXCERPT_BYTES) {
+        tools.push(wrap(handler)?);
     }
 
-    // MCP replay: no live `McpClient` is spawned, but the agent loop
-    // still needs a registered handler for every `mcp.*` tool the
-    // pipeline declares — otherwise the pre-flight check fails with
-    // `UnknownToolCalled`. We synthesize one `ReplayMcpStubHandler`
-    // per declared tool, lifting its description and schema from the
-    // recorded LLM tape (already collected above) so the outgoing
-    // `LlmRequest.tools` byte-equals what was recorded (a mismatch
-    // would change the tape key and surface as `LlmError::ReplayMiss`).
-    // Tools that appear in `allowed_tools` but never in any recorded
-    // request get an empty stub: pre-flight passes, and any actual
-    // call would surface a clear miss.
-    let mut mcp_seen: HashSet<String> = HashSet::new();
+    // An `allowed_tools` entry never seen in a recorded request gets an
+    // empty stub: pre-flight passes and a real call reports a tape miss.
+    let mut seen: HashSet<&str> = HashSet::new();
     for cfg in pipeline.agents.values() {
         for tool in &cfg.allowed_tools {
-            if !tool.starts_with("mcp.") || !mcp_seen.insert(tool.clone()) {
+            if !tool.starts_with("mcp.") || !seen.insert(tool) {
                 continue;
             }
             let wire = wire_name_from_yaml(tool);
@@ -157,125 +156,19 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
                     || (String::new(), serde_json::json!({})),
                     |def| (def.description.clone(), def.schema.clone()),
                 );
-            let stub = Arc::new(ReplayMcpStubHandler::new(tool.clone(), description, schema));
-            let replay = ReplayToolHandler::from_entries(stub, tool_entries.clone())
-                .context("indexing tool entries from bundle")?;
-            builtin_tools.push(Arc::new(replay));
+            tools.push(wrap(Arc::new(ReplayMcpStubHandler::new(
+                tool.clone(),
+                description,
+                schema,
+            )))?);
         }
     }
-
-    // Cyclic construction for subagent recursion: each
-    // `SubagentHandler` keeps a `Weak<LoopAgent>` back-pointer.
-    // Same pattern as `orno run` so
-    // recorded subagent dispatches replay through the same code path
-    // they were captured on.
-    let event_sink = sink.clone();
-    let transport_for_loop = transport.clone();
-    let redactor_for_loop = redactor.clone();
-    let loop_agent: Arc<LoopAgent> = Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
-        let mut tools = builtin_tools.clone();
-        for (name, cfg) in &pipeline.agents {
-            tools.push(Arc::new(SubagentHandler::new(
-                format!("subagent.{name}"),
-                name.clone(),
-                cfg.clone(),
-                weak.clone(),
-                event_sink.clone(),
-            )));
-        }
-        LoopAgent::new(LoopAgentConfig {
-            transport: transport_for_loop,
-            sink: event_sink.clone(),
-            redactor: redactor_for_loop,
-            body_excerpt_max_bytes,
-            tools,
-        })
-    });
-
-    let agent: Arc<dyn Agent> = loop_agent;
-    let engine_config = EngineConfig::default();
-    let mut registry = NodeRegistry::new();
-    // Shell nodes are never replayed: their side-effects (filesystem,
-    // network, subprocess spawning) were not captured in the bundle.
-    // DenyShellExecutor returns NodeError::ReplayRefused so the operator
-    // gets a clear failure rather than silently running live subprocesses.
-    registry.register("shell", Arc::new(DenyShellExecutor));
-    registry.register("agent", Arc::new(AgentExecutor::from_agent(agent)));
-    let registry = Arc::new(registry);
-    let templates = Arc::new(TemplateEngine::new());
-    // Clone the sink before transferring ownership into the engine so
-    // the SIGINT branch below can still emit a sentinel `RunFinished`
-    // envelope after the engine future is dropped.
-    let sink_for_signal = sink.clone();
-    let engine = Engine::new(sink, registry, templates, engine_config);
-
-    // The recorded namespaces stand in for the live env and secrets:
-    // vars come back already rendered, and secret values are the
-    // redaction placeholder, which is also what the recorded requests
-    // were keyed with.
-    let mut inputs = RunInputs::default();
-    inputs.env = bundle.run_inputs.env;
-    inputs.secrets = bundle.run_inputs.secrets;
-    inputs.rendered_vars = Some(bundle.run_inputs.vars);
-    //
-    // SIGINT handling mirrors `orno run`: race the engine future
-    // against `ctrl_c`. Replay has no live tapes to flush and no MCP
-    // children to drain, so the SIGINT branch only emits a sentinel
-    // `RunFinished` and bubbles up `Interrupted`. `main` translates
-    // that sentinel into exit code 130 so a wrapping shell can tell
-    // operator cancellation apart from a normal tape-miss failure
-    // (which exits 1 via the `bail!` below).
-    let run_outcome = tokio::select! {
-        biased;
-        () = super::sigint_with_warning() => {
-            sink_for_signal.record(Event::RunFinished {
-                run_id: run_id.clone(),
-                ok: false,
-                failed_nodes: vec![INTERRUPTED_FAILED_NODE.to_string()],
-                skipped_nodes: Vec::new(),
-            })
-            .await;
-            return Err(super::Interrupted.into());
-        }
-        res = engine.run(&run_id, &pipeline, inputs) => res?,
-    };
-
-    if streaming_sink.is_broken() {
-        bail!("event stream write failed (downstream closed?); replay output is incomplete");
-    }
-
-    // A replay that mismatches the tape (LlmError::ReplayMiss,
-    // tool-tape miss, etc.) surfaces as a node failure and lands in
-    // `RunFinished.ok = false`. Mirror `orno run` so a CI step that
-    // gates on `orno replay --bundle …` failing actually exits non-zero.
-    if !run_outcome.ok {
-        let names = if run_outcome.failed_nodes.is_empty() {
-            "<unknown>".to_string()
-        } else {
-            run_outcome.failed_nodes.join(", ")
-        };
-        bail!("replay failed: nodes [{names}] reported ok:false");
-    }
-
-    Ok(())
+    Ok(tools)
 }
 
-/// Walk the tool definitions recorded on the LLM entries and collect
-/// the `OrnoChatTool` definition for each MCP tool the agent loop sent
-/// to the model. Returned in first-occurrence order so callers can
-/// reconstruct the recorded tool order verbatim.
-///
-/// First-seen wins: every recorded iteration of an agent sends the
-/// same `tools` list, so duplicates are expected and harmless.
-///
-/// Order matters here because the tape key hashes the serialized
-/// `LlmRequest`, and `LlmRequest.tools` serializes as a JSON array — element
-/// position is part of the hashed bytes. A `HashMap` return type
-/// previously scrambled tool order across program runs (`HashMap`
-/// key iteration is randomized), causing every replay to miss with
-/// `LlmError::ReplayMiss`. The `Vec` return preserves the order
-/// each tool first appeared in the tape, which is the order the
-/// agent loop sent them on the recorded run.
+/// Collect the definition of each MCP tool the agent loop sent to the
+/// model, in first-seen order. Order matters: the tape key hashes the
+/// serialized `tools` array, so a reordered list makes every call miss.
 fn discover_mcp_tool_definitions(llm_entries: &[TapeEntry]) -> Vec<OrnoChatTool> {
     let mut out: Vec<OrnoChatTool> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -289,23 +182,11 @@ fn discover_mcp_tool_definitions(llm_entries: &[TapeEntry]) -> Vec<OrnoChatTool>
     out
 }
 
-/// Recover the per-server tool list from recorded wire-form tool names
-/// so wildcard expansion (`mcp.<server>.*`) can be replayed without a
-/// live MCP server.
-///
-/// The wire form is `mcp_<server>_<tool>`; the YAML form is
-/// `mcp.<server>.<tool>`. To reverse the mapping we need the server
-/// boundary, which the wire form alone does not encode unambiguously
-/// — both `(server="fs", tool="extra_read")` and `(server="fs_extra",
-/// tool="read")` collapse to `mcp_fs_extra_read`. We resolve by taking
-/// the longest server prefix declared in `pipeline.mcp_servers` that
-/// matches; in v0.1 every demo uses single-token server names so the
-/// ambiguity never bites in practice. Tools whose wire name does not
-/// begin with `mcp_<S>_` for any declared server `S` emit a
-/// `tracing::warn!` and are skipped — they cannot have come from a
-/// server orno knows about, so the operator gets a stderr signal that
-/// a recorded tool was lost on replay (defense-in-depth for bundles
-/// recorded before the validate-side ambiguity check existed).
+/// Recover the per-server tool list from recorded wire names so wildcards
+/// can expand without a live server. `mcp_<server>_<tool>` is ambiguous
+/// when server names contain underscores, so the longest declared server
+/// prefix wins; names matching no declared server are warned about and
+/// skipped.
 fn derive_server_tools(
     mcp_tool_defs: &[OrnoChatTool],
     pipeline: &pipeline::Pipeline,
@@ -339,8 +220,8 @@ fn derive_server_tools(
         } else {
             let declared: Vec<&str> = pipeline.mcp_servers.keys().map(String::as_str).collect();
             tracing::warn!(
-                wire_name = %wire_name,
-                declared_servers = ?declared,
+                tool.wire_name = %wire_name,
+                mcp.declared_servers = ?declared,
                 "MCP wire-form tool name does not match any declared \
                  server prefix; tool will not be replayable",
             );

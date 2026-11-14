@@ -205,6 +205,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_symlink_escape() {
         let root = tempfile::TempDir::new().expect("create root");

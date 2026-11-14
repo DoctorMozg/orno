@@ -137,7 +137,7 @@ nodes:
     command: "false"
 "#;
     let file = write_pipeline(yaml);
-    // After WU-2.4 the CLI exits non-zero whenever the run reports
+    // The CLI exits non-zero whenever the run reports
     // `ok: false`, so a downstream `orno run … && next-step` short-
     // circuits without inspecting NDJSON. The stream-level `ok:false`
     // assertions still hold.
@@ -175,7 +175,7 @@ nodes:
     needs: [fail_node]
 "#;
     let file = write_pipeline(yaml);
-    // WU-2.4: any failed node propagates to a non-zero process exit.
+    // Any failed node propagates to a non-zero process exit.
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
         .assert()
@@ -237,7 +237,7 @@ nodes:
     command: "{{ env.ORNO_TEST_UNSET_VAR }}"
 "#;
     let file = write_pipeline(yaml);
-    // WU-2.4: template render failure surfaces as a non-zero process
+    // Template render failure surfaces as a non-zero process
     // exit (not just a stream-level `ok:false`).
     let assert = orno()
         .args(["run", file.path().to_str().unwrap()])
@@ -785,7 +785,7 @@ nodes:
 #[cfg(unix)]
 #[test]
 fn run_sigint_exits_130_and_emits_run_finished() {
-    // WU-2.5: SIGINT must produce exit 130, a `RunFinished {ok:false,
+    // SIGINT must produce exit 130, a `RunFinished {ok:false,
     // failed_nodes:["<interrupted>"]}` envelope on stdout, and no
     // panic. `sleep 30` keeps the shell child alive long enough to be
     // interrupted; the SIGINT is delivered via the platform `kill`

@@ -34,7 +34,7 @@ There is no provider-neutral web search. Whether the right backend is Tavily, Br
 
 ## What happens if my replay bundle is missing an LLM call?
 
-The replay transport returns `LlmError::ReplayMiss`, which surfaces as a `node_finished` event with `ok: false` and a structured `failure: LlmFailure::ReplayMiss`. The CLI process exits 0 — node failure is a pipeline-level signal, not a process-level one. A tape miss is never silently filled by a live call.
+The replay transport returns `LlmError::ReplayMiss`, which surfaces as an `llm_request_failed` event with `failure.kind: replay_miss`, then a `node_finished` event with `ok: false`. `orno replay` exits `1`, the same as a failed node in `orno run`. A tape miss is never silently filled by a live call.
 
 ## Why are stdout and stderr separate?
 
@@ -54,7 +54,7 @@ Today, the engine schedules nodes serially. Disjoint branches still execute (a f
 
 ## How do I run a pipeline without an API key?
 
-Two options. For deterministic smoke testing, set `ORNO_TEST_LLM_TRANSPORT=dummy` — the dummy transport returns canned responses. For replay-only execution against a previously recorded run, use `orno replay <bundle.ndjson>` — it never calls the live API and never touches the network.
+Two options. For deterministic smoke testing, build with `--features test-transport` and set `ORNO_TEST_LLM_TRANSPORT=dummy` (for example `cargo run -p orno-cli --features test-transport -- run ...`) — the dummy transport returns canned responses. Release binaries ignore the variable. For replay-only execution against a previously recorded run, use `orno replay <bundle.ndjson>` — it never calls the live API and never touches the network.
 
 ## Can I declare an agent inline at the node level?
 

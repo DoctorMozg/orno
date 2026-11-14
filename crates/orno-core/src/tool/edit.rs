@@ -61,7 +61,7 @@ impl ToolHandler for EditHandler {
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
             jail_file(root, &path).await?
         } else {
-            // BS1: fail closed when roots is empty — no boundary, no edit.
+            // Fail closed when roots is empty — no boundary, no edit.
             return Err(ToolError::Denied {
                 reason: "Edit tool requires a non-empty `roots` list; \
                          no jail boundary is configured for this agent"
@@ -98,7 +98,7 @@ impl ToolHandler for EditHandler {
         })
         .await?;
 
-        debug!(file.path = %resolved.display(), call_id = %inv.call_id, "edited file");
+        debug!(file.path = %resolved.display(), tool.call_id = %inv.call_id, "edited file");
         Ok(format!(
             "Edited {} (replaced 1 occurrence)",
             resolved.display(),

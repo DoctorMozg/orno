@@ -107,10 +107,10 @@ fn child_agent_config() -> AgentConfig {
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "WU-3.3 regression test that wires a parent + subagent + recording transport end-to-end; splitting it would obscure the propagation invariant being asserted"
+    reason = "wires a parent, a subagent and a recording transport end-to-end; splitting would obscure the propagation invariant"
 )]
 async fn parent_token_budget_covers_subagent_spend() {
-    // WU-3.3 regression: a subagent loop's per-LLM-response usage must charge
+    // A subagent loop's per-LLM-response usage must charge
     // against the parent loop's `max_total_tokens`. The assertion runs against
     // the recording transport's captured `max_tokens` field on the parent's
     // SECOND request — that's the iteration the parent enters after the
@@ -218,7 +218,7 @@ async fn parent_token_budget_covers_subagent_spend() {
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "WU-3.3 regression test that wires a parent + subagent + recording transport end-to-end and asserts terminal-variant behavior after the subagent overruns; splitting it would obscure the bound being proven"
+    reason = "wires a parent, a subagent and a recording transport end-to-end and asserts the terminal variant after an overrun; splitting would obscure the bound"
 )]
 async fn parent_token_budget_breach_on_subagent_overrun() {
     // Companion: when a subagent's spend pushes the parent's running total past

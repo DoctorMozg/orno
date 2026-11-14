@@ -30,7 +30,7 @@ The cap is per-agent, not per-pipeline. A subagent gets its own `max_iterations`
 
 `allowed_tools` is the closed set the model may call. It is enumerated explicitly: `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `SetState`, plus optional `mcp.<server>.<tool>` and `subagent.<name>` entries. There is no "all tools" wildcard, no "default tools" inheritance, and no implicit additions from any source.
 
-Calling a tool not in `allowed_tools` is **terminal**: `Event::UnknownToolCalled` fires, the agent loop returns `AgentError::UnknownToolCalled`, and the node ends with `ok: false`. There is no retry path. The loop does not recover by feeding the error back to the model — termination is the whole point. A model emitting an unexpected tool name is signaling that its understanding of the task and its understanding of the tool surface have diverged; the right move is to stop.
+Calling a tool not in `allowed_tools` is **terminal**: the agent loop returns `AgentError::UnknownToolCalled`, and the node ends with `ok: false`. There is no retry path. The loop does not recover by feeding the error back to the model — termination is the whole point. A model emitting an unexpected tool name is signaling that its understanding of the task and its understanding of the tool surface have diverged; the right move is to stop.
 
 This is the dimension that makes "what could this pipeline do?" auditable. `orno plan` reads `allowed_tools` directly; the operator approving a pipeline is reading the same closed list the runtime will enforce.
 
@@ -102,9 +102,9 @@ The asymmetry maps cleanly onto a question: *did the model do something it was a
 
 ## DAG scheduling vs agent loops
 
-orno's parallelism is at the **DAG level**, not inside the agent loop. Two `kind: agent` nodes with no `needs:` between them run concurrently. A single agent loop, on the other hand, executes its own tool calls **serially** in the order the model emitted them — even when the model emits multiple tool calls in a single assistant turn.
+orno schedules at the **DAG level**, not inside the agent loop, and today the engine runs nodes one at a time: two `kind: agent` nodes with no `needs:` between them still run serially, and a failure in one branch does not stop the other. A single agent loop, on the other hand, executes its own tool calls **serially** in the order the model emitted them — even when the model emits multiple tool calls in a single assistant turn.
 
-Why? Because parallel tool calls inside a loop introduce ordering ambiguity. If the model emits `Read` and `Bash` together, was `Bash` supposed to see the file `Read` returned? Some calls are side-effect-free (`Read`); some are not (`Bash`); some are subagent dispatches with their own loops. Serial execution in declaration order is the only ordering the model could have meant unambiguously. Operators who want parallelism declare it at the DAG level, where the order is explicit.
+Why? Because parallel tool calls inside a loop introduce ordering ambiguity. If the model emits `Read` and `Bash` together, was `Bash` supposed to see the file `Read` returned? Some calls are side-effect-free (`Read`); some are not (`Bash`); some are subagent dispatches with their own loops. Serial execution in declaration order is the only ordering the model could have meant unambiguously. Ordering between steps is declared at the DAG level, where it is explicit.
 
 This is why an agent's `policy.max_tool_calls` budget is sufficient to bound cost — there is no hidden parallelism to account for.
 

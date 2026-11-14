@@ -62,19 +62,8 @@ pub enum PipelineError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NodeError {
-    #[error("node `{id}` kind `{kind}` is not registered")]
-    UnknownKind { id: String, kind: String },
-
     #[error("node `{id}` is not implemented yet (skeleton stub)")]
     NotImplemented { id: String },
-
-    /// Raised when a `kind: agent` node carries a configuration that
-    /// Phase 4 cannot honor yet — e.g. a non-empty `allowed_tools`
-    /// (tools land in Phase 5) or `max_iterations > 1` (the loop body
-    /// also lands in Phase 5). Fails fast rather than silently
-    /// ignoring the declared policy.
-    #[error("node `{id}` uses feature `{feature}` not yet supported")]
-    UnsupportedYet { id: String, feature: String },
 
     #[error("node `{id}` failed")]
     Execution {
@@ -103,13 +92,6 @@ pub enum AgentError {
     /// configuration error rather than a mid-run transport failure.
     #[error("invalid agent policy: {0}")]
     InvalidPolicy(String),
-
-    /// A policy feature is declared but not yet honored in this phase
-    /// (e.g. non-empty `allowed_tools` before Phase 5 wires tool
-    /// handlers). Fails fast so strict pipelines never silently lose
-    /// policy.
-    #[error("agent uses feature `{0}` not yet supported")]
-    UnsupportedYet(String),
 
     /// Agent exhausted `max_iterations` without reaching a `stop`
     /// finish reason.
@@ -245,17 +227,8 @@ pub enum McpError {
         message: String,
     },
 
-    #[error("MCP server `{server}` crashed mid-run")]
-    ServerCrashed { server: String },
-
     #[error("MCP transport `{transport}` is not supported in this build")]
     UnsupportedTransport { transport: String },
-
-    #[error("MCP server `{server}` shutdown timed out after {secs}s")]
-    ShutdownTimeout { server: String, secs: u64 },
-
-    #[error("MCP server `{server}` does not advertise tool `{tool}`")]
-    UnknownTool { server: String, tool: String },
 }
 
 /// Why a tool run failed in a way the model can act on. Matched on by
@@ -320,10 +293,9 @@ pub enum ToolError {
 
     /// A `SetState` call would push the serialized size of
     /// `nodes.<self>.state` past `EngineConfig.max_output_bytes`. The
-    /// write is rejected and the previous state is left intact. ADR
-    /// 0025 §5 — shared cap with stderr tails, API body excerpts, and
-    /// prompt/response excerpts so one knob governs every
-    /// wire-emitted value.
+    /// write is rejected and the previous state is left intact. The cap
+    /// is shared with stderr tails and API body excerpts so one knob
+    /// governs every wire-emitted value.
     #[error("tool `{name}` write rejected: state size {bytes} exceeds cap {cap}")]
     StateTooLarge {
         name: String,
@@ -331,8 +303,7 @@ pub enum ToolError {
         cap: usize,
     },
 
-    /// This handler is not yet wired (stub). Indicates a Phase 5+
-    /// feature that the caller declared but has not been implemented.
+    /// The caller declared a feature this handler does not implement yet.
     #[error("tool `{name}` not implemented yet: {feature}")]
     NotImplemented { name: String, feature: String },
 

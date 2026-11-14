@@ -271,7 +271,7 @@ impl<W: Write> HashAccumWriter<W> {
     /// the trailer without going through the hasher.
     fn finalize(mut self) -> std::io::Result<(W, String)> {
         self.inner.flush()?;
-        let digest = hex::encode(self.hasher.finalize().as_bytes());
+        let digest = self.hasher.finalize().to_hex().to_string();
         Ok((self.inner, digest))
     }
 }
@@ -632,7 +632,7 @@ impl ParsedBundle {
             BundleEntry::LlmEntry(e) => self.llm_entries.push(e),
             BundleEntry::ToolEntry(e) => self.tool_entries.push(e),
             BundleEntry::BundleTrailer { blake3 } => {
-                let actual = hex::encode(self.hasher.finalize().as_bytes());
+                let actual = self.hasher.finalize().to_hex().to_string();
                 if actual != blake3 {
                     return Err(BundleError::IntegrityMismatch {
                         expected: blake3,
@@ -928,7 +928,7 @@ mod tests {
             hasher.update(b"\n");
         }
         let trailer = serde_json::to_string(&BundleEntry::BundleTrailer {
-            blake3: hex::encode(hasher.finalize().as_bytes()),
+            blake3: hasher.finalize().to_hex().to_string(),
         })
         .unwrap();
         lines.push(trailer);

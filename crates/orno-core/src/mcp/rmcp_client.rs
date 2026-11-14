@@ -277,7 +277,7 @@ impl McpClient for RmcpClient {
             .await
             {
                 Ok(Err(e)) => {
-                    tracing::warn!(server = %self.server, error = ?e, "mcp shutdown task panicked");
+                    tracing::warn!(mcp.server = %self.server, error = %e, "mcp shutdown task panicked");
                 },
                 Err(_) => {
                     // On timeout, the cancel() future is dropped, which
@@ -290,7 +290,7 @@ impl McpClient for RmcpClient {
                     // is loud in operator logs even though the process
                     // table will reflect the kill on a sub-second delay.
                     tracing::error!(
-                        server = %self.server,
+                        mcp.server = %self.server,
                         timeout_secs = MCP_HANDSHAKE_TIMEOUT_SECS,
                         "MCP shutdown timed out; relying on rmcp's drop-time kill — \
                          child process may briefly outlive this call",

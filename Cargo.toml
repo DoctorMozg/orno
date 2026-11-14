@@ -114,10 +114,7 @@ aho-corasick = { version = "1", default-features = false, features = ["std", "pe
 # an LLM cannot bypass redaction by encoding a secret before exfiltrating
 # it. `base64 0.22` is already pulled transitively by `genai`, `reqwest`,
 # and `hyper-util`, so adding a direct dep does not multiply versions.
-# `hex 0.4` is a fresh direct dep — small, std-only, no transitive
-# competitors in the lock file.
 base64 = { version = "0.22", default-features = false, features = ["std"] }
-hex    = { version = "0.4", default-features = false, features = ["std"] }
 
 # LRU eviction cache for `TemplateEngine`. Caps the number of compiled
 # MiniJinja templates so a long-lived engine cannot grow without bound.
@@ -125,10 +122,12 @@ hex    = { version = "0.4", default-features = false, features = ["std"] }
 # omits the optional `serde` support that orno does not need.
 lru = { version = "0.18", default-features = false }
 
-# Tape I/O for `RecordingTransport` / `ReplayTransport` tests. Used from
-# integration tests and from round-trip unit tests — pulled at workspace
-# level so both crates share the same version.
+# Atomic writes in the file tools and bundle temp paths in the CLI; also
+# used by tests in both crates.
 tempfile = "3"
+
+# `#[async_trait]` on every trait seam; dyn-compatible async needs it.
+async-trait = "0.1"
 
 # Process-group SIGKILL for `ChildGuard`; `unsafe_code = "forbid"` rules out
 # raw libc. Already in the tree via tempfile.

@@ -76,14 +76,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn req(prompt: &str) -> LlmRequest {
-        LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            prompt.into(),
-            None,
-            None,
-            None,
-        )
+        LlmRequest::from_prompt("openai", "gpt-5", prompt)
     }
 
     fn response(content: &str) -> LlmResponse {

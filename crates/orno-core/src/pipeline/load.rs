@@ -95,40 +95,12 @@ fn validate_env_lists(pipeline: &Pipeline, errors: &mut Vec<String>) {
 }
 
 /// Expand `mcp.<server>.*` wildcards in every agent's `allowed_tools`
-/// against the tool list each server actually advertised at handshake.
-///
-/// `validate` accepts the wildcard form structurally but does not expand
-/// it — the real tool list is only known after each MCP server has
-/// initialized. The orchestrator (`commands/run.rs`) calls this once the
-/// `tools/list` results are in hand; `commands/replay.rs` calls it with
-/// the per-server tool names lifted from the recorded LLM tape so a
-/// replayed run sees the same expanded allowlist the recording did.
-///
-/// Mutates `pipeline.agents` in place. After this returns, no
-/// `allowed_tools` entry contains a wildcard, so the agent loop's
-/// pre-flight `find_handler` check sees only exact names.
-///
-/// `server_tools` maps each MCP server name to its advertised tool list
-/// (raw tool names from `tools/list`, not the wire form). Servers
-/// declared in `pipeline.mcp_servers` but absent from `server_tools` —
-/// e.g. a recording with no MCP traffic — are treated as having an
-/// empty tool list; their wildcards expand to nothing rather than an
-/// error so a replay of a never-called server stays a no-op.
-///
-/// Dedupe semantics: when an agent declares both `mcp.<server>.*` and
-/// an explicit `mcp.<server>.<tool>`, the wildcard expansion does not
-/// re-emit `<tool>`. The first occurrence (in declaration order) wins;
-/// later duplicates are silently skipped.
-///
-/// Order semantics: every entry — explicit name, wildcard expansion,
-/// builtin, subagent — keeps its position in declaration order. Wildcard
-/// expansion lands at the wildcard's position. This makes the
-/// post-expansion list readable top-down for users who later inspect
-/// the run-time state via tracing.
-pub fn expand_mcp_wildcards(
-    pipeline: &mut Pipeline,
-    server_tools: &BTreeMap<String, Vec<String>>,
-) -> Result<(), PipelineError> {
+/// against the tools each server advertised at handshake (or, on replay,
+/// the tool names recovered from the tape). Servers missing from
+/// `server_tools` expand to nothing. Entries keep declaration order and the
+/// first occurrence of a duplicate wins, so an explicit `mcp.<server>.<tool>`
+/// is not re-emitted by a wildcard.
+pub fn expand_mcp_wildcards(pipeline: &mut Pipeline, server_tools: &BTreeMap<String, Vec<String>>) {
     for agent_config in pipeline.agents.values_mut() {
         let mut expanded: Vec<String> = Vec::with_capacity(agent_config.allowed_tools.len());
         let mut seen: HashSet<String> = HashSet::new();
@@ -157,7 +129,6 @@ pub fn expand_mcp_wildcards(
 
         agent_config.allowed_tools = expanded;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -689,7 +660,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &["read_file", "list_directory"])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["a"].allowed_tools,
@@ -720,7 +691,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &["read_file", "list_directory"])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["a"].allowed_tools,
@@ -746,7 +717,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &[])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["a"].allowed_tools,
@@ -771,7 +742,7 @@ mod tests {
         );
 
         let tools: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert!(
             p.agents["a"].allowed_tools.is_empty(),
@@ -791,7 +762,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &["list_directory"])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["a"].allowed_tools,
@@ -823,7 +794,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &["read_file"])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["parent"].allowed_tools,
@@ -859,7 +830,7 @@ mod tests {
         );
 
         let tools = server_tools(&[("fs", &["read_file", "write_file"])]);
-        expand_mcp_wildcards(&mut p, &tools).expect("expansion succeeds");
+        expand_mcp_wildcards(&mut p, &tools);
 
         assert_eq!(
             p.agents["child"].allowed_tools,

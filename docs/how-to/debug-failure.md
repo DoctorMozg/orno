@@ -23,7 +23,8 @@ echo $?
 ```
 
 - `0` — pipeline succeeded.
-- non-zero — pipeline failed (load, validation, or any node).
+- `1` — pipeline failed to load or validate, or any node failed.
+- `130` — interrupted by SIGINT.
 
 The exit code is the first signal. Now find which node owns the failure.
 
@@ -41,14 +42,13 @@ Output (typical):
 {
   "event": {
     "type": "node_finished",
+    "run_id": "run_...",
     "node_id": "review",
+    "node_kind": "agent",
     "ok": false,
-    "duration_ms": 12500,
     "failure": {
-      "kind": "BudgetExceeded",
-      "budget_kind": "Tokens",
-      "limit": 30000,
-      "consumed": 30214
+      "kind": "budget_exceeded",
+      "budget_kind": "tokens"
     }
   }
 }
@@ -64,6 +64,7 @@ jq -c 'select(.event.type == "run_finished")' events.ndjson
 {
   "event": {
     "type": "run_finished",
+    "run_id": "run_...",
     "ok": false,
     "failed_nodes": ["review"],
     "skipped_nodes": ["publish_results"]
@@ -79,16 +80,16 @@ jq -c 'select(.event.type == "node_skipped")' events.ndjson
 
 ## Step 4 — Identify the failure variant
 
-The `failure.kind` is a typed discriminator. The full set:
+The `failure.kind` is a snake_case discriminator. The full set:
 
-- **`NoExecutorRegistered`** — an unrecognized `kind:` in the pipeline. Check the node's `kind:` field; it should be `agent` or `shell`.
-- **`TemplateRenderFailed`** — a MiniJinja template referenced something that doesn't exist. Check the template literal: `{{ vars.* }}`, `{{ env.* }}`, `{{ nodes.<id>.* }}`.
-- **`ExecutorError`** — the executor returned an error before producing output. Read the inner `message` field.
-- **`NodePayloadFailure`** — shell node exited non-zero, or agent node terminated with a strict-mode breach. Read `exit_code` and `stderr_tail` for shell; agent failures cascade through `AgentError`.
-- **`IterationLimitExceeded`** — agent loop hit `max_iterations`. Tighten the prompt or raise the limit.
-- **`BudgetExceeded`** — agent loop hit `max_total_tokens` or `max_tool_calls`. `budget_kind` discriminates; see [tighten-budget](tighten-budget.md).
-- **`ToolDenied`** — an effect-class denial. Most denials are non-terminal; this variant fires only when the loop terminates around a denial. Read the `tool` and `reason` fields.
-- **`TimedOut`** — wall-clock deadline reached. Check the `timeout:` field on the node; raise it or speed up the work.
+- **`no_executor_registered`** — no executor for the node's kind (`node_kind` field). Only reachable when orno is embedded with a custom registry.
+- **`template_render_failed`** — a MiniJinja template referenced something that doesn't exist. Read the `error` field and check `{{ vars.* }}`, `{{ env.* }}`, `{{ nodes.<id>.* }}`.
+- **`executor_error`** — the executor returned an error before producing output (spawn failure, agent-loop error, LLM transport error). Read the `error` field.
+- **`node_payload_failure`** — a shell node exited non-zero or was killed. Read `exit_code` (null when killed by a signal), `signal`, and `stderr_tail`.
+- **`iteration_limit_exceeded`** — agent loop hit `max_iterations`. Tighten the prompt or raise the limit.
+- **`budget_exceeded`** — agent loop hit `max_total_tokens` or `max_tool_calls`. `budget_kind` is `tokens` or `tool_calls`; see [tighten-budget](tighten-budget.md).
+- **`tool_denied`** — reserved; effect-class denials are fed back to the model and surface as `tool_denied` events, not as a node failure.
+- **`timed_out`** — wall-clock deadline reached (`limit_secs`). Check the `timeout:` field on the node.
 
 For LLM-specific failures, the run also emits `Event::LlmRequestFailed` paired with the failed `LlmRequestStarted`:
 
@@ -100,72 +101,76 @@ jq -c 'select(.event.type == "llm_request_failed")' events.ndjson
 {
   "event": {
     "type": "llm_request_failed",
+    "run_id": "run_...",
+    "node_id": "review",
+    "provider": "openrouter",
+    "model": "openai/gpt-5",
     "failure": {
-      "kind": "AuthFailed",
-      "provider": "openrouter"
+      "kind": "auth_failed"
     }
   }
 }
 ```
 
-`LlmFailure` variants: `AuthFailed`, `RateLimited`, `ModelNotFound`, `ApiError { status, body_excerpt }`, `Transport`, `ConfigError`, `ParseError`, `ReplayMiss`, `Other`.
+`LlmFailure` kinds: `auth_failed`, `rate_limited`, `model_not_found`, `api_error` (`status`, `body_excerpt`), `transport`, `config_error`, `parse_error`, `replay_miss`, `other`. A missing API key is a `config_error` whose message names the env var to set.
 
 ## Step 5 — Trace the agent's reasoning
 
-For agent nodes, the most informative envelope is `agent_iteration_finished`. It records the model's content and tool calls per turn:
+For agent nodes, read the per-turn envelopes. `agent_iteration_started` marks each turn, `llm_response_received` carries `finish_reason`, `usage` and a `content_excerpt`:
 
 ```bash
-jq -c 'select(.event.type == "agent_iteration_finished")' events.ndjson
+jq -c 'select(.event.type == "agent_iteration_started" or .event.type == "llm_response_received")' events.ndjson
 ```
 
-You'll see one envelope per loop iteration with `iteration`, `cumulative_tokens`, `cumulative_tool_calls`, `tool_calls_emitted`, and `content_excerpt`. The content excerpt is truncated for readability — the full content is in the recorded bundle if you ran with `--record-bundle`.
+Excerpts are redacted and truncated; the full content is in the recorded bundle if you ran with `--record-bundle`.
 
 For tool-call detail:
 
 ```bash
-jq -c 'select(.event.type == "tool_invoked")' events.ndjson
+jq -c 'select(.event.type == "tool_call_recorded")' events.ndjson
 ```
 
-Each call shows the arguments (with secrets redacted) and the result. A failed tool call shows up as `tool_failed` instead.
+Each call shows `input_excerpt` and `output_excerpt` (with secrets redacted). A recoverable tool failure appears there as an `output_excerpt` starting `error:`; a policy denial starts `denied:` and has a matching `tool_denied` event.
 
 ## Step 6 — If the run was recorded, replay it
 
 If you ran with `--record-bundle bundle.ndjson`, you can re-execute the pipeline against the recorded tapes:
 
 ```bash
-orno replay bundle.ndjson 2>&1 | tee replay-events.ndjson
+orno replay bundle.ndjson | tee replay-events.ndjson
 ```
 
-Replay is **byte-for-byte deterministic** modulo `run_id` and timestamps. This means:
+Replay reproduces the recorded LLM and tool results, so the event stream matches modulo `run_id` and timestamps (`kind: shell` nodes are refused during replay). This means:
 
 - The failure is reproducible without spending tokens.
 - You can iterate on inspection (different `jq` filters, manual envelope reads) as many times as you like.
 - A bug in your pipeline that depends on LLM non-determinism is invisible during replay — but a bug in tool dispatch, template rendering, or node ordering is reproducible.
 
-The bundle also contains the full LLM and tool tapes, which preserve the exact bytes the model emitted. You can read them directly:
+The bundle (format version 2) also contains the LLM and tool tapes as `llm_entry` and `tool_entry` lines, each `{key, seq, outcome}`, which preserve what the model and tools returned. You can read them directly:
 
 ```bash
-jq 'select(.kind == "llm_response")' bundle.ndjson
-jq 'select(.kind == "tool_response")' bundle.ndjson
+jq 'select(.type == "llm_entry")' bundle.ndjson
+jq 'select(.type == "tool_entry")' bundle.ndjson
 ```
 
 ## Step 7 — Use `orno validate` to catch load-time bugs
 
-If the failure is at pipeline load (exit code non-zero, no `run_started` envelope), the YAML didn't pass validation. Run `orno validate` directly:
+If the failure is at pipeline load (exit code non-zero, empty stdout), the YAML didn't pass validation. Run `orno validate` directly:
 
 ```bash
 orno validate pipeline.yaml
 ```
 
-You'll get a typed error pointing at the offending field. Common causes:
+You'll get every problem at once, each naming the offending node, agent or key. Common causes:
 
-- **`UnknownTool`** — typo in `allowed_tools` (e.g., `Reed` instead of `Read`).
-- **`DuplicateNode`** — two nodes with the same `id:`.
-- **`DependencyCycle`** — cycle in `needs:` declarations.
-- **`UnknownAgent`** — node references an `agent:` that isn't defined in `agents:`.
-- **`ChildExceedsParentPolicy`** — a subagent has more permissive effects than its parent.
-- **`MissingSecret`** — pipeline references a secret name that's not declared in `secrets:`.
-- **`UnknownEnvVar`** — pipeline references `env.NAME` but `pass_env:` doesn't include `NAME`.
+- **Unknown key** — a typo like `need:` or `blocked_domain:`; unknown keys are rejected.
+- **Not a known builtin, subagent reference, or mcp tool** — typo in `allowed_tools` (e.g., `Reed` instead of `Read`).
+- **Cycle or undefined `needs:`** — `InvalidGraph`.
+- **Undeclared agent** — node references an `agent:` that isn't defined in `agents:`.
+- **Cannot delegate** — a subagent is more permissive than its parent.
+- **Listed in both `pass_env` and `secrets`** — keep it in `secrets:` only.
+- **`nodes.<id>` is not an upstream dependency** — add the node to `needs:`.
+- **Lists `Bash` but declares `allowed_domains`/`roots`** — drop `Bash` or set `unconfined_shell: true`.
 
 ## Step 8 — Dig into the trace log
 
@@ -198,7 +203,7 @@ Usually one of:
 `IterationLimitExceeded` after exhausting `max_iterations`. The model isn't reaching a final-content turn. Common causes:
 
 - The system prompt asks for an impossible thing (e.g., "search this URL" when WebFetch isn't allowed).
-- The model keeps re-calling the same tool with no progress (see `tool_invoked` for repeating calls with identical arguments).
+- The model keeps re-calling the same tool with no progress (see `tool_call_recorded` for repeating calls with identical arguments).
 - The tool surface is too narrow — the model lacks the tool it needs and keeps trying.
 
 Fix the prompt or the surface; raising the iteration limit is rarely the right move.

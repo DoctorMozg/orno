@@ -7,8 +7,12 @@
 | Exit code | Condition                                                                                                                                                                          |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `0`       | Pipeline loaded and executed; the final `run_finished` event reports `ok: true`.                                                                                                   |
-| `1`       | One or more nodes reported `ok: false`; or the pipeline failed to load (`PipelineError`); or the engine returned `Err`. `run_finished` is always emitted with `ok: false` and the `failed_nodes` / `skipped_nodes` aggregates. |
-| `130`     | Run interrupted by SIGINT (Ctrl-C). The event stream is closed immediately; no `run_finished` envelope is emitted.                                                                 |
+| `1`       | One or more nodes reported `ok: false`; the pipeline failed to load or validate (`PipelineError`); env or secrets resolution failed; or the engine returned `Err`. |
+| `130`     | Run interrupted by SIGINT (Ctrl-C). A `run_finished` envelope with `ok: false` and `failed_nodes: ["<interrupted>"]` is emitted, record tapes are flushed best-effort, and MCP servers are drained (bounded at 5 seconds) before the process exits. |
+
+When a run has started, `run_finished` is emitted for every outcome above, including MCP handshake failures and `vars:` render failures. Failures that happen before the run starts (the file cannot be read, the YAML does not parse or validate, secrets do not resolve, a `--record-tape` or `--record-tool-tape` target already exists) emit no events: stdout stays empty and the error goes to stderr.
+
+`--record-tape` and `--record-tool-tape` create the file with `create_new`: an existing path is an error, not overwritten. (The `--help` text says "creates or truncates"; that wording is out of date.)
 
 ## `orno replay`
 

@@ -264,19 +264,11 @@ async fn rmcp_client_empty_command_returns_spawn_error() {
     );
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// HTTP transport — wire-level tests
-//
-// The full streamable-HTTP MCP handshake involves session negotiation, JSON
-// or SSE responses, and `Mcp-Session-Id` headers. That is far more than
-// `wiremock` can fake without re-implementing the protocol. These tests
-// instead pin the wire-level contract: the right URL is hit, the right
-// headers go out, and config-time errors surface as `HandshakeFailed`.
-// Wiremock returns 500 on every request so the handshake fails immediately
-// after the first POST, which is enough to verify request shape via
-// `.expect(1..)`. End-to-end protocol coverage lives in `mcp_real.rs`
-// against actual MCP servers.
-// ──────────────────────────────────────────────────────────────────────────────
+// `wiremock` cannot fake the full streamable-HTTP handshake, so these tests
+// pin the wire-level contract instead: the right URL and headers go out and
+// config errors surface as `HandshakeFailed`. Wiremock returns 500, which
+// fails the handshake right after the first POST. End-to-end coverage lives
+// in `mcp_real.rs`.
 
 mod http_transport {
     use orno_core::mcp::{McpClient, RmcpClient};

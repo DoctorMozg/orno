@@ -1,132 +1,59 @@
-//! Template-rendering context. Threads node outputs, pipeline
-//! `vars:`, plus resolved `env.*` and `secrets.*` maps into the
-//! `MiniJinja` render call. Designed for per-branch shadowing in
-//! parallel execution; v0.1 uses one flat context and grows it as
-//! each node succeeds.
+//! Template-rendering context: pipeline `vars:`, resolved `env.*` and
+//! `secrets.*` maps and completed node outputs, kept as the JSON value
+//! `MiniJinja` renders against.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-/// One template context. `vars`, `env`, and `secrets` are populated
-/// at construction and never mutated. `nodes` grows as upstream
-/// nodes succeed (via `record_node_output`).
+/// One template context. `vars`, `env` and `secrets` are fixed at
+/// construction; `nodes` grows through `record_node_output`.
+///
+/// The render value is held as an `Arc` so each node's render shares it
+/// instead of deep-cloning every prior output; `record_node_output` only
+/// copies when a still-live render scope holds the previous snapshot.
 #[derive(Debug, Clone)]
 pub struct Context {
-    vars: BTreeMap<String, Value>,
-    env: BTreeMap<String, String>,
-    secrets: BTreeMap<String, String>,
-    nodes: BTreeMap<String, Value>,
-}
-
-/// A key-level conflict surfaced by `Context::merge`. Does not
-/// block the merge — the right-hand context wins; the conflict is
-/// advisory (logged as a warning by the scheduler when parallel
-/// execution lands).
-#[derive(Debug, Clone)]
-pub struct ContextConflict {
-    /// Dotted path like `nodes.fetch.exit_code` or `vars.foo`.
-    pub path: String,
-    pub left: Value,
-    pub right: Value,
+    snapshot: Arc<Value>,
 }
 
 impl Context {
-    /// Seed from the pipeline's `vars:` map plus `env` and `secrets`
-    /// maps already resolved by the caller from CLI flags, `.env`
-    /// files, and `pass_env:`. The process environment is
-    /// not auto-inherited; only the entries the caller places in
-    /// `env` and `secrets` are visible to templates.
+    /// Seed from the pipeline's `vars:` plus the `env` and `secrets` maps
+    /// the caller already resolved. The process environment is not
+    /// inherited; templates see only what the caller passes in.
     #[must_use]
     pub fn new(
         vars: BTreeMap<String, Value>,
         env: BTreeMap<String, String>,
         secrets: BTreeMap<String, String>,
     ) -> Self {
+        let strings = |m: BTreeMap<String, String>| -> Value {
+            Value::Object(m.into_iter().map(|(k, v)| (k, Value::String(v))).collect())
+        };
         Self {
-            vars,
-            env,
-            secrets,
-            nodes: BTreeMap::new(),
+            snapshot: Arc::new(json!({
+                "vars": Value::Object(vars.into_iter().collect()),
+                "nodes": {},
+                "env": strings(env),
+                "secrets": strings(secrets),
+            })),
         }
     }
 
-    /// Bare context with no vars, env, or secrets — for tests and
-    /// embedders that construct context programmatically. Prefer
-    /// `Context::new` when caller-supplied maps are available.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            vars: BTreeMap::new(),
-            env: BTreeMap::new(),
-            secrets: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-        }
-    }
-
-    /// Store a completed upstream node's output under `nodes.<id>`.
-    /// For shell nodes the output is `{ stdout, stderr, exit_code }`;
-    /// for agent nodes it is `{ output, state?, finish_reason, usage }`
-    /// where `output` is the final assistant message and `state` is
-    /// present only when the agent made at least one `SetState` call
-    /// (`SetState` writes node-scoped state). The scheduler is
-    /// authoritative for calling this only on success (failed nodes
-    /// are `Skipped`, not recorded).
+    /// Store a completed node's output under `nodes.<id>`. The engine
+    /// records failed shell nodes too, so recovery branches can read
+    /// their `stderr` and `exit_code`.
     pub fn record_node_output(&mut self, node_id: &str, output: Value) {
-        self.nodes.insert(node_id.to_string(), output);
+        Arc::make_mut(&mut self.snapshot)["nodes"][node_id] = output;
     }
 
-    /// Serialize the context in the exact shape `MiniJinja` expects:
-    /// `{ "vars": {...}, "nodes": {...}, "env": {...}, "secrets": {...} }`.
-    /// The secrets map renders here just like any other namespace; the
-    /// redactor applied to emitted events is what keeps values from
-    /// leaking into the log stream.
-    /// Call site: `TemplateEngine::render(name, source, &ctx.snapshot_for_template())`.
+    /// The `{ vars, nodes, env, secrets }` value templates render
+    /// against. Secrets render like any namespace; the event redactor is
+    /// what keeps them out of the log stream.
     #[must_use]
-    pub fn snapshot_for_template(&self) -> Value {
-        json!({
-            "vars": self.vars,
-            "nodes": self.nodes,
-            "env": self.env,
-            "secrets": self.secrets,
-        })
-    }
-
-    /// Merge `other` into `self`, last-writer-wins. Returns every
-    /// overlapping key as a `ContextConflict` so callers can log the
-    /// shadowed value. Unused in v0.1 sequential execution; the API
-    /// exists so parallel branches can merge their child contexts
-    /// back into the parent DAG context without adding a new method
-    /// later.
-    pub fn merge(&mut self, other: Context) -> Vec<ContextConflict> {
-        let mut conflicts = Vec::new();
-        // Merge vars.
-        for (k, v) in other.vars {
-            if let Some(prev) = self.vars.insert(k.clone(), v.clone())
-                && prev != v
-            {
-                conflicts.push(ContextConflict {
-                    path: format!("vars.{k}"),
-                    left: prev,
-                    right: v,
-                });
-            }
-        }
-        // Merge nodes.
-        for (k, v) in other.nodes {
-            if let Some(prev) = self.nodes.insert(k.clone(), v.clone())
-                && prev != v
-            {
-                conflicts.push(ContextConflict {
-                    path: format!("nodes.{k}"),
-                    left: prev,
-                    right: v,
-                });
-            }
-        }
-        // Env and secrets are not merged — each branch keeps its
-        // construction-time snapshot.
-        conflicts
+    pub fn snapshot_for_template(&self) -> Arc<Value> {
+        Arc::clone(&self.snapshot)
     }
 }
 
@@ -221,91 +148,5 @@ mod tests {
         assert!(obj.contains_key("nodes"));
         assert!(obj.contains_key("env"));
         assert!(obj.contains_key("secrets"));
-    }
-
-    #[test]
-    fn merge_with_conflict_reports_every_overlap() {
-        let mut left_vars = BTreeMap::new();
-        left_vars.insert("k1".to_string(), json!(1));
-        let mut left = Context::new(left_vars, BTreeMap::new(), BTreeMap::new());
-        left.record_node_output("n1", json!({"a": 1}));
-
-        let mut right_vars = BTreeMap::new();
-        right_vars.insert("k1".to_string(), json!(2));
-        right_vars.insert("k2".to_string(), json!(3));
-        let mut right = Context::new(right_vars, BTreeMap::new(), BTreeMap::new());
-        right.record_node_output("n1", json!({"a": 2}));
-        right.record_node_output("n2", json!({"b": 5}));
-
-        let conflicts = left.merge(right);
-        assert_eq!(conflicts.len(), 2, "expected exactly two conflicts");
-
-        let vars_conflict = conflicts
-            .iter()
-            .find(|c| c.path == "vars.k1")
-            .expect("vars.k1 conflict missing");
-        assert_eq!(vars_conflict.left, json!(1));
-        assert_eq!(vars_conflict.right, json!(2));
-
-        let nodes_conflict = conflicts
-            .iter()
-            .find(|c| c.path == "nodes.n1")
-            .expect("nodes.n1 conflict missing");
-        assert_eq!(nodes_conflict.left, json!({"a": 1}));
-        assert_eq!(nodes_conflict.right, json!({"a": 2}));
-
-        let snapshot = left.snapshot_for_template();
-        assert_eq!(snapshot["vars"]["k1"], json!(2));
-        assert_eq!(snapshot["vars"]["k2"], json!(3));
-        assert_eq!(snapshot["nodes"]["n1"]["a"], json!(2));
-        assert_eq!(snapshot["nodes"]["n2"]["b"], json!(5));
-    }
-
-    #[test]
-    fn merge_without_conflict_returns_empty() {
-        let mut left_vars = BTreeMap::new();
-        left_vars.insert("k1".to_string(), json!(1));
-        let mut left = Context::new(left_vars, BTreeMap::new(), BTreeMap::new());
-
-        let mut right_vars = BTreeMap::new();
-        right_vars.insert("k2".to_string(), json!(2));
-        let right = Context::new(right_vars, BTreeMap::new(), BTreeMap::new());
-
-        let conflicts = left.merge(right);
-        assert!(conflicts.is_empty(), "disjoint merge must not conflict");
-
-        let snapshot = left.snapshot_for_template();
-        assert_eq!(snapshot["vars"]["k1"], json!(1));
-        assert_eq!(snapshot["vars"]["k2"], json!(2));
-    }
-
-    #[test]
-    fn merge_does_not_merge_env_or_secrets() {
-        // env and secrets are per-branch construction-time
-        // snapshots; `merge` only flows vars and nodes. Construct with
-        // arguments that would produce a clear conflict if merge ever
-        // touched them, then assert the left side is untouched.
-        let mut left_env = BTreeMap::new();
-        left_env.insert("X".to_string(), "left".to_string());
-        let mut left_secrets = BTreeMap::new();
-        left_secrets.insert("S".to_string(), "left_s".to_string());
-        let mut left = Context::new(BTreeMap::new(), left_env, left_secrets);
-
-        let mut right_env = BTreeMap::new();
-        right_env.insert("X".to_string(), "right".to_string());
-        right_env.insert("Y".to_string(), "right_only".to_string());
-        let mut right_secrets = BTreeMap::new();
-        right_secrets.insert("S".to_string(), "right_s".to_string());
-        let right = Context::new(BTreeMap::new(), right_env, right_secrets);
-
-        drop(left.merge(right));
-
-        let snapshot = left.snapshot_for_template();
-        assert_eq!(snapshot["env"]["X"], json!("left"));
-        assert!(
-            snapshot["env"].get("Y").is_none(),
-            "right-only env key must not leak into left",
-        );
-        assert_eq!(snapshot["secrets"]["S"], json!("left_s"));
     }
 }

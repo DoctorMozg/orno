@@ -2,9 +2,8 @@
 //!
 //! `NodeRequest` and `NodeResponse` are the serde-tagged contracts that
 //! every node kind flows through. Built-in executors implement the same
-//! trait; the subprocess plugin transport (deferred past v0.1 per ADR
-//! 0017) will reuse the same wire format without reintroducing a
-//! sibling kind.
+//! trait; a future subprocess plugin transport would reuse the same wire
+//! format rather than add a sibling kind.
 
 pub mod agent;
 pub mod registry;
@@ -129,7 +128,7 @@ pub fn render_request(
     ctx: &Context,
     agents: &BTreeMap<String, AgentConfig>,
 ) -> Result<NodeRequest, PipelineError> {
-    let ctx_json = Arc::new(ctx.snapshot_for_template());
+    let ctx_json = ctx.snapshot_for_template();
     match kind {
         NodeKind::Agent(n) => {
             let cfg = agents

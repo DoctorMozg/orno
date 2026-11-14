@@ -77,7 +77,7 @@ async fn emits_request_and_response_events_in_order() {
 
 #[tokio::test]
 async fn transport_error_emits_llm_request_failed_before_propagating() {
-    // The Phase 3 invariant: a transport failure leaves a typed
+    // A transport failure leaves a typed
     // `LlmRequestFailed` on the wire next to the dangling `LlmRequestStarted`.
     // Without this event, a downstream consumer can only see the opaque error
     // chain and cannot tell `auth_failed` from a stray parse error.
