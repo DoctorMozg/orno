@@ -224,17 +224,17 @@ nodes:
 }
 
 #[test]
-fn run_template_syntax_error_fails_node_and_run() {
-    // A malformed template expression must not panic or silently render
-    // — `dispatch_node` surfaces `PipelineError::Template` as a node
-    // failure. Verifies the render-error branch of the engine's
-    // dispatch logic end-to-end.
+fn run_template_render_error_fails_node_and_run() {
+    // A template that compiles but cannot render (unset env var) must not
+    // panic or silently render — `dispatch_node` surfaces
+    // `PipelineError::Template` as a node failure. Syntax errors never get
+    // this far: load-time validation rejects them.
     let yaml = r#"
 version: 1
 nodes:
   - id: bad_template
     kind: shell
-    command: "{{ invalid syntax ]}"
+    command: "{{ env.ORNO_TEST_UNSET_VAR }}"
 "#;
     let file = write_pipeline(yaml);
     // WU-2.4: template render failure surfaces as a non-zero process
@@ -960,4 +960,62 @@ fn flush_failure_after_successful_run_fails_the_command() {
         .stderr(contains("writing bundle"));
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains(r#""type":"run_finished""#), "{stdout}");
+}
+
+const UNDECLARED_AGENT_PIPELINE: &str = r#"
+version: 1
+nodes:
+  - id: side_effect
+    kind: shell
+    command: echo
+    args: ["ran"]
+  - id: ask
+    kind: agent
+    agent: ghost
+    needs: [side_effect]
+    initial_prompt: "hi"
+"#;
+
+#[test]
+fn run_rejects_undeclared_agent_before_any_node_starts() {
+    let file = write_pipeline(UNDECLARED_AGENT_PIPELINE);
+    let assert = orno()
+        .args(["run", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("undeclared agent `ghost`"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains("node_started"),
+        "no node may start when validation fails: {stdout}"
+    );
+}
+
+#[test]
+fn plan_rejects_undeclared_agent() {
+    let file = write_pipeline(UNDECLARED_AGENT_PIPELINE);
+    orno()
+        .args(["plan", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("undeclared agent `ghost`"));
+}
+
+#[test]
+fn run_rejects_template_syntax_error_before_any_node_starts() {
+    let yaml = r#"
+version: 1
+nodes:
+  - id: bad_template
+    kind: shell
+    command: "{{ invalid syntax ]}"
+"#;
+    let file = write_pipeline(yaml);
+    let assert = orno()
+        .args(["run", file.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(contains("bad_template"));
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains("node_started"), "{stdout}");
 }

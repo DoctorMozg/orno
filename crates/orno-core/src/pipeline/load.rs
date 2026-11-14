@@ -1,13 +1,13 @@
 //! YAML → validated `Pipeline`.
 
 use std::collections::{BTreeMap, HashSet};
-use std::net::IpAddr;
 use std::path::Path;
 
 use crate::error::PipelineError;
-use crate::tool::net_guard::{is_blocked_ip, literal_ip};
 
-use super::schema::{McpServerConfig, Pipeline};
+use super::checks;
+use super::graph::DepGraph;
+use super::schema::Pipeline;
 
 /// Highest `Pipeline.version` this build understands. Bumped whenever
 /// the pipeline schema changes in a backwards-incompatible way so an
@@ -39,292 +39,59 @@ pub fn load_from_str(yaml: &str) -> Result<Pipeline, PipelineError> {
 }
 
 /// Validate semantic constraints that serde alone cannot enforce.
-#[expect(
-    clippy::too_many_lines,
-    reason = "validation covers all schema constraints; acceptable until v0.1.0 node types stabilize"
-)]
+///
+/// A structural problem (version, empty pipeline, duplicate id, unknown
+/// `needs:`, cycle) returns at once, since later checks need a sound
+/// graph. Everything else is collected, so one run reports every problem.
+///
+/// Errors: `PipelineError::InvalidGraph` for graph problems,
+/// `PipelineError::Validation` for the rest.
 pub fn validate(pipeline: &Pipeline) -> Result<(), PipelineError> {
-    // Reject schema versions this build does not understand. A version
-    // ahead of CURRENT_PIPELINE_VERSION can carry shapes the executor
-    // does not know how to dispatch; behind, the executor may apply
-    // semantics the author did not opt into. Either way, refuse fast
-    // with an actionable message rather than misinterpreting silently.
+    // A version ahead of this build can carry shapes the executor cannot
+    // dispatch; one behind may apply semantics the author did not opt into.
     if pipeline.version != CURRENT_PIPELINE_VERSION {
         return Err(PipelineError::Validation(format!(
             "pipeline version {} is not supported by this build (expected {CURRENT_PIPELINE_VERSION})",
             pipeline.version,
         )));
     }
-
     if pipeline.nodes.is_empty() {
         return Err(PipelineError::Validation("pipeline has no nodes".into()));
     }
+    let graph = DepGraph::build(&pipeline.nodes)?;
 
-    // A name in both lists would put the same value in the unredacted
-    // `env.*` namespace as well as `secrets.*`.
-    if let Some(name) = pipeline
-        .pass_env
-        .iter()
-        .find(|n| pipeline.secrets.contains(n))
-    {
-        return Err(PipelineError::Validation(format!(
-            "`{name}` is listed in both `pass_env` and `secrets`; keep it in `secrets` only \
-             so it stays redacted",
-        )));
-    }
+    let mut errors = Vec::new();
+    validate_env_lists(pipeline, &mut errors);
+    checks::validate_mcp_servers(pipeline, &mut errors);
+    checks::validate_nodes(pipeline, &mut errors);
+    checks::validate_agents(pipeline, &mut errors);
+    checks::validate_templates(pipeline, &graph, &mut errors);
 
-    // Reject MCP server declarations that would fail (or be unsafe) at run
-    // start. Stdio: an empty argv would surface as an opaque "no such
-    // file" at spawn. HTTP: only http/https are allowed; bare `http://` is
-    // restricted to loopback so an operator does not accidentally ship
-    // credentials in clear, and any URL whose host is a literal IP in a
-    // blocked range (link-local, RFC 1918, cloud metadata, etc.) is
-    // refused outright. Catching all of these at validate-time turns
-    // runtime spawn / connect failures into actionable YAML authoring
-    // errors.
-    for (name, server) in &pipeline.mcp_servers {
-        let call_timeout_secs = match server {
-            McpServerConfig::Stdio(stdio) => stdio.call_timeout_secs,
-            McpServerConfig::Http(http) => http.call_timeout_secs,
-        };
-        if call_timeout_secs == Some(0) {
-            return Err(PipelineError::Validation(format!(
-                "mcp_servers.`{name}`: `call_timeout_secs` must be greater than zero",
-            )));
-        }
-        match server {
-            McpServerConfig::Stdio(stdio) if stdio.command.is_empty() => {
-                return Err(PipelineError::Validation(format!(
-                    "mcp_servers.`{name}`: stdio transport requires a non-empty `command:` argv",
-                )));
-            },
-            McpServerConfig::Http(http) => {
-                let parsed = reqwest::Url::parse(&http.url).map_err(|e| {
-                    PipelineError::Validation(format!(
-                        "mcp_servers.`{name}`: invalid url `{}`: {e}",
-                        http.url
-                    ))
-                })?;
-                let scheme = parsed.scheme();
-                if scheme != "https" && scheme != "http" {
-                    return Err(PipelineError::Validation(format!(
-                        "mcp_servers.`{name}`: url scheme `{scheme}` not permitted; \
-                         use https or http://localhost",
-                    )));
-                }
-                let host = parsed.host_str().unwrap_or("");
-                let host_ip = literal_ip(&parsed);
-                // `http://` is only safe over loopback. Everything else
-                // (real IPs, public hostnames) must use https so
-                // credentials in `Authorization` headers are not sent in
-                // clear.
-                if scheme == "http" {
-                    let is_loopback = match host_ip {
-                        Some(IpAddr::V4(v4)) => v4.is_loopback(),
-                        Some(IpAddr::V6(v6)) => v6.is_loopback(),
-                        None => host == "localhost" || host == "localhost.",
-                    };
-                    if !is_loopback {
-                        return Err(PipelineError::Validation(format!(
-                            "mcp_servers.`{name}`: `http://` is only allowed for loopback hosts; \
-                             use `https://` for remote servers",
-                        )));
-                    }
-                }
-                // Block link-local, RFC 1918, CGNAT, documentation, and
-                // cloud metadata IPs even on https — these ranges should
-                // never be the target of an MCP server URL. The `http`
-                // path above already restricts to loopback explicitly, so
-                // skip this gate when scheme is `http` to avoid
-                // double-rejecting `http://127.0.0.1` (loopback is in
-                // `is_blocked_ipv4`'s set, but it's the one literal we
-                // just permitted).
-                if scheme == "https"
-                    && let Some(ip) = host_ip
-                    && is_blocked_ip(ip)
-                {
-                    return Err(PipelineError::Validation(format!(
-                        "mcp_servers.`{name}`: url host `{ip}` is in a blocked range \
-                         (loopback / private / link-local / CGNAT / documentation / metadata)",
-                    )));
-                }
-            },
-            McpServerConfig::Stdio(_) => {},
-        }
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(PipelineError::Validation(errors.remove(0))),
+        n => Err(PipelineError::Validation(format!(
+            "{n} errors:\n  - {}",
+            errors.join("\n  - ")
+        ))),
     }
+}
 
-    let mut ids = HashSet::new();
-    for node in &pipeline.nodes {
-        if !ids.insert(node.id.as_str()) {
-            return Err(PipelineError::Validation(format!(
-                "duplicate node id `{}`",
-                node.id
-            )));
-        }
-    }
-
-    for node in &pipeline.nodes {
-        for dep in &node.needs {
-            if !ids.contains(dep.as_str()) {
-                return Err(PipelineError::Validation(format!(
-                    "node `{}` depends on unknown `{}`",
-                    node.id, dep
-                )));
-            }
-        }
-    }
-
-    // Cycle detection via Kahn's algorithm. `DagWalker::new` performs
-    // the same check at execution time, but `orno validate` stops at
-    // this function — without the inline pass, a cyclic pipeline would
-    // pass validation and fail only at runtime. Keeping the load layer
-    // decoupled from execution means inlining the algorithm here rather
-    // than calling into `DagWalker`.
-    let n = pipeline.nodes.len();
-    let id_to_idx: std::collections::HashMap<&str, usize> = pipeline
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, node)| (node.id.as_str(), i))
-        .collect();
-    let mut in_degree = vec![0usize; n];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (idx, node) in pipeline.nodes.iter().enumerate() {
-        for dep in &node.needs {
-            // Safe indexing: the preceding loop already rejected any
-            // `needs:` target that is not a declared id.
-            let dep_idx = id_to_idx[dep.as_str()];
-            in_degree[idx] += 1;
-            dependents[dep_idx].push(idx);
-        }
-    }
-    let mut queue: std::collections::VecDeque<usize> =
-        (0..n).filter(|&i| in_degree[i] == 0).collect();
-    let mut visited = 0usize;
-    while let Some(idx) = queue.pop_front() {
-        visited += 1;
-        for &dep in &dependents[idx] {
-            in_degree[dep] -= 1;
-            if in_degree[dep] == 0 {
-                queue.push_back(dep);
-            }
-        }
-    }
-    if visited < n {
-        let cycle_node = pipeline
-            .nodes
+// A name in both lists would put the same value in the unredacted `env.*`
+// namespace as well as `secrets.*`.
+fn validate_env_lists(pipeline: &Pipeline, errors: &mut Vec<String>) {
+    errors.extend(
+        pipeline
+            .pass_env
             .iter()
-            .enumerate()
-            .find(|(i, _)| in_degree[*i] > 0)
-            .map_or("unknown", |(_, node)| node.id.as_str());
-        return Err(PipelineError::Validation(format!(
-            "cycle detected involving `{cycle_node}`"
-        )));
-    }
-
-    // Validate per-agent tool allowlists.
-    // – `mcp.<server>.*` and `mcp.<server>.<tool>` must name a server declared
-    //   in `Pipeline.mcp_servers`. The wildcard form (`*`) is validated here
-    //   but expanded later by the orchestrator (`expand_mcp_wildcards`) once
-    //   the server has handshaked and advertised its real tool list.
-    // – `subagent.<child>` must name an agent declared in `Pipeline.agents`;
-    //   compose-down requires the child's effect policy to be no more
-    //   permissive than the parent's (compose-down rule).
-    for (agent_name, agent_config) in &pipeline.agents {
-        let policy = &agent_config.policy;
-        let confinement = match (policy.allowed_domains.is_empty(), policy.roots.is_empty()) {
-            (false, false) => Some("`allowed_domains` and `roots`"),
-            (false, true) => Some("`allowed_domains`"),
-            (true, false) => Some("`roots`"),
-            (true, true) => None,
-        };
-        if let Some(confinement) = confinement
-            && !policy.unconfined_shell
-            && agent_config.allowed_tools.iter().any(|t| t == "Bash")
-        {
-            return Err(PipelineError::Validation(format!(
-                "agent `{agent_name}` lists `Bash` but declares {confinement}; a shell can reach \
-                 any host and path, so the confinement would not hold. Drop `Bash` or set \
-                 `unconfined_shell: true` to accept that",
-            )));
-        }
-        for tool in &agent_config.allowed_tools {
-            if let Some(rest) = tool.strip_prefix("mcp.") {
-                let server = rest.split('.').next().unwrap_or("");
-                if !pipeline.mcp_servers.contains_key(server) {
-                    return Err(PipelineError::Validation(format!(
-                        "agent `{agent_name}` references MCP tool `{tool}` \
-                         with unknown server `{server}`"
-                    )));
-                }
-            } else if let Some(child_name) = tool.strip_prefix("subagent.") {
-                let child = pipeline.agents.get(child_name).ok_or_else(|| {
-                    PipelineError::Validation(format!(
-                        "agent `{agent_name}` references unknown subagent \
-                             `{child_name}`"
-                    ))
-                })?;
-
-                if !agent_config.policy.allow_mutations && child.policy.allow_mutations {
-                    return Err(PipelineError::Validation(format!(
-                        "agent `{agent_name}` (allow_mutations=false) cannot \
-                         delegate to `{child_name}` (allow_mutations=true)"
-                    )));
-                }
-                if !agent_config.policy.allow_network && child.policy.allow_network {
-                    return Err(PipelineError::Validation(format!(
-                        "agent `{agent_name}` (allow_network=false) cannot \
-                         delegate to `{child_name}` (allow_network=true)"
-                    )));
-                }
-                if !agent_config.policy.allow_context_writes && child.policy.allow_context_writes {
-                    return Err(PipelineError::Validation(format!(
-                        "agent `{agent_name}` (allow_context_writes=false) cannot \
-                         delegate to `{child_name}` (allow_context_writes=true)"
-                    )));
-                }
-                // Filesystem-jail compose-down: when the parent has any
-                // `roots:` declared, every child root must lie under at
-                // least one parent root. An empty parent `roots:` is the
-                // pre-existing "unjailed parent" shape — it does not
-                // constrain children, so leave them alone.
-                if !agent_config.policy.roots.is_empty() {
-                    for child_root in &child.policy.roots {
-                        let allowed = agent_config
-                            .policy
-                            .roots
-                            .iter()
-                            .any(|parent_root| child_root.starts_with(parent_root));
-                        if !allowed {
-                            return Err(PipelineError::Validation(format!(
-                                "agent `{agent_name}` cannot delegate to `{child_name}`: \
-                                 subagent root `{}` is not a subdirectory of any parent root",
-                                child_root.display(),
-                            )));
-                        }
-                    }
-                }
-                // Recursion-depth compose-down: a child's own
-                // `max_subagent_depth` budget must leave room for the
-                // current dispatch — the parent spends one unit of
-                // recursion to enter the child, so the child's cap can be
-                // at most parent - 1. `saturating_add` keeps the
-                // comparison safe at `u32::MAX`.
-                if child.policy.max_subagent_depth.saturating_add(1)
-                    > agent_config.policy.max_subagent_depth
-                {
-                    return Err(PipelineError::Validation(format!(
-                        "agent `{agent_name}` (max_subagent_depth={}) cannot \
-                         delegate to `{child_name}` (max_subagent_depth={}); \
-                         child must be at most parent - 1",
-                        agent_config.policy.max_subagent_depth, child.policy.max_subagent_depth,
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
+            .filter(|n| pipeline.secrets.contains(n))
+            .map(|name| {
+                format!(
+                    "`{name}` is listed in both `pass_env` and `secrets`; keep it in `secrets` \
+                     only so it stays redacted"
+                )
+            }),
+    );
 }
 
 /// Expand `mcp.<server>.*` wildcards in every agent's `allowed_tools`
@@ -456,8 +223,8 @@ mod tests {
     #[test]
     fn duplicate_ids_are_rejected() {
         let p = pipeline(vec![shell_node("a", &[]), shell_node("a", &[])]);
-        let Err(PipelineError::Validation(msg)) = validate(&p) else {
-            panic!("expected Validation error on duplicate ids");
+        let Err(PipelineError::InvalidGraph { reason: msg }) = validate(&p) else {
+            panic!("expected InvalidGraph error on duplicate ids");
         };
         assert!(
             msg.contains("duplicate") && msg.contains('a'),
@@ -468,8 +235,8 @@ mod tests {
     #[test]
     fn unknown_needs_is_rejected() {
         let p = pipeline(vec![shell_node("b", &["nowhere"])]);
-        let Err(PipelineError::Validation(msg)) = validate(&p) else {
-            panic!("expected Validation error on unknown dep");
+        let Err(PipelineError::InvalidGraph { reason: msg }) = validate(&p) else {
+            panic!("expected InvalidGraph error on unknown dep");
         };
         assert!(
             msg.contains("nowhere"),
@@ -883,8 +650,8 @@ mod tests {
         // check cannot catch this because both ids resolve; only the
         // Kahn pass notices the residual in-degree.
         let p = pipeline(vec![shell_node("a", &["b"]), shell_node("b", &["a"])]);
-        let Err(PipelineError::Validation(msg)) = validate(&p) else {
-            panic!("expected Validation error on cyclic pipeline");
+        let Err(PipelineError::InvalidGraph { reason: msg }) = validate(&p) else {
+            panic!("expected InvalidGraph error on cyclic pipeline");
         };
         assert!(
             msg.contains("cycle"),
@@ -1109,5 +876,243 @@ mod tests {
                 "mcp.fs.write_file".to_string(),
             ],
         );
+    }
+
+    fn agent_node(id: &str, needs: &[&str], agent: &str, prompt: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind: NodeKind::Agent(crate::pipeline::schema::AgentNode {
+                agent: agent.to_string(),
+                initial_prompt: prompt.to_string(),
+            }),
+            needs: needs.iter().map(|s| (*s).to_string()).collect(),
+            timeout: None,
+        }
+    }
+
+    fn shell_with_command(id: &str, needs: &[&str], command: &str) -> Node {
+        let mut node = shell_node(id, needs);
+        if let NodeKind::Shell(shell) = &mut node.kind {
+            shell.command = command.to_string();
+        }
+        node
+    }
+
+    fn validation_message(p: &Pipeline) -> String {
+        match validate(p) {
+            Err(PipelineError::Validation(msg)) => msg,
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_referencing_undeclared_agent_is_rejected() {
+        let p = pipeline(vec![agent_node("n", &[], "ghost", "hi")]);
+        let msg = validation_message(&p);
+        assert!(msg.contains("node `n`") && msg.contains("ghost"), "{msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::webfetch_needs_network(&["WebFetch"], (false, false, false), "allow_network is false")]
+    #[case::edit_needs_mutations(&["Edit"], (false, false, false), "allow_mutations is false")]
+    #[case::bash_needs_mutations(&["Bash"], (false, true, false), "allow_mutations is false")]
+    #[case::bash_needs_network(&["Bash"], (true, false, false), "allow_network is false")]
+    #[case::setstate_needs_context_writes(&["SetState"], (false, false, false), "allow_context_writes is false")]
+    #[case::unknown_tool(&["Teleport"], (true, true, true), "not a known builtin")]
+    #[case::malformed_mcp_tool(&["mcp.srv"], (true, true, true), "not a valid mcp tool reference")]
+    fn tool_gates_and_names_are_checked_at_load(
+        #[case] tools: &[&str],
+        #[case] (mutations, network, context_writes): (bool, bool, bool),
+        #[case] expected: &str,
+    ) {
+        let mut policy = base_policy(mutations, network);
+        policy.allow_context_writes = context_writes;
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config_with_policy(tools.iter().map(|t| (*t).to_string()).collect(), policy),
+        );
+        let msg = validation_message(&p);
+        assert!(msg.contains(expected), "expected `{expected}` in: {msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::iterations(0, 1000, 5, "max_iterations must be > 0")]
+    #[case::tokens(1, 0, 5, "max_total_tokens must be > 0")]
+    #[case::tool_calls(1, 1000, 0, "max_tool_calls is 0")]
+    fn zero_budgets_are_rejected(
+        #[case] iterations: u32,
+        #[case] tokens: u64,
+        #[case] tool_calls: u32,
+        #[case] expected: &str,
+    ) {
+        let mut policy = base_policy(true, true);
+        policy.max_iterations = iterations;
+        policy.max_total_tokens = tokens;
+        policy.max_tool_calls = tool_calls;
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config_with_policy(vec!["Read".to_string()], policy),
+        );
+        let msg = validation_message(&p);
+        assert!(msg.contains(expected), "{msg}");
+    }
+
+    #[test]
+    fn every_problem_is_reported_in_one_run() {
+        let mut p = pipeline(vec![agent_node("n", &[], "ghost", "hi")]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config(vec!["WebFetch".to_string()], false, false),
+        );
+        let msg = validation_message(&p);
+        assert!(
+            msg.starts_with("2 errors:") && msg.contains("ghost") && msg.contains("WebFetch"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn mcp_server_names_with_underscore_prefix_overlap_are_rejected() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers.insert("foo".to_string(), stdio_mcp_server());
+        p.mcp_servers
+            .insert("foo_bar".to_string(), stdio_mcp_server());
+        let msg = validation_message(&p);
+        assert!(
+            msg.contains("foo") && msg.contains("foo_bar") && msg.contains("Rename"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn dormant_domain_list_warns_without_failing() {
+        let mut policy = base_policy(false, false);
+        policy.allowed_domains = vec!["x.com".to_string()];
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config_with_policy(Vec::new(), policy),
+        );
+        assert!(validate(&p).is_ok());
+        let warnings = checks::warnings(&p);
+        assert!(
+            warnings.iter().any(|w| w.contains("allow_network=false")),
+            "{warnings:?}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::syntax_error("{{ invalid syntax ]}", "invalid template")]
+    #[case::unclosed_block("{% if x %}no end", "invalid template")]
+    fn template_syntax_errors_fail_at_load(#[case] command: &str, #[case] expected: &str) {
+        let p = pipeline(vec![shell_with_command("n", &[], command)]);
+        let msg = validation_message(&p);
+        assert!(
+            msg.contains(expected) && msg.contains("node `n` command"),
+            "{msg}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::non_ancestor(&[("a", &[][..]), ("b", &[][..])], "{{ nodes.a.stdout }}", "not an upstream dependency")]
+    #[case::undeclared(&[("a", &[][..])], "{{ nodes.ghost.stdout }}", "names no declared node")]
+    #[case::undeclared_with_chain(&[("a", &[][..]), ("b", &["a"][..])], "{{ nodes.c.stdout }}", "names no declared node")]
+    fn node_references_must_be_ancestors(
+        #[case] upstream: &[(&str, &[&str])],
+        #[case] template: &str,
+        #[case] expected: &str,
+    ) {
+        let mut nodes: Vec<Node> = upstream
+            .iter()
+            .map(|(id, needs)| shell_node(id, needs))
+            .collect();
+        nodes.push(shell_with_command("last", &[], template));
+        let msg = validation_message(&pipeline(nodes));
+        assert!(msg.contains(expected) && msg.contains("last"), "{msg}");
+    }
+
+    #[test]
+    fn transitive_ancestor_reference_is_accepted() {
+        let p = pipeline(vec![
+            shell_node("a", &[]),
+            shell_node("b", &["a"]),
+            shell_with_command(
+                "c",
+                &["b"],
+                "echo {{ nodes.a.stdout }} {{ nodes.b.exit_code }}",
+            ),
+        ]);
+        validate(&p).expect("a is a transitive ancestor of c");
+    }
+
+    #[test]
+    fn agent_prompt_and_system_references_are_checked() {
+        let mut p = pipeline(vec![
+            shell_node("a", &[]),
+            agent_node("n", &[], "writer", "{{ nodes.a.stdout }}"),
+        ]);
+        let mut config = agent_config(Vec::new(), false, false);
+        config.system = Some("{{ nodes.a.stdout }}".to_string());
+        p.agents.insert("writer".to_string(), config);
+        let msg = validation_message(&p);
+        assert!(
+            msg.contains("initial_prompt") && msg.contains("agent `writer` system"),
+            "{msg}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::hyphen("a-b")]
+    #[case::leading_digit("1a")]
+    #[case::dot("a.b")]
+    #[case::space("a b")]
+    #[case::empty("")]
+    fn invalid_node_ids_are_rejected(#[case] id: &str) {
+        let msg = validation_message(&pipeline(vec![shell_node(id, &[])]));
+        assert!(msg.contains("[A-Za-z_][A-Za-z0-9_]*"), "{msg}");
+    }
+
+    #[test]
+    fn zero_node_timeout_is_rejected() {
+        let mut node = shell_node("slow", &[]);
+        node.timeout = Some(0);
+        let msg = validation_message(&pipeline(vec![node]));
+        assert!(msg.contains("slow") && msg.contains("timeout"), "{msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::empty("")]
+    #[case::blank("   ")]
+    fn empty_shell_command_is_rejected(#[case] command: &str) {
+        let msg = validation_message(&pipeline(vec![shell_with_command("n", &[], command)]));
+        assert!(
+            msg.contains("node `n`") && msg.contains("`command` is empty"),
+            "{msg}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::escape("/work/../etc")]
+    #[case::relative("../outside")]
+    fn parent_dir_in_roots_is_rejected(#[case] root: &str) {
+        let mut policy = base_policy(false, false);
+        policy.roots = vec![std::path::PathBuf::from(root)];
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "a".to_string(),
+            agent_config_with_policy(Vec::new(), policy),
+        );
+        let msg = validation_message(&p);
+        assert!(msg.contains(root) && msg.contains("`..`"), "{msg}");
+    }
+
+    #[test]
+    fn templated_mcp_url_is_deferred_to_render_time() {
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.mcp_servers
+            .insert("web".to_string(), http_mcp_server("{{ env.MCP_URL }}/mcp"));
+        validate(&p).expect("a templated url cannot be checked before it is rendered");
     }
 }

@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ToolError;
+use crate::events::Redactor;
 use net_guard::DomainRules;
 
 pub use bash::BashHandler;
@@ -59,6 +60,67 @@ pub enum ToolEffect {
     /// external side effects (fs/process) still require that flag.
     /// Confined to the current node.
     ContextSelf,
+}
+
+impl ToolEffect {
+    /// True when the effect needs `AgentPolicy.allow_mutations`.
+    #[must_use]
+    pub fn requires_mutations(self) -> bool {
+        matches!(self, Self::Mutations | Self::MutationsAndNetwork)
+    }
+
+    /// True when the effect needs `AgentPolicy.allow_network`.
+    #[must_use]
+    pub fn requires_network(self) -> bool {
+        matches!(self, Self::Network | Self::MutationsAndNetwork)
+    }
+
+    /// True when the effect needs `AgentPolicy.allow_context_writes`.
+    #[must_use]
+    pub fn requires_context_writes(self) -> bool {
+        self == Self::ContextSelf
+    }
+}
+
+/// Every builtin tool name with its declared effect. Pipeline validation
+/// reads this table; [`builtin_handlers`] must stay in step with it, which
+/// a unit test enforces.
+pub const BUILTIN_TOOLS: &[(&str, ToolEffect)] = &[
+    ("Bash", ToolEffect::MutationsAndNetwork),
+    ("Read", ToolEffect::ReadOnly),
+    ("Write", ToolEffect::Mutations),
+    ("Edit", ToolEffect::Mutations),
+    ("WebFetch", ToolEffect::Network),
+    ("SetState", ToolEffect::ContextSelf),
+];
+
+/// Declared effect of the builtin named `name`, or `None` when it is not a builtin.
+#[must_use]
+pub fn builtin_effect(name: &str) -> Option<ToolEffect> {
+    BUILTIN_TOOLS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, effect)| *effect)
+}
+
+/// One handler per [`BUILTIN_TOOLS`] entry. `SetState` shares the run-level
+/// redactor so `secrets.*` leaves are scrubbed before state reaches the wire.
+#[must_use]
+pub fn builtin_handlers(
+    redactor: &Arc<Redactor>,
+    body_excerpt_max_bytes: usize,
+) -> Vec<Arc<dyn ToolHandler>> {
+    vec![
+        Arc::new(BashHandler),
+        Arc::new(ReadHandler),
+        Arc::new(WriteHandler),
+        Arc::new(EditHandler),
+        Arc::new(WebFetchHandler::default()),
+        Arc::new(SetStateHandler::new(
+            Arc::clone(redactor),
+            body_excerpt_max_bytes,
+        )),
+    ]
 }
 
 /// Per-call context threaded from `LoopAgent` into `ToolHandler::invoke`.
@@ -216,4 +278,20 @@ pub trait ToolHandler: Send + Sync {
     ///
     /// Must not check policy — callers are already cleared to call this.
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError>;
+}
+
+#[cfg(test)]
+mod builtin_table_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn handlers_match_the_builtin_table() {
+        let redactor = Arc::new(Redactor::new(&BTreeMap::new()));
+        let handlers = builtin_handlers(&redactor, 1024);
+        let actual: Vec<(&str, ToolEffect)> =
+            handlers.iter().map(|h| (h.name(), h.effect())).collect();
+        assert_eq!(actual, BUILTIN_TOOLS);
+    }
 }

@@ -52,9 +52,8 @@ pub enum PipelineError {
     InvalidGraph { reason: String },
 
     /// An agent node referenced a name missing from `Pipeline.agents`.
-    /// Raised during dispatch, not at load time — `validate()` does not
-    /// yet cross-check node → agent references (that is Phase 7 work on
-    /// the full `orno validate` policy surface per `docs/roadmap.md`).
+    /// `validate()` rejects this at load time; the render path reports it
+    /// too, for pipelines built in code without going through `validate()`.
     #[error("node references unknown agent `{name}`")]
     UnknownAgent { name: String },
 }

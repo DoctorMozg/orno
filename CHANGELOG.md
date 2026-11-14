@@ -47,6 +47,21 @@ once the first tagged release ships.
   escapes both limits. Add `unconfined_shell: true` to the agent's
   policy to accept that (the `commit-digest` and `flaky-test-triage`
   examples do).
+- **Breaking:** unknown keys in a pipeline file are rejected with the key
+  and node id in the error (a typo like `need:` or
+  `blocked_domain:` used to be dropped silently). The JSON schema now
+  sets `additionalProperties: false`.
+- **Breaking:** node ids must match `[A-Za-z_][A-Za-z0-9_]*`, so
+  `nodes.<id>` is writable in templates. `timeout: 0` and an empty shell
+  `command` are rejected.
+- **Breaking:** `orno run`, `plan` and `replay` run the full validation
+  that only `orno validate` ran before (undeclared agents, unknown tools,
+  zero budgets, effect gates) and report every error at once, so a run
+  fails before its first node starts. `orno plan` exits non-zero on an
+  undeclared agent instead of printing a node for it.
+- Validation also compiles every template and checks that
+  `nodes.<id>` reads name a transitive `needs:` ancestor. Dependency
+  cycles are reported as `InvalidGraph` everywhere.
 - `policy.roots` entries and shell-node `env:` values are rendered
   through the template engine, so `{{ vars.* }}` / `{{ env.* }}` work
   there.
@@ -56,6 +71,11 @@ once the first tagged release ships.
 
 ### Fixed
 
+- `..` in `policy.roots` is rejected, so `/work/../etc` no longer passes
+  the subagent roots check against `/work`.
+- A templated MCP server `url` is now validated (http/https, loopback-only
+  plain http, blocked IPs) after rendering, right before the server is
+  spawned; load-time validation only sees the template text.
 - A tape or bundle flush failure no longer leaks MCP child processes or
   hides the engine error; the bundle records the pipeline text loaded at
   startup instead of re-reading the file.

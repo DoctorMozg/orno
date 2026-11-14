@@ -17,19 +17,17 @@ use orno_core::node::shell::ShellExecutor;
 use orno_core::pipeline::Pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, ReadHandler, RecordingToolHandler, ReplayToolHandler,
-    SetStateHandler, SubagentHandler, ToolHandler, WebFetchHandler, WriteHandler,
+    RecordingToolHandler, ReplayToolHandler, SubagentHandler, ToolHandler, builtin_handlers,
 };
 
 use super::{RunFlags, ToolTapePair};
 
-/// Construct the built-in tool vector — `BashHandler`, `ReadHandler`,
-/// `WriteHandler`, `EditHandler`, `WebFetchHandler`, `SetStateHandler`
-/// — and append the per-MCP-server tool handlers already produced by
+/// Construct the built-in tool vector (`orno_core::tool::BUILTIN_TOOLS`)
+/// and append the per-MCP-server tool handlers already produced by
 /// `spawn_mcp_servers`. `LoopAgent` gates each call against the
 /// per-agent `AgentPolicy.allowed_tools` list, so an agent that does
 /// not opt into a handler cannot reach it: this vector is the
-/// availability ceiling, not the default. `SetStateHandler` shares
+/// availability ceiling, not the default. `SetState` shares
 /// the run-level redactor so `secrets.*` leaves are scrubbed before
 /// state reaches the wire.
 pub(super) fn assemble_builtin_tools(
@@ -37,17 +35,7 @@ pub(super) fn assemble_builtin_tools(
     body_excerpt_max_bytes: usize,
     mcp_tools: Vec<Arc<dyn ToolHandler>>,
 ) -> Vec<Arc<dyn ToolHandler>> {
-    let mut tools: Vec<Arc<dyn ToolHandler>> = vec![
-        Arc::new(BashHandler),
-        Arc::new(ReadHandler),
-        Arc::new(WriteHandler),
-        Arc::new(EditHandler),
-        Arc::new(WebFetchHandler::default()),
-        Arc::new(SetStateHandler::new(
-            redactor.clone(),
-            body_excerpt_max_bytes,
-        )),
-    ];
+    let mut tools = builtin_handlers(redactor, body_excerpt_max_bytes);
     tools.extend(mcp_tools);
     tools
 }

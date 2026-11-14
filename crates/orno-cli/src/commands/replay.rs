@@ -34,8 +34,7 @@ use orno_core::node::shell::DenyShellExecutor;
 use orno_core::pipeline;
 use orno_core::pipeline::template::TemplateEngine;
 use orno_core::tool::{
-    BashHandler, EditHandler, ReadHandler, ReplayMcpStubHandler, ReplayToolHandler,
-    SetStateHandler, SubagentHandler, ToolHandler, WebFetchHandler, WriteHandler,
+    ReplayMcpStubHandler, ReplayToolHandler, SubagentHandler, ToolHandler, builtin_handlers,
 };
 
 /// Default body-excerpt cap shared with `orno run`'s non-verbose mode.
@@ -122,35 +121,16 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     // `(tool_name, call_id, args)` so siblings sharing the entry list
     // never collide — a `Bash` call and a `Read` call with the same
     // call_id index different tape rows.
-    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> = vec![
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(BashHandler),
-            tool_entries.clone(),
-        )),
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(ReadHandler),
-            tool_entries.clone(),
-        )),
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(WriteHandler),
-            tool_entries.clone(),
-        )),
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(EditHandler),
-            tool_entries.clone(),
-        )),
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(WebFetchHandler::default()),
-            tool_entries.clone(),
-        )),
-        Arc::new(ReplayToolHandler::from_entries(
-            Arc::new(SetStateHandler::new(
-                redactor.clone(),
-                body_excerpt_max_bytes,
-            )),
-            tool_entries.clone(),
-        )),
-    ];
+    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> =
+        builtin_handlers(&redactor, body_excerpt_max_bytes)
+            .into_iter()
+            .map(|handler| {
+                Arc::new(ReplayToolHandler::from_entries(
+                    handler,
+                    tool_entries.clone(),
+                )) as Arc<dyn ToolHandler>
+            })
+            .collect();
 
     // MCP replay: no live `McpClient` is spawned, but the agent loop
     // still needs a registered handler for every `mcp.*` tool the

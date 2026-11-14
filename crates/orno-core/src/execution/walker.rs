@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use crate::error::PipelineError;
 use crate::events::SkipReason;
+use crate::pipeline::graph::DepGraph;
 use crate::pipeline::{Node, Pipeline};
 
 /// Per-node lifecycle state. Internal to the walker; tests read it
@@ -24,7 +25,7 @@ pub enum NodeState {
 
 /// Generator-style DAG walker.
 ///
-/// Construction validates the graph (cycles, unknown `needs:` targets)
+/// Construction validates the graph (duplicate ids, cycles, unknown `needs:` targets)
 /// and fails fast with [`PipelineError::InvalidGraph`]. After that, the
 /// walker answers [`DagWalker::next_ready`] until the DAG drains. Every
 /// [`DagWalker::complete`] call may cascade skips through transitive
@@ -49,41 +50,18 @@ pub struct DagWalker<'p> {
 
 impl<'p> DagWalker<'p> {
     /// Build a walker over the pipeline. Validates the DAG; returns
-    /// [`PipelineError::InvalidGraph`] on unknown `needs:` targets or
-    /// cycles.
-    ///
-    /// Duplicate ids are treated as a validator bug — the walker
-    /// trusts that [`crate::pipeline::load::validate`] has already
-    /// rejected them — and panic here rather than return an error.
+    /// [`PipelineError::InvalidGraph`] on duplicate ids, unknown
+    /// `needs:` targets or cycles.
     #[must_use = "walker errors must be propagated"]
     pub fn new(pipeline: &'p Pipeline) -> Result<Self, PipelineError> {
+        let graph = DepGraph::build(&pipeline.nodes)?;
         let nodes: Vec<&Node> = pipeline.nodes.iter().collect();
         let n = nodes.len();
-
-        let mut by_id: BTreeMap<String, usize> = BTreeMap::new();
-        for (idx, node) in nodes.iter().enumerate() {
-            assert!(
-                by_id.insert(node.id.clone(), idx).is_none(),
-                "duplicate node id `{}` reached walker — validator bug",
-                node.id,
-            );
-        }
-
-        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut waiting_on: Vec<usize> = vec![0; n];
-        for (idx, node) in nodes.iter().enumerate() {
-            for dep in &node.needs {
-                let Some(&dep_idx) = by_id.get(dep) else {
-                    return Err(PipelineError::InvalidGraph {
-                        reason: format!("node `{}` depends on unknown `{dep}`", node.id),
-                    });
-                };
-                dependents[dep_idx].push(idx);
-                waiting_on[idx] += 1;
-            }
-        }
-
-        Self::detect_cycle(&nodes, &dependents, &waiting_on)?;
+        let DepGraph {
+            by_id,
+            dependents,
+            in_degree: waiting_on,
+        } = graph;
 
         let mut state: Vec<NodeState> = vec![NodeState::Pending; n];
         let mut ready_queue: Vec<usize> = Vec::new();
@@ -103,39 +81,6 @@ impl<'p> DagWalker<'p> {
             waiting_on,
             ready_queue,
         })
-    }
-
-    /// Run Kahn's algorithm over a scratch copy of the in-degree
-    /// array. When the popped count is short of `n`, at least one
-    /// residual node is on a cycle; name the lowest-indexed such
-    /// node in the error so the message is deterministic.
-    fn detect_cycle(
-        nodes: &[&Node],
-        dependents: &[Vec<usize>],
-        waiting_on: &[usize],
-    ) -> Result<(), PipelineError> {
-        let n = nodes.len();
-        let mut scratch: Vec<usize> = waiting_on.to_vec();
-        let mut queue: VecDeque<usize> = (0..n).filter(|&i| scratch[i] == 0).collect();
-        let mut popped = 0usize;
-        while let Some(idx) = queue.pop_front() {
-            popped += 1;
-            for &dep in &dependents[idx] {
-                scratch[dep] -= 1;
-                if scratch[dep] == 0 {
-                    queue.push_back(dep);
-                }
-            }
-        }
-        if popped < n {
-            let residual = (0..n)
-                .find(|&i| scratch[i] > 0)
-                .expect("cycle detected but no residual node — arithmetic bug");
-            return Err(PipelineError::InvalidGraph {
-                reason: format!("cycle detected involving `{}`", nodes[residual].id),
-            });
-        }
-        Ok(())
     }
 
     /// Return the next node the scheduler should execute, or `None`

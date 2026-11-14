@@ -11,7 +11,7 @@
 //! the source; the same hex string is the `MiniJinja` template name so a
 //! cache hit is a direct `get_template` lookup.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 use crate::error::PipelineError;
 
+use super::checks::check_rendered_mcp_server;
 use super::schema::McpServerConfig;
 
 /// Maximum number of bytes accepted for a single template source string.
@@ -68,48 +69,8 @@ impl TemplateEngine {
     }
 
     pub fn render(&self, name: &str, source: &str, ctx: &Value) -> Result<String, PipelineError> {
-        if source.len() > MAX_TEMPLATE_SOURCE_BYTES {
-            return Err(PipelineError::Validation(format!(
-                "template `{name}` source exceeds {MAX_TEMPLATE_SOURCE_BYTES} bytes ({} bytes)",
-                source.len(),
-            )));
-        }
-
-        let hash = blake3::hash(source.as_bytes());
-
-        // Poison recovery matches `InMemorySink` / `StreamingSink` — a
-        // panicking task on a sibling render must not starve subsequent
-        // template renders. The cache state is set-and-test, so a partial
-        // mutation across a panic is bounded: at worst, a hash gets
-        // inserted without its template registered (re-insert is
-        // idempotent) or vice versa (the next `add_template_owned`
-        // returns the same source, then `get_template` succeeds).
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let template_name = if let Some(existing) = inner.cache.get(&hash) {
-            existing.clone()
-        } else {
-            let hex = hash.to_hex().to_string();
-            inner
-                .env
-                .add_template_owned(hex.clone(), source.to_string())
-                .map_err(|source| PipelineError::Template {
-                    name: name.to_string(),
-                    source,
-                })?;
-            // `LruCache::push` (not `put`) returns the evicted (key, value)
-            // pair when the cache is at capacity. `put` only returns a value
-            // on a key collision, so an overflow eviction would be silently
-            // dropped and the Environment would grow without bound.
-            if let Some((_evicted_hash, evicted_name)) = inner.cache.push(hash, hex.clone()) {
-                inner.env.remove_template(&evicted_name);
-            }
-            hex
-        };
-
+        let mut inner = self.lock();
+        let template_name = Self::compile_cached(&mut inner, name, source)?;
         let tmpl =
             inner
                 .env
@@ -122,6 +83,86 @@ impl TemplateEngine {
             name: name.to_string(),
             source,
         })
+    }
+
+    /// Compile `source` without rendering it and return the node ids it
+    /// reads through `nodes.<id>`. A syntax error surfaces here instead of
+    /// at dispatch. Only trivial attribute lookups are seen, so
+    /// `nodes[var]` is invisible to the scan.
+    ///
+    /// Errors: `PipelineError::Template` on a syntax error,
+    /// `PipelineError::Validation` for oversize source.
+    pub fn referenced_nodes(
+        &self,
+        name: &str,
+        source: &str,
+    ) -> Result<BTreeSet<String>, PipelineError> {
+        let mut inner = self.lock();
+        let template_name = Self::compile_cached(&mut inner, name, source)?;
+        let tmpl =
+            inner
+                .env
+                .get_template(&template_name)
+                .map_err(|source| PipelineError::Template {
+                    name: name.to_string(),
+                    source,
+                })?;
+        Ok(tmpl
+            .undeclared_variables(true)
+            .iter()
+            .filter_map(|path| path.strip_prefix("nodes."))
+            .filter_map(|rest| rest.split('.').next())
+            .map(str::to_string)
+            .collect())
+    }
+
+    // Poison recovery matches `InMemorySink` / `StreamingSink` — a
+    // panicking task on a sibling render must not starve subsequent
+    // template renders. The cache state is set-and-test, so a partial
+    // mutation across a panic is bounded: at worst, a hash gets
+    // inserted without its template registered (re-insert is
+    // idempotent) or vice versa (the next `add_template_owned`
+    // returns the same source, then `get_template` succeeds).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register `source` with the environment if the cache has not seen it
+    /// and return the name it is registered under.
+    fn compile_cached(
+        inner: &mut Inner,
+        name: &str,
+        source: &str,
+    ) -> Result<String, PipelineError> {
+        if source.len() > MAX_TEMPLATE_SOURCE_BYTES {
+            return Err(PipelineError::Validation(format!(
+                "template `{name}` source exceeds {MAX_TEMPLATE_SOURCE_BYTES} bytes ({} bytes)",
+                source.len(),
+            )));
+        }
+
+        let hash = blake3::hash(source.as_bytes());
+        if let Some(existing) = inner.cache.get(&hash) {
+            return Ok(existing.clone());
+        }
+        let hex = hash.to_hex().to_string();
+        inner
+            .env
+            .add_template_owned(hex.clone(), source.to_string())
+            .map_err(|source| PipelineError::Template {
+                name: name.to_string(),
+                source,
+            })?;
+        // `LruCache::push` (not `put`) returns the evicted (key, value)
+        // pair when the cache is at capacity. `put` only returns a value
+        // on a key collision, so an overflow eviction would be silently
+        // dropped and the Environment would grow without bound.
+        if let Some((_evicted_hash, evicted_name)) = inner.cache.push(hash, hex.clone()) {
+            inner.env.remove_template(&evicted_name);
+        }
+        Ok(hex)
     }
 }
 
@@ -172,7 +213,9 @@ pub fn render_pipeline_vars(
 /// the same context nodes get. Rendered values are never logged here;
 /// errors carry only the server name and the template error.
 ///
-/// Errors: `PipelineError::Template` when a string fails to render.
+/// Errors: `PipelineError::Template` when a string fails to render,
+/// `PipelineError::Validation` when the rendered server fails the same
+/// checks as load-time validation (url scheme, blocked host).
 pub fn render_mcp_server(
     tmpl: &TemplateEngine,
     server_name: &str,
@@ -188,11 +231,14 @@ pub fn render_mcp_server(
     })?;
     let rendered = render_value(tmpl, &format!("mcp_servers.{server_name}"), &raw, &ctx)?;
     // The serde error is dropped on purpose: it can quote a rendered value.
-    serde_json::from_value(rendered).map_err(|_| {
+    let rendered: McpServerConfig = serde_json::from_value(rendered).map_err(|_| {
         PipelineError::Validation(format!(
             "mcp_servers.`{server_name}`: rendered config does not match the schema"
         ))
-    })
+    })?;
+    // Validation only saw the template text; a rendered url can differ.
+    check_rendered_mcp_server(server_name, &rendered)?;
+    Ok(rendered)
 }
 
 /// Walk a `Value` tree and emit a `tracing::warn!` for every `secrets.X`
@@ -281,7 +327,7 @@ fn render_value(
 /// Cheap pre-check — skip the render call when the source obviously
 /// has no template tags. MiniJinja parses literal strings cleanly, so
 /// this is purely a perf hint, not a correctness gate.
-fn looks_templated(s: &str) -> bool {
+pub(super) fn looks_templated(s: &str) -> bool {
     s.contains("{{") || s.contains("{%")
 }
 
@@ -725,5 +771,43 @@ mod tests {
         )
         .expect_err("strict undefined must fail");
         assert!(matches!(err, PipelineError::Template { .. }));
+    }
+
+    #[rstest::rstest]
+    #[case::wrong_scheme("ftp://{{ env.HOST }}/mcp", "HOST", "mcp.example.com", "scheme `ftp`")]
+    #[case::plain_http_remote("http://{{ env.HOST }}/mcp", "HOST", "mcp.example.com", "loopback")]
+    #[case::metadata_ip(
+        "https://{{ env.HOST }}/mcp",
+        "HOST",
+        "169.254.169.254",
+        "blocked range"
+    )]
+    #[case::not_a_url("{{ env.HOST }}", "HOST", "not a url", "invalid url")]
+    fn rendered_mcp_url_is_validated(
+        #[case] url: &str,
+        #[case] var: &str,
+        #[case] value: &str,
+        #[case] expected: &str,
+    ) {
+        use crate::pipeline::schema::McpHttpConfig;
+
+        let http = McpServerConfig::Http(McpHttpConfig {
+            url: url.to_string(),
+            auth: None,
+            headers: BTreeMap::new(),
+            call_timeout_secs: None,
+        });
+        let err = render_mcp_server(
+            &TemplateEngine::new(),
+            "web",
+            &http,
+            &env_from(&[(var, value)]),
+            &BTreeMap::new(),
+        )
+        .expect_err("a bad rendered url must be refused before spawn");
+        let PipelineError::Validation(msg) = err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("web") && msg.contains(expected), "{msg}");
     }
 }
