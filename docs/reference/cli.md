@@ -1,6 +1,6 @@
 # CLI reference
 
-The `orno` binary has six subcommands. Every subcommand exits `0` on success and non-zero on failure; see [exit codes](exit-codes.md) for the discriminating values.
+The `orno` binary has six subcommands. Every subcommand exits `0` on success and non-zero on failure. See [exit codes](exit-codes.md) for what each non-zero value means.
 
 ```
 orno <COMMAND> [OPTIONS]
@@ -22,26 +22,26 @@ orno run <PIPELINE> [OPTIONS]
 
 | Flag                                | Value     | Description                                                                                                                                                                                                                                                                                                                       |
 | ----------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-e`, `--env <KEY=VAL>`             | `KEY=VAL` | Inline binding for the `env.*` template namespace. Repeatable; last flag wins on a duplicate key. Refused for names declared in the pipeline's `secrets:` block — `argv` leaks into shell history. Use `--secrets-file` for credentials.                                                                                          |
-| `--env-file <PATH>`                 | path      | Dotenv file merged into the `env.*` template namespace. Repeatable; later files shadow earlier ones. A binding whose name appears in the pipeline's `secrets:` block is routed into `secrets.*` instead (name-based classification cannot be downgraded by source).                                                              |
-| `--secrets-file <PATH>`             | path      | Dotenv file merged into the `secrets.*` template namespace. Repeatable; later files shadow earlier ones.                                                                                                                                                                                                                          |
+| `-e`, `--env <KEY=VAL>`             | `KEY=VAL` | Inline binding for the `env.*` template namespace. Repeatable, and the last flag wins on a duplicate key. Refused for names declared in the pipeline's `secrets:` block, because `argv` leaks into shell history. Use `--secrets-file` for credentials.                                                                           |
+| `--env-file <PATH>`                 | path      | Dotenv file merged into the `env.*` template namespace. Repeatable, and later files shadow earlier ones. A binding whose name appears in the pipeline's `secrets:` block is routed into `secrets.*` instead. Name-based classification cannot be downgraded by source.                                                          |
+| `--secrets-file <PATH>`             | path      | Dotenv file merged into the `secrets.*` template namespace. Repeatable, and later files shadow earlier ones.                                                                                                                                                                                                                      |
 | `-v`, `--verbose`                   | flag      | Verbose diagnostics. Bumps tracing to `debug` (unless `RUST_LOG` is already set) and lifts the default `--stderr-tail-bytes` cap from 2 KB to 64 KB.                                                                                                                                                                              |
-| `--stderr-tail-bytes <BYTES>`       | integer   | Cap on captured stderr (and similarly bounded payloads — `LlmFailure.body_excerpt`, MCP excerpts, `SetState` payloads) in failure diagnostics. Default `2048` in normal mode, `65536` with `--verbose`. An explicit value here always wins.                                                                                       |
+| `--stderr-tail-bytes <BYTES>`       | integer   | Cap on captured stderr in failure diagnostics. It also bounds similar payloads: `LlmFailure.body_excerpt`, MCP excerpts, `SetState` payloads. Default `2048` in normal mode, `65536` with `--verbose`. An explicit value here always wins.                                                                                       |
 | `--max-node-output-bytes <BYTES>`   | integer   | Cap on a `kind: shell` node's captured `stdout` and `stderr`, per stream. Default 8 MiB. Past the cap the captured prefix is kept, the child keeps running, and one `node_output_truncated` event is emitted per overflowed stream. Distinct from `--stderr-tail-bytes`, which caps log excerpts. |
 | `--record-tape <PATH>`              | path      | Write every LLM request/response pair to a tape file for later replay. Creates the file and fails if it already exists. Mutually exclusive with `--replay-tape` and `--record-bundle`.                                                                                                                                                                       |
-| `--replay-tape <PATH>`              | path      | Replay LLM calls from a tape instead of hitting the live API. A tape miss is a hard error — no live-API fallback. Mutually exclusive with `--record-tape` and `--record-bundle`.                                                                                                                                                  |
+| `--replay-tape <PATH>`              | path      | Replay LLM calls from a tape instead of hitting the live API. A tape miss is a hard error, with no live-API fallback. Mutually exclusive with `--record-tape` and `--record-bundle`.                                                                                                                                                  |
 | `--record-tool-tape <PATH>`         | path      | Write every tool/MCP call result to a tape file. Creates the file and fails if it already exists. Mutually exclusive with `--replay-tool-tape` and `--record-bundle`.                                                                                                                                                                                        |
 | `--replay-tool-tape <PATH>`         | path      | Replay tool/MCP calls from a tape instead of executing them live. A tape miss is a hard error. Mutually exclusive with `--record-tool-tape` and `--record-bundle`.                                                                                                                                                                |
 | `--record-bundle <PATH>`            | path      | Record the full run (LLM tape + tool tape + the pipeline YAML itself) into a single bundle for replay with `orno replay`. Mutually exclusive with the four individual tape flags.                                                                                                                                                 |
 
 ### Streams
 
-`orno run` emits two distinct streams:
+`orno run` writes to two streams:
 
-- **stdout** — `EventEnvelope` NDJSON, the user-facing event log. Downstream tools consume this.
-- **stderr** — `tracing` JSON, internal observability. Log pipelines consume this.
+- **stdout**: `EventEnvelope` NDJSON, the user-facing event log. Downstream tools consume this.
+- **stderr**: `tracing` JSON, internal observability. Log pipelines consume this.
 
-Both streams use RFC 3339 UTC timestamps so they are joinable on wall clock without parsing `seq`. Do not pipe stderr into the same consumer as stdout — they have different schemas.
+Both streams use RFC 3339 UTC timestamps, so you can join them on wall clock without parsing `seq`. Don't pipe stderr into the same consumer as stdout, because the two have different schemas.
 
 ### Examples
 
@@ -61,7 +61,7 @@ orno run pipeline.yaml -v
 
 ## `orno replay`
 
-Re-execute a recorded run from a bundle. No live LLM calls, no network, no MCP server spawning — every external interaction is served from the bundle's tapes.
+Re-execute a recorded run from a bundle. No live LLM calls, no network, no MCP server spawning. Every external interaction is served from the bundle's tapes.
 
 ```
 orno replay <BUNDLE>
@@ -89,11 +89,11 @@ orno validate <PIPELINE>
 | ------------ | -------- | -------------------------------------- |
 | `<PIPELINE>` | yes      | Path to the pipeline YAML file.        |
 
-Exits `0` if the pipeline is loadable and structurally valid, non-zero on any `PipelineError`. No events are emitted; failures print to stderr.
+Exits `0` if the pipeline is loadable and structurally valid, non-zero on any `PipelineError`. No events are emitted, and failures print to stderr.
 
 ## `orno plan`
 
-Static preview of a pipeline. No LLM calls, no network, no tool execution. Emits one `plan_node` line per node followed by a single `plan_summary` line on stdout as NDJSON.
+Static preview of a pipeline. No LLM calls, no network, no tool execution. Emits one `plan_node` line per node, then a single `plan_summary` line, all on stdout as NDJSON.
 
 ```
 orno plan <PIPELINE>
@@ -103,7 +103,7 @@ orno plan <PIPELINE>
 | ------------ | -------- | -------------------------------------- |
 | `<PIPELINE>` | yes      | Path to the pipeline YAML file.        |
 
-The reviewer audits the worst-case ceiling — declared tools, declared effects, max tokens, max tool calls, MCP dependencies — before any spend is authorized. Exit code is `0` iff the pipeline loads, validates, and is spendable.
+A reviewer can audit the worst-case ceiling (declared tools, declared effects, max tokens, max tool calls, MCP dependencies) before any spend is authorized. The exit code is `0` if and only if the pipeline loads, validates, and is spendable.
 
 ```bash
 orno plan examples/hello/pipeline.yaml
@@ -117,7 +117,7 @@ Print the pipeline JSON Schema (the canonical wire-format spec) to stdout.
 orno schema
 ```
 
-No arguments. The output is the JSON Schema generated from the in-tree types and is the source of truth for the YAML grammar — when this disagrees with [`pipeline-yaml.md`](pipeline-yaml.md), the schema wins.
+It takes no arguments. The output is the JSON Schema generated from the in-tree types, and it is the source of truth for the YAML grammar. When it disagrees with [`pipeline-yaml.md`](pipeline-yaml.md), the schema wins.
 
 The repository's `schemas/pipeline.schema.json` is regenerated from this command:
 
@@ -145,7 +145,7 @@ orno completions fish > ~/.config/fish/completions/orno.fish
 
 ## See also
 
-- [Exit codes](exit-codes.md) — what each non-zero exit means.
-- [Environment variables](env-vars.md) — variables `orno` reads.
-- [Events](events.md) — wire format of the NDJSON stream emitted by `orno run`.
-- [Pipeline YAML](pipeline-yaml.md) — the input grammar for `<PIPELINE>` arguments.
+- [Exit codes](exit-codes.md): what each non-zero exit means.
+- [Environment variables](env-vars.md): variables `orno` reads.
+- [Events](events.md): wire format of the NDJSON stream emitted by `orno run`.
+- [Pipeline YAML](pipeline-yaml.md): the input grammar for `<PIPELINE>` arguments.

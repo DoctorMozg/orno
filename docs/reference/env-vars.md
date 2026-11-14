@@ -1,8 +1,8 @@
 # Environment variables
 
-orno reads a small fixed set of environment variables. Variables are grouped by purpose; everything here is name-classified — a variable's role does not change based on the source file it came from.
+orno reads a small fixed set of environment variables, grouped below by purpose. Everything here is classified by name, so a variable's role does not change with the source file it came from.
 
-orno does **not** auto-inherit the entire process environment into the `env.*` template namespace. Names must be opted in via `pass_env:`, `-e`, or `--env-file`. This section documents the exception list — variables orno itself reads at the runtime boundary.
+orno does **not** auto-inherit the entire process environment into the `env.*` template namespace. Names must be opted in via `pass_env:`, `-e`, or `--env-file`. This section documents the exceptions: variables orno itself reads at the runtime boundary.
 
 ## Provider credentials
 
@@ -34,13 +34,13 @@ A non-loopback host logs a warning at client construction: prompts and tool-call
 
 ## Tracing
 
-Standard `tracing-subscriber` filter. Affects only the stderr observability stream; the stdout event log is unaffected.
+Standard `tracing-subscriber` filter. Affects only the stderr observability stream. The stdout event log is unaffected.
 
 | Variable    | Default                                                | Description                                                                                                       |
 | ----------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | `RUST_LOG`  | `info` (or `debug` when `orno run --verbose` is set)   | Tracing filter directive. Standard `env_logger`/`tracing-subscriber` syntax, e.g. `RUST_LOG=orno_core=debug,info`. |
 
-`RUST_LOG` always wins. `--verbose` only adjusts the default; it does not override an explicit `RUST_LOG`.
+`RUST_LOG` always wins. `--verbose` only adjusts the default. It does not override an explicit `RUST_LOG`.
 
 ## Test transports
 
@@ -59,7 +59,7 @@ ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport --
 
 ## User-declared secrets
 
-Names listed under the pipeline's top-level `secrets:` block are read from the process env (or `--secrets-file`) at run start and routed into the `secrets.*` template namespace. The variables themselves have no fixed names — they are whatever the pipeline declares.
+Names listed under the pipeline's top-level `secrets:` block are read from the process env (or `--secrets-file`) at run start and routed into the `secrets.*` template namespace. The variables themselves have no fixed names. They are whatever the pipeline declares.
 
 ```yaml
 secrets:
@@ -71,7 +71,7 @@ Reads `GITHUB_TOKEN` and `SLACK_BOT_TOKEN` from the process env (and any `--secr
 
 ## User-declared env inputs
 
-Names listed under `pass_env:` are pulled from the process env into the `env.*` template namespace. Same rule applies — the variable names are pipeline-specific.
+Names listed under `pass_env:` are pulled from the process env into the `env.*` template namespace. Same rule applies: the variable names are pipeline-specific.
 
 ```yaml
 pass_env:
@@ -79,12 +79,12 @@ pass_env:
   - CI_BUILD_ID
 ```
 
-Reads `PR_NUMBER` and `CI_BUILD_ID` from the process env and exposes them as `{{ env.PR_NUMBER }}` and `{{ env.CI_BUILD_ID }}`. Visible in events and traces — never redacted.
+Reads `PR_NUMBER` and `CI_BUILD_ID` from the process env and exposes them as `{{ env.PR_NUMBER }}` and `{{ env.CI_BUILD_ID }}`. Visible in events and traces, never redacted.
 
 A name listed in both `pass_env:` and `secrets:` fails validation: keep it in `secrets:` only so it stays redacted. Dotenv bindings that arrive through `--env-file` under a name declared in `secrets:` are routed into `secrets.*`.
 
 ## See also
 
-- [Pipeline YAML › environment and secrets](pipeline-yaml.md#environment-and-secrets) — full grammar for `pass_env:` and `secrets:`.
-- [CLI › `orno run`](cli.md#orno-run) — `-e`, `--env-file`, `--secrets-file` flags.
-- [FAQ › how are secrets redacted?](../faq.md#how-are-secrets-redacted) — name-based classification rationale.
+- [Pipeline YAML › environment and secrets](pipeline-yaml.md#environment-and-secrets): full grammar for `pass_env:` and `secrets:`.
+- [CLI › `orno run`](cli.md#orno-run): `-e`, `--env-file`, `--secrets-file` flags.
+- [FAQ › how are secrets redacted?](../faq.md#how-are-secrets-redacted): name-based classification rationale.

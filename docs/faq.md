@@ -2,19 +2,19 @@
 
 ## What is orno actually for?
 
-CI workflows that need to invoke an LLM agent under a contract a reviewer can audit before authorizing spend. The five strictness dimensions — iteration, tool surface, effects, resources, non-determinism — are runtime guarantees, not defaults. The hero surfaces `orno plan` and `orno replay` exist so a pipeline can be reviewed and re-run without spending tokens.
+CI workflows that need to invoke an LLM agent under a contract a reviewer can audit before authorizing spend. The five strictness dimensions (iteration, tool surface, effects, resources, non-determinism) are runtime guarantees, not defaults. The hero surfaces `orno plan` and `orno replay` exist so a pipeline can be reviewed and re-run without spending tokens.
 
 ## Why YAML?
 
-Pipelines are read more often than written, and they are the artifact a reviewer audits before a run. YAML is also what every other CI tool the pipeline lives next to (GitHub Actions, GitLab CI, Argo) uses, so authors do not have to learn a second declarative dialect.
+Pipelines are read more often than written, and they are the artifact a reviewer audits before a run. YAML is also what every other CI tool the pipeline lives next to (GitHub Actions, GitLab CI, Argo) uses, so authors don't have to learn a second declarative dialect.
 
 ## Why does an agent need a policy block?
 
-Because the runtime contract is enforced from it. Every effect class — mutation, network, domain reach, context-self writes — is gated by an explicit policy field, and every breach produces a typed event a reviewer can grep for. Defaulting to "anything goes" is exactly what orno is designed not to be.
+Because the runtime contract is enforced from it. Every effect class (mutation, network, domain reach, context-self writes) is gated by an explicit policy field, and every breach produces a typed event a reviewer can grep for. Defaulting to "anything goes" is exactly what orno is designed not to be.
 
 ## How is "multi-agent" different from peer-to-peer agents?
 
-orno's multi-agent model is recursive single-agent loops. A parent calls a child via the synthetic `subagent.<name>` tool, the child runs its own bounded loop, and returns its final assistant message to the parent like any other tool result. There are no chat channels between siblings. The flat list under `agents:` defines named agents; the DAG under `nodes:` decides which run as top-level nodes; the `subagent.<name>` tool decides which can be invoked as children.
+orno's multi-agent model is recursive single-agent loops. A parent calls a child via the synthetic `subagent.<name>` tool, the child runs its own bounded loop, and returns its final assistant message to the parent like any other tool result. There are no chat channels between siblings. The flat list under `agents:` defines named agents. The DAG under `nodes:` decides which run as top-level nodes. The `subagent.<name>` tool decides which can be invoked as children.
 
 ## Why OpenRouter as the default provider?
 
@@ -22,7 +22,7 @@ A single API key (`OPENROUTER_API_KEY`) unlocks OpenAI, Anthropic, Google, and o
 
 ## How are secrets redacted?
 
-Classification is name-based. Provider-known names (e.g. `OPENROUTER_API_KEY` when an agent's `provider:` is `openrouter`) are auto-classified. User-declared names go in `secrets: [NAMES]` at the top level. Either way, values are replaced with `***` in every event body, tracing line, and replay tape. Putting an `OPENROUTER_API_KEY=sk-...` line in `.env.inputs` does not downgrade it — orno still routes it into `secrets.*`.
+Classification is name-based. Provider-known names (e.g. `OPENROUTER_API_KEY` when an agent's `provider:` is `openrouter`) are auto-classified. User-declared names go in `secrets: [NAMES]` at the top level. Either way, values are replaced with `***` in every event body, tracing line, and replay tape. Putting an `OPENROUTER_API_KEY=sk-...` line in `.env.inputs` doesn't downgrade it. orno still routes it into `secrets.*`.
 
 ## Can a child agent be more permissive than its parent?
 
@@ -30,7 +30,7 @@ No. A child's `allow_mutations` / `allow_network` cannot exceed its parent's. En
 
 ## Why isn't `WebSearch` a builtin?
 
-There is no provider-neutral web search. Whether the right backend is Tavily, Brave, Bing, or a private index depends entirely on the operator. The shipped surface is what every install can rely on out of the box; web search returns when there is a stable provider trait to host it on. In the meantime, MCP servers fill the gap.
+There is no provider-neutral web search. Whether the right backend is Tavily, Brave, Bing, or a private index depends entirely on the operator. The shipped surface is what every install can rely on out of the box. Web search returns when there is a stable provider trait to host it on. In the meantime, MCP servers fill the gap.
 
 ## What happens if my replay bundle is missing an LLM call?
 
@@ -42,7 +42,7 @@ stdout is the user-facing event log: NDJSON envelopes meant for downstream tools
 
 ## Can I parallelise nodes in the DAG?
 
-Today, the engine schedules nodes serially. Disjoint branches still execute (a failure in one branch does not skip nodes in another), but they execute one node at a time. Parallel scheduling is on the work list and will not change the user-facing pipeline shape when it lands.
+Today, the engine schedules nodes serially. Disjoint branches still execute (a failure in one branch does not skip nodes in another), but they execute one node at a time. Parallel scheduling is on the work list and won't change the user-facing pipeline shape when it lands.
 
 ## Can an agent overwrite its own state mid-loop?
 
@@ -50,11 +50,11 @@ Today, the engine schedules nodes serially. Disjoint branches still execute (a f
 
 ## How do I see what a pipeline will do without running it?
 
-`orno plan <pipeline.yaml>` — one `plan_node` line per node, one `plan_summary` line for the whole pipeline. No LLM calls, no network, no tool execution. Exit code is `0` iff the pipeline loads, validates, and is spendable. A reviewer audits the worst-case ceiling before authorizing spend.
+Run `orno plan <pipeline.yaml>`. It prints one `plan_node` line per node and one `plan_summary` line for the whole pipeline. No LLM calls, no network, no tool execution. Exit code is `0` iff the pipeline loads, validates, and is spendable. A reviewer audits the worst-case ceiling before authorizing spend.
 
 ## How do I run a pipeline without an API key?
 
-Two options. For deterministic smoke testing, build with `--features test-transport` and set `ORNO_TEST_LLM_TRANSPORT=dummy` (for example `cargo run -p orno-cli --features test-transport -- run ...`) — the dummy transport returns canned responses. Release binaries ignore the variable. For replay-only execution against a previously recorded run, use `orno replay <bundle.ndjson>` — it never calls the live API and never touches the network.
+Two options. For deterministic smoke testing, build with `--features test-transport` and set `ORNO_TEST_LLM_TRANSPORT=dummy` (for example `cargo run -p orno-cli --features test-transport -- run ...`). The dummy transport returns canned responses. Release binaries ignore the variable. For replay-only execution against a previously recorded run, use `orno replay <bundle.ndjson>`. It never calls the live API and never touches the network.
 
 ## Can I declare an agent inline at the node level?
 

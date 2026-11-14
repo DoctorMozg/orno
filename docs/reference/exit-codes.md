@@ -12,7 +12,7 @@
 
 When a run has started, `run_finished` is emitted for every outcome above, including MCP handshake failures and `vars:` render failures. Failures that happen before the run starts (the file cannot be read, the YAML does not parse or validate, secrets do not resolve, a `--record-tape` or `--record-tool-tape` target already exists) emit no events: stdout stays empty and the error goes to stderr.
 
-`--record-tape` and `--record-tool-tape` create the file with `create_new`: an existing path is an error, not overwritten. (The `--help` text says "creates or truncates"; that wording is out of date.)
+`--record-tape` and `--record-tool-tape` create the file with `create_new`: an existing path is an error, not overwritten. (The `--help` text says "creates or truncates", but that wording is out of date.)
 
 ## `orno replay`
 
@@ -21,7 +21,7 @@ When a run has started, `run_finished` is emitted for every outcome above, inclu
 | `0`       | Bundle loaded and replay completed; the final `run_finished` event reports `ok: true`.                  |
 | non-zero  | Bundle file missing or malformed, or replay encountered a tape miss. Tape misses are **never** a fallback to the live API — they always surface as failures.   |
 
-Per-node replay-miss failures surface on `node_finished` events **and** on the process exit code (exit `1`) — same behavior as `orno run`.
+Per-node replay-miss failures surface on `node_finished` events **and** on the process exit code (exit `1`), the same as in `orno run`.
 
 ## `orno validate`
 
@@ -30,7 +30,7 @@ Per-node replay-miss failures surface on `node_finished` events **and** on the p
 | `0`       | Pipeline loaded and passed semantic validation.                                                        |
 | non-zero  | Any `PipelineError` — file not found, YAML parse error, validation failure, undefined agent reference. |
 
-`orno validate` is a quick pre-flight check; pair it with `orno plan` for a fuller pre-spend audit.
+`orno validate` is a quick pre-flight check. Pair it with `orno plan` for a fuller pre-spend audit.
 
 ## `orno plan`
 
@@ -57,6 +57,6 @@ Per-node replay-miss failures surface on `node_finished` events **and** on the p
 
 ## See also
 
-- [CLI](cli.md) — every subcommand and its flags.
-- [Events](events.md) — the wire format that carries node-level pass/fail beyond the process exit code.
-- [Errors](errors.md) — typed error enums behind non-zero exits.
+- [CLI](cli.md): every subcommand and its flags.
+- [Events](events.md): the wire format that carries node-level pass/fail beyond the process exit code.
+- [Errors](errors.md): typed error enums behind non-zero exits.

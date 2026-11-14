@@ -15,20 +15,20 @@ Each subdirectory holds one runnable orno pipeline plus any artifacts (bundles, 
 
 ## Running an example
 
-Most examples assume `OPENROUTER_API_KEY` is set in the environment:
+Most examples need `OPENROUTER_API_KEY` set in the environment:
 
 ```
 export OPENROUTER_API_KEY=sk-or-v1-...
 cargo run -p orno-cli -- run examples/hello/pipeline.yaml
 ```
 
-For a no-key smoke test, build with the `test-transport` feature and use the dummy transport. Release binaries ignore `ORNO_TEST_LLM_TRANSPORT`:
+To smoke-test without a key, build with the `test-transport` feature and use the dummy transport. Release binaries ignore `ORNO_TEST_LLM_TRANSPORT`:
 
 ```
 ORNO_TEST_LLM_TRANSPORT=dummy cargo run -p orno-cli --features test-transport -- run examples/hello/pipeline.yaml
 ```
 
-Several examples consume environment inputs via `pass_env:` — `pr-review/` wants `PR_NUMBER`, `flaky-test-triage/` wants `TEST_PATH`, `CI_LOG_URL`, and `GITHUB_REPO`, and so on. Their per-example READMEs spell out the inputs.
+Several examples read environment inputs through `pass_env:`. `pr-review/` wants `PR_NUMBER`, `flaky-test-triage/` wants `TEST_PATH`, `CI_LOG_URL`, and `GITHUB_REPO`, and so on. Each example's own README lists its inputs.
 
 ## Layout convention
 
@@ -44,4 +44,4 @@ examples/
     bundle.ndjson
 ```
 
-When adding a new example, drop a folder here, name the pipeline `pipeline.yaml`, write a short README with the surface exercised and the inputs needed, and add a row to the table above.
+To add an example, create a folder here and name the pipeline `pipeline.yaml`. Write a short README covering the surface exercised and the inputs needed, then add a row to the table above.

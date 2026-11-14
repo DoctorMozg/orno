@@ -31,7 +31,7 @@ vars:
 
 ### Var rendering against env and secrets
 
-String values inside `vars` are themselves templated — they are rendered once at engine
+String values inside `vars` are themselves templated. They are rendered once at engine
 entry against the `{ env, secrets }` namespace before any node is dispatched, so a value
 of the form `"{{ env.RELEASE_TAG }}"` resolves to the env binding rather than carrying
 the literal template source through to downstream nodes:
@@ -47,20 +47,20 @@ Numbers, booleans, and nulls pass through unchanged. Arrays and objects recurse,
 element-by-element.
 
 Cross-var references (`vars.b: "{{ vars.a }}"`) are intentionally **not** supported in
-v0.1.x — the rendering context exposes only `env` and `secrets`. A `{{ vars.x }}` lookup
+v0.1.x, because the rendering context exposes only `env` and `secrets`. A `{{ vars.x }}` lookup
 inside another `vars` entry will fail with `PipelineError::Template { name: "vars.b", … }`.
 
 ## Environment and secrets
 
-Pipelines reference two external-value namespaces from templates — `env.*` for visible inputs and `secrets.*` for redacted credentials. See [env-vars.md](env-vars.md) for the runtime-boundary surface.
+Pipelines reference two external-value namespaces from templates: `env.*` for visible inputs and `secrets.*` for redacted credentials. See [env-vars.md](env-vars.md) for the runtime-boundary surface.
 
-### `env.*` — pipeline inputs, opt-in
+### `env.*`: pipeline inputs, opt-in
 
 Sources, highest precedence wins:
 
 1. `-e KEY=VAL` CLI flag (repeatable).
-2. `--env-file <path>` (repeatable; later files shadow earlier ones; dotenv format).
-3. `pass_env: [NAMES]` top-level YAML block — pulls the named keys from the process env at run start.
+2. `--env-file <path>` (repeatable, later files shadow earlier ones, dotenv format).
+3. `pass_env: [NAMES]` top-level YAML block, which pulls the named keys from the process env at run start.
 
 ```yaml
 pass_env:
@@ -76,12 +76,12 @@ Values in `env.*` are visible:
 - Appear verbatim in emitted events.
 - Logged at any tracing level without redaction.
 
-### `secrets.*` — credentials, ambient + file override
+### `secrets.*`: credentials, ambient + file override
 
 Sources, highest precedence wins:
 
 1. **Process env** for the names listed in `secrets: [NAMES]` at the top level. Typical use is MCP server `env:` blocks that pass a token through to the server subprocess.
-2. **`--secrets-file <path>`** (repeatable; later files shadow earlier ones; dotenv format). Every key in the file must be declared under `secrets:`; an undeclared key is an error.
+2. **`--secrets-file <path>`** (repeatable, later files shadow earlier ones, dotenv format). Every key in the file must be declared under `secrets:`, and an undeclared key is an error.
 
 Provider API keys (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are separate: the LLM transport reads them from the process env, and they are redacted automatically for the providers a pipeline uses. They are in `secrets.*` only when declared here. See [env-vars.md](env-vars.md#provider-credentials).
 
@@ -91,9 +91,9 @@ secrets:
   - SLACK_BOT_TOKEN
 ```
 
-There is no CLI flag for individual secret values — `argv` leaks into shell history, `ps aux`, and some exec-tracing facilities. Use `--secrets-file` for ad-hoc overrides.
+There is no CLI flag for individual secret values, since `argv` leaks into shell history, `ps aux`, and some exec-tracing facilities. Use `--secrets-file` for ad-hoc overrides.
 
-Classification follows the **name**, not the source. If a name is declared under `secrets:` and someone writes it into `--env-file` input, orno routes that binding into `secrets.*` — a name's sensitivity cannot be downgraded by choice of source file. A name listed in both `pass_env` and `secrets` fails validation.
+Classification follows the **name**, not the source. If a name is declared under `secrets:` and someone writes it into `--env-file` input, orno routes that binding into `secrets.*`. A name's sensitivity cannot be downgraded by choice of source file. A name listed in both `pass_env` and `secrets` fails validation.
 
 Values in `secrets.*` are protected:
 
@@ -111,7 +111,7 @@ orno run pipeline.yaml \
   --secrets-file .env.secrets
 ```
 
-All three flags are repeatable. Missing files are a hard error — no silent fallback to default paths.
+All three flags are repeatable. Missing files are a hard error, with no silent fallback to default paths.
 
 ## `agents`
 
@@ -122,7 +122,7 @@ Map of agent name to `AgentConfig`. Each named agent can be referenced by:
 
 ### Providers
 
-`provider:` is required and must be one of `openai`, `anthropic`, `ollama`, `openrouter`. OpenRouter exposes every upstream vendor behind one OpenAI-compatible endpoint, so a single `OPENROUTER_API_KEY` reaches OpenAI, Anthropic, Google, and open-weight models; the `model:` is then the OpenRouter route (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.5`). Direct `openai` / `anthropic` need the matching vendor key; `ollama` needs none and reads `OLLAMA_HOST`. See [env-vars.md](env-vars.md#provider-credentials).
+`provider:` is required and must be one of `openai`, `anthropic`, `ollama`, `openrouter`. OpenRouter exposes every upstream vendor behind one OpenAI-compatible endpoint, so a single `OPENROUTER_API_KEY` reaches OpenAI, Anthropic, Google, and open-weight models. The `model:` is then the OpenRouter route (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4.5`). Direct `openai` / `anthropic` need the matching vendor key. `ollama` needs none and reads `OLLAMA_HOST`. See [env-vars.md](env-vars.md#provider-credentials).
 
 ### `AgentConfig`
 
@@ -164,14 +164,14 @@ Each entry matches one of:
 
 - A builtin name: `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `SetState`.
 - A specific MCP tool: `"mcp.<server>.<tool>"` where `<server>` is a key in the top-level `mcp_servers:` map and `<tool>` is a tool advertised by that server.
-- An MCP server wildcard: `"mcp.<server>.*"` — every tool the server advertises at handshake.
-- A subagent reference: `"subagent.<agent-name>"` where `<agent-name>` is a key in `agents:`. The tool takes `{ prompt: string }`; the parent's emitted prompt becomes the child's `initial_prompt` for a fresh agent run. Requires `max_subagent_depth > 0`.
+- An MCP server wildcard: `"mcp.<server>.*"`, which covers every tool the server advertises at handshake.
+- A subagent reference: `"subagent.<agent-name>"` where `<agent-name>` is a key in `agents:`. The tool takes `{ prompt: string }`. The parent's emitted prompt becomes the child's `initial_prompt` for a fresh agent run. Requires `max_subagent_depth > 0`.
 
 Wildcards on builtins and on subagents are disallowed. Listing a non-existent MCP server, MCP tool, or agent fails at `orno validate`.
 
 #### Wire-form tool names
 
-YAML uses dots as readable separators in `mcp.<server>.<tool>` and `subagent.<agent-name>`. Provider function-calling schemas usually disallow dots in tool names; orno rewrites dots to underscores when building the LLM request (`mcp.github.search_issues` → `mcp_github_search_issues`; `subagent.security_lens` → `subagent_security_lens`). Users write dots in YAML; the wire sees underscores. Validation and event-log messages use the dotted YAML form.
+YAML uses dots as readable separators in `mcp.<server>.<tool>` and `subagent.<agent-name>`. Provider function-calling schemas usually disallow dots in tool names, so orno rewrites dots to underscores when building the LLM request: `mcp.github.search_issues` becomes `mcp_github_search_issues`, and `subagent.security_lens` becomes `subagent_security_lens`. Users write dots in YAML and the wire sees underscores. Validation and event-log messages use the dotted YAML form.
 
 ### `policy` semantics
 
@@ -192,7 +192,7 @@ YAML uses dots as readable separators in `mcp.<server>.<tool>` and `subagent.<ag
 | `unconfined_shell`       | bool (default `false`)     | Required when `allowed_tools` has `Bash` and `allowed_domains` or `roots` is set; a shell reaches any host and path, so those limits do not bind it. |
 | `on_parse_error`         | `fail \| retry_once`       | What the loop does when the model returns malformed JSON for a tool-call argument. `fail` terminates; `retry_once` feeds the parse error back as a tool-result message and loops once more. A second parse error always terminates.                  |
 
-Child-agent policy rules, enforced at pipeline load: a child cannot be **less** strict than its parent on `allow_mutations`, `allow_network` or `allow_context_writes`; a child's `max_subagent_depth` must be at most the parent's minus one; and when the parent declares `roots`, every child root must sit inside one of them. A subagent's `system` and `roots` templates are rendered with the parent node's context, and a rendered root outside the parent's roots is denied at call time.
+Child-agent policy rules are enforced at pipeline load. A child cannot be **less** strict than its parent on `allow_mutations`, `allow_network` or `allow_context_writes`. A child's `max_subagent_depth` must be at most the parent's minus one. When the parent declares `roots`, every child root must sit inside one of them. A subagent's `system` and `roots` templates are rendered with the parent node's context, and a rendered root outside the parent's roots is denied at call time.
 
 ## `mcp_servers`
 
@@ -243,10 +243,10 @@ The `url` must be `https://`, or `http://` to a loopback host, and an `https://`
 
 Array of `Node` entries. Each node:
 
-- `id: string` — required; unique within the pipeline and matching `[A-Za-z_][A-Za-z0-9_]*`, so `nodes.<id>` is writable in templates.
-- `kind: agent | shell` — required; determines which fields follow.
-- `needs: [string]` — optional; ids of nodes this node depends on. Drives DAG scheduling.
-- `timeout: integer` — optional; per-node wall-clock cap in seconds, greater than zero (`timeout: 0` is rejected). This is the only wall-clock limit; there is none on the agent policy. When elapsed, the node is cancelled and `Event::NodeTimedOut` fires; `node_finished.failure` carries `kind: timed_out`.
+- `id: string`: required. Must be unique within the pipeline and match `[A-Za-z_][A-Za-z0-9_]*`, so `nodes.<id>` is writable in templates.
+- `kind: agent | shell`: required. Determines which fields follow.
+- `needs: [string]`: optional. Ids of nodes this node depends on. Drives DAG scheduling.
+- `timeout: integer`: optional per-node wall-clock cap in seconds, greater than zero (`timeout: 0` is rejected). This is the only wall-clock limit, and there is none on the agent policy. When elapsed, the node is cancelled and `Event::NodeTimedOut` fires, and `node_finished.failure` carries `kind: timed_out`.
 
 ### `kind: agent`
 
@@ -296,7 +296,7 @@ The command must not be empty. The child starts with a cleared environment holdi
 
 For subprocess invocations **inside** an agent loop, use the `Bash` tool (which *is* policy-gated). `kind: shell` exists for deterministic pipeline steps that don't need a model.
 
-> **Policy note.** `kind: shell` runs entirely outside the agent strictness sandbox. It does **not** consult any agent's `allow_mutations`, `allow_network`, `allowed_domains`, `blocked_domains`, or any other tool-effect gate — those policies apply only to tool calls dispatched by an `agent` node's loop. A shell node can read or write any path the orno process can reach, open arbitrary network sockets, and exec any program on `PATH`, subject only to the OS-level permissions of the orno process itself. Treat the `command` and `args` fields as fully privileged: render-time templating is the boundary, and a value reaching them must already be trusted (a literal, a `{{ vars.* }}` from a vetted pipeline, or a `{{ nodes.<id>.* }}` whose upstream output you control). For untrusted-input subprocesses, route them through an `agent` node with `Bash` in `allowed_tools` so the strictness contract applies.
+> **Policy note.** `kind: shell` runs entirely outside the agent strictness sandbox. It does **not** consult any agent's `allow_mutations`, `allow_network`, `allowed_domains`, `blocked_domains`, or any other tool-effect gate. Those policies apply only to tool calls dispatched by an `agent` node's loop. A shell node can read or write any path the orno process can reach, open arbitrary network sockets, and exec any program on `PATH`, subject only to the OS-level permissions of the orno process itself. Treat the `command` and `args` fields as fully privileged: render-time templating is the boundary, and a value reaching them must already be trusted (a literal, a `{{ vars.* }}` from a vetted pipeline, or a `{{ nodes.<id>.* }}` whose upstream output you control). For untrusted-input subprocesses, route them through an `agent` node with `Bash` in `allowed_tools` so the strictness contract applies.
 
 ## Templates
 
@@ -329,7 +329,7 @@ Template context:
 
 There is no `nodes.<id>.status`: a node whose upstream failed is skipped, never rendered.
 
-Shell nodes do not expose `.output`; agent nodes do not expose `.stdout` / `.stderr` / `.exit_code`. Referencing the wrong channel is a template-render error.
+Shell nodes do not expose `.output`, and agent nodes do not expose `.stdout` / `.stderr` / `.exit_code`. Referencing the wrong channel is a template-render error.
 
 ## Effect-class reference
 
@@ -348,8 +348,8 @@ See [tools.md](tools.md#effect-classes) for the full effect-class semantics and 
 
 Blocking behavior:
 
-- Violation of a precondition on a builtin (effect class, or a URL outside the domain lists) → emit `Event::ToolDenied` with a reason and feed a `denied: ...` result back to the model. The loop continues with the denial in context.
-- Calling a tool not in `allowed_tools` → **terminate the node** with `AgentError::UnknownToolCalled` (strict; no retry). No dedicated event is emitted; the node ends with `node_finished { ok: false }`.
+- A violated precondition on a builtin (effect class, or a URL outside the domain lists) emits `Event::ToolDenied` with a reason and feeds a `denied: ...` result back to the model. The loop continues with the denial in context.
+- Calling a tool not in `allowed_tools` **terminates the node** with `AgentError::UnknownToolCalled` (strict, no retry). No dedicated event is emitted, and the node ends with `node_finished { ok: false }`.
 
 ## Validation
 
@@ -357,9 +357,9 @@ Blocking behavior:
 
 - The file parses against the schema. **Unknown keys are rejected** at every level (top level, nodes, agents, `policy`, `mcp_servers`), with the key and node id in the error.
 - `version` equals the version this build supports.
-- Node ids match `[A-Za-z_][A-Za-z0-9_]*`; `timeout: 0` and an empty shell `command` are rejected.
+- Node ids match `[A-Za-z_][A-Za-z0-9_]*`. `timeout: 0` and an empty shell `command` are rejected.
 - Every `nodes[*].agent` references an entry in `agents:`.
-- Every `subagent.<name>` in `allowed_tools` references an entry in `agents:`; every `mcp.<server>.<tool>` and `mcp.<server>.*` references a key in `mcp_servers:`; every other entry is a known builtin.
+- Every `subagent.<name>` in `allowed_tools` references an entry in `agents:`. Every `mcp.<server>.<tool>` and `mcp.<server>.*` references a key in `mcp_servers:`. Every other entry is a known builtin.
 - Budgets: `max_iterations > 0`, `max_total_tokens > 0`, and `max_tool_calls > 0` when `allowed_tools` is non-empty.
 - Effect gates: each builtin's required `allow_*` flag is on (see [effect classes](#effect-class-reference)).
 - `Bash` together with a non-empty `allowed_domains` or `roots` requires `unconfined_shell: true`.
@@ -370,7 +370,7 @@ Blocking behavior:
 - Child-agent policies compose down: no more permissive than their parents' on the `allow_*` flags, `max_subagent_depth` at most the parent's minus one, roots inside the parent's roots.
 - Every template compiles, and `nodes.<id>` reads name a transitive `needs:` ancestor.
 
-`Read`/`Write`/`Edit` with empty `roots` is not caught here; it fails at run start with `AgentError::InvalidPolicy`.
+`Read`/`Write`/`Edit` with empty `roots` is not caught here. It fails at run start with `AgentError::InvalidPolicy`.
 
 A failure surfaces as `PipelineError` and exits non-zero with a description on stderr. No events are emitted.
 
@@ -405,8 +405,8 @@ See `examples/pr-review/`, `examples/flaky-test-triage/`, and `examples/release-
 
 ## See also
 
-- [CLI](cli.md) — every subcommand and its flags.
-- [Tools](tools.md) — per-tool argument schemas and effect classes.
-- [Events](events.md) — the wire format the pipeline emits.
-- [Errors](errors.md) — typed errors raised on invalid YAML or invalid graphs.
-- [Environment variables](env-vars.md) — names orno reads at the runtime boundary.
+- [CLI](cli.md): every subcommand and its flags.
+- [Tools](tools.md): per-tool argument schemas and effect classes.
+- [Events](events.md): the wire format the pipeline emits.
+- [Errors](errors.md): typed errors raised on invalid YAML or invalid graphs.
+- [Environment variables](env-vars.md): names orno reads at the runtime boundary.

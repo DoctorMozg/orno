@@ -1,8 +1,8 @@
 # Error reference
 
-orno's public error surface is a fixed set of `thiserror` enums in `orno-core::error`. Every enum is `#[non_exhaustive]` — consumers must accept that new variants may appear in future releases without that being a breaking change.
+orno's public error surface is a fixed set of `thiserror` enums in `orno-core::error`. Every enum is `#[non_exhaustive]`, so new variants can appear in future releases without that counting as a breaking change. Consumers must allow for them.
 
-This page enumerates each enum's variants and the conditions that produce them. Failures that surface on the user-facing event log are typed in [`events.md`](events.md) — `NodeFailure` and `LlmFailure` mirror these enums for wire emission.
+This page enumerates each enum's variants and the conditions that produce them. Failures that surface on the user-facing event log are typed in [`events.md`](events.md). `NodeFailure` and `LlmFailure` mirror these enums for wire emission.
 
 ## `CoreError`
 
@@ -34,7 +34,7 @@ Failures discovered while loading or validating a pipeline YAML.
 
 ## `NodeError`
 
-Failures from the node executor's dispatch path. Surface as `NodeFailure::ExecutorError` on the event log.
+Failures from the node executor's dispatch path. They surface as `NodeFailure::ExecutorError` on the event log.
 
 | Variant          | Fields                                                              | Cause                                                                                                         |
 | ---------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -44,7 +44,7 @@ Failures from the node executor's dispatch path. Surface as `NodeFailure::Execut
 
 ## `AgentError`
 
-Failures from the agent loop. Each variant maps to one of the [five strictness dimensions](../glossary.md#the-five-strictness-dimensions) or to a tool/LLM-source failure surfaced through the loop.
+Failures from the agent loop. Each variant maps to one of the [five strictness dimensions](../glossary.md#the-five-strictness-dimensions) or to a tool or LLM failure surfaced through the loop.
 
 | Variant                  | Fields                                              | Cause                                                                                                                                                                  |
 | ------------------------ | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -74,7 +74,7 @@ Failures from the `LlmTransport` seam. Mirrored to `LlmFailure` on the event wir
 
 ## `ToolError`
 
-Failures from a `ToolHandler::invoke` call. `ToolError::is_recoverable()` decides what the agent loop does next: recoverable errors are fed back to the model as an `error: <message>` tool result and the loop continues; every other variant terminates the node as `AgentError::Tool`.
+Failures from a `ToolHandler::invoke` call. `ToolError::is_recoverable()` decides what the agent loop does next: recoverable errors are fed back to the model as an `error: <message>` tool result and the loop continues. Every other variant terminates the node as `AgentError::Tool`.
 
 | Variant         | Fields                                                              | Recoverable | Cause                                                                                                                                              |
 | --------------- | ------------------------------------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -87,7 +87,7 @@ Failures from a `ToolHandler::invoke` call. `ToolError::is_recoverable()` decide
 
 ### `RecoverableKind`
 
-Serialized as snake_case. Matched on by the tapes, so a replayed recoverable failure keeps its kind.
+Serialized as snake_case. The tapes match on it, so a replayed recoverable failure keeps its kind.
 
 | Kind            | Raised by                                                                                       |
 | --------------- | ----------------------------------------------------------------------------------------------- |
@@ -111,6 +111,6 @@ Failures from the MCP client.
 
 ## See also
 
-- [Events](events.md) — `NodeFailure` and `LlmFailure` mirror this surface for wire-format emission.
-- [Exit codes](exit-codes.md) — process-level discriminators.
-- [Five strictness dimensions](../glossary.md#the-five-strictness-dimensions) — the contract violations behind most `AgentError` variants.
+- [Events](events.md): `NodeFailure` and `LlmFailure` mirror this surface for wire-format emission.
+- [Exit codes](exit-codes.md): process-level discriminators.
+- [Five strictness dimensions](../glossary.md#the-five-strictness-dimensions): the contract violations behind most `AgentError` variants.

@@ -1,6 +1,6 @@
 # Event reference
 
-`orno run` emits a stream of NDJSON events on **stdout** — one envelope per line. The stream is the public, versioned wire format. Internal `tracing` JSON goes to **stderr** under a separate, unversioned schema; do not pipe the two into the same consumer.
+`orno run` emits a stream of NDJSON events on **stdout**, one envelope per line. The stream is the public, versioned wire format. Internal `tracing` JSON goes to **stderr** under a separate, unversioned schema, so don't pipe the two into the same consumer.
 
 This page documents the envelope, every `Event` variant, and the typed failure payloads.
 
@@ -24,7 +24,7 @@ Every event is wrapped in:
 | `timestamp`      | string      | RFC 3339 UTC instant (`time::serde::rfc3339`). Joinable with stderr `tracing` lines on wall clock.   |
 | `event`          | object      | Internally-tagged variant — `event.type` discriminates.                                              |
 
-`Event` is `#[non_exhaustive]` — replay consumers must tolerate unknown `type` values rather than rejecting the stream. New variants land in minor releases without bumping `schema_version`; the version increments only when an existing variant's shape changes.
+`Event` is `#[non_exhaustive]`, so replay consumers must tolerate unknown `type` values rather than rejecting the stream. New variants land in minor releases without bumping `schema_version`. The version increments only when an existing variant's shape changes.
 
 ## Lifecycle events
 
@@ -77,7 +77,7 @@ Emitted just before a node's executor is invoked.
 
 ### `node_finished`
 
-Emitted after a node's executor returns (with success or failure).
+Emitted after a node's executor returns, with success or failure.
 
 ```json
 {
@@ -130,7 +130,7 @@ Paired with a subsequent `node_finished { ok: false, failure: { kind: "timed_out
 
 ### `node_output_truncated`
 
-Emitted when a `kind: shell` node's captured `stdout` or `stderr` exceeded the engine's `max_node_output_bytes` cap (default 8 MiB; tunable via `--max-node-output-bytes`). The captured prefix is preserved in `nodes.<id>.{stdout,stderr}`; the child keeps running so it does not block on a full pipe buffer (the overflow is drained to `/dev/null`). One envelope per truncated stream.
+Emitted when a `kind: shell` node's captured `stdout` or `stderr` exceeded the engine's `max_node_output_bytes` cap (default 8 MiB, tunable via `--max-node-output-bytes`). The captured prefix is preserved in `nodes.<id>.{stdout,stderr}`. The child keeps running so it does not block on a full pipe buffer, and the overflow is drained to `/dev/null`. One envelope per truncated stream.
 
 ```json
 {
@@ -170,11 +170,11 @@ Emitted at the start of each agent loop turn, before the LLM transport is called
 }
 ```
 
-`iteration` is 0-based — a single-shot agent emits exactly `iteration: 0`.
+`iteration` is 0-based, so a single-shot agent emits exactly `iteration: 0`.
 
 ### `llm_request_started`
 
-Emitted immediately before the transport is called. Carries provider/model identifiers and head-truncated, redacted excerpts of the rendered prompt.
+Emitted immediately before the transport is called. Carries provider and model identifiers, plus head-truncated, redacted excerpts of the rendered prompt.
 
 ```json
 {
@@ -190,7 +190,7 @@ Emitted immediately before the transport is called. Carries provider/model ident
 
 `system_excerpt` is `null` (not `""`) when the agent declared no system prompt.
 
-Excerpts are bounded by the engine's excerpt cap and pass through the per-run redactor — `secrets.*` values never reach the wire.
+Excerpts are bounded by the engine's excerpt cap and pass through the per-run redactor, so `secrets.*` values never reach the wire.
 
 ### `llm_response_received`
 
@@ -258,7 +258,7 @@ Emitted when a tool call is denied by the policy gate (mutation/network/context-
 }
 ```
 
-Non-terminal — the loop continues with the denial fed back to the model. Always paired with a `tool_call_recorded` carrying the same denial string.
+Non-terminal. The loop continues with the denial fed back to the model. Always paired with a `tool_call_recorded` carrying the same denial string.
 
 ## Subagent events
 
@@ -309,7 +309,7 @@ Emitted when a subagent dispatch returns `AgentError`. The `error` field is the 
 }
 ```
 
-The parent loop still feeds the failure back to its LLM as a denial-style `ToolResult` string; this event records the structured observability trail.
+The parent loop still feeds the failure back to its LLM as a denial-style `ToolResult` string. This event records the structured observability trail.
 
 ### `subagent_depth_exceeded`
 
@@ -326,7 +326,7 @@ Emitted when a subagent dispatch attempt would exceed `max_subagent_depth`. The 
 }
 ```
 
-Non-terminal — the parent's loop continues with a denial.
+Non-terminal. The parent's loop continues with a denial.
 
 ## MCP events
 
@@ -393,7 +393,7 @@ Emitted immediately after a `tools/call` returns.
 }
 ```
 
-`ok: false` discriminates server-reported tool errors from successful calls; the `output_excerpt` carries the error message in that case.
+`ok: false` discriminates server-reported tool errors from successful calls, and `output_excerpt` carries the error message in that case.
 
 ### `mcp_server_shutting_down`
 
@@ -461,16 +461,16 @@ Carried on `llm_request_failed.failure`. Internally tagged on `kind`, `#[non_exh
 
 Every excerpt field on the wire is processed in this order before emission:
 
-1. **Redaction.** `secrets.*` values that appear in the rendered text are replaced with `***`. Name-based — anything classified as a secret is redacted regardless of source. The redactor is per-run and applied in the agent loop before the event leaves the process.
-2. **Truncation.** Bodies are head-truncated at the engine's `max_output_bytes` cap (default 2 KB; 64 KB with `--verbose`; explicit `--stderr-tail-bytes` always wins). The truncated form is suffixed with a single `…` character on a UTF-8 boundary.
+1. **Redaction.** `secrets.*` values that appear in the rendered text are replaced with `***`. Redaction is name-based, so anything classified as a secret is redacted regardless of source. The redactor is per-run and applied in the agent loop before the event leaves the process.
+2. **Truncation.** Bodies are head-truncated at the engine's `max_output_bytes` cap (default 2 KB, or 64 KB with `--verbose`). An explicit `--stderr-tail-bytes` always wins. The truncated form is suffixed with a single `…` character on a UTF-8 boundary.
 
-The cap applies to: prompt and system excerpts on `llm_request_started`, content excerpts on `llm_response_received`, input/output excerpts on `tool_call_recorded` and `mcp_tool_call_sent`/`completed`, `body_excerpt` on `llm_failure.api_error`, and shell `stderr_tail` on `node_payload_failure`.
+The cap applies to: prompt and system excerpts on `llm_request_started`, content excerpts on `llm_response_received`, input/output excerpts on `tool_call_recorded` and `mcp_tool_call_sent`/`completed`, `body_excerpt` on `llm_request_failed` (`failure.kind: api_error`), and shell `stderr_tail` on `node_payload_failure`.
 
 Stderr tails truncate from the **front** (the relevant signal sits at the end of stderr). HTTP error bodies and prompt/response excerpts truncate from the **back** (the actionable signal sits at the start of those payloads).
 
 ## See also
 
-- [CLI › `orno run`](cli.md#orno-run) — how to capture and replay event streams.
-- [Errors](errors.md) — typed error enums that mirror `NodeFailure` and `LlmFailure` on the internal API.
-- [Exit codes](exit-codes.md) — process exit code semantics and how `run_finished.ok` maps to them.
-- [Tools](tools.md) — what fires `tool_call_recorded`, `tool_denied`, and the MCP envelope variants.
+- [CLI › `orno run`](cli.md#orno-run): how to capture and replay event streams.
+- [Errors](errors.md): typed error enums that mirror `NodeFailure` and `LlmFailure` on the internal API.
+- [Exit codes](exit-codes.md): process exit code semantics and how `run_finished.ok` maps to them.
+- [Tools](tools.md): what fires `tool_call_recorded`, `tool_denied`, and the MCP envelope variants.
