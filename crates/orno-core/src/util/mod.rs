@@ -1,6 +1,7 @@
 //! Small utilities used by more than one subsystem and not large enough
 //! to warrant their own module.
 
+pub(crate) mod child_guard;
 pub mod tape;
 
 pub use tape::{TapeReader, TapeWriter};

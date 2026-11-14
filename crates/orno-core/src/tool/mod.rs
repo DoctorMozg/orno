@@ -5,6 +5,7 @@
 
 pub mod bash;
 pub mod edit;
+mod fs_util;
 pub mod mcp_handler;
 pub mod net_guard;
 mod path_guard;

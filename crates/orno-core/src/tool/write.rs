@@ -1,7 +1,6 @@
 //! `Write` tool — write a file. Requires `allow_mutations`.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -9,7 +8,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, instrument};
 
-use super::path_guard::jail_path;
+use super::fs_util::{atomic_write, run_blocking};
+use super::path_guard::jail_file;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -59,7 +59,7 @@ impl ToolHandler for WriteHandler {
         // violation independent of the actual file content (F1).
         // BS1: fail closed when roots is empty — no boundary, no write.
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
+            jail_file(root, &path).await?
         } else {
             return Err(ToolError::Denied {
                 reason: "Write tool requires a non-empty `roots` list; \
@@ -68,45 +68,12 @@ impl ToolHandler for WriteHandler {
             });
         };
 
-        if let Some(parent) = resolved.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| ToolError::Invocation {
-                name: "Write".to_string(),
-                source: Box::new(e),
-            })?;
-        }
-
-        // Atomic write: stage in a sibling temp file and rename onto
-        // the target. Avoids leaving a half-written file on a crash and
-        // closes the read-after-truncate window where another reader
-        // can observe the file as empty between the truncate and the
-        // final flush.
-        let parent_dir = resolved.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp =
-            tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| ToolError::Invocation {
-                name: "Write".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.as_file_mut()
-            .write_all(content.as_bytes())
-            .map_err(|e| ToolError::Invocation {
-                name: "Write".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.as_file()
-            .sync_all()
-            .map_err(|e| ToolError::Invocation {
-                name: "Write".to_string(),
-                source: Box::new(e),
-            })?;
-        temp.persist(&resolved).map_err(|e| ToolError::Invocation {
-            name: "Write".to_string(),
-            source: Box::new(e.error),
-        })?;
-
+        let target = resolved.clone();
         let bytes = content.len();
+        run_blocking("Write", move || {
+            atomic_write("Write", &target, content.as_bytes())
+        })
+        .await?;
         debug!(file.path = %resolved.display(), file.bytes = bytes, call_id = %inv.call_id, "wrote file");
         Ok(format!("Wrote {bytes} bytes to {}", resolved.display()))
     }
@@ -280,5 +247,51 @@ mod tests {
 
         let written = std::fs::read_to_string(&nested).expect("read back");
         assert_eq!(written, "ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_under_escaping_symlink_is_denied_and_creates_nothing() {
+        let root = TempDir::new().expect("create root");
+        let outside = TempDir::new().expect("create outside");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).expect("symlink");
+        let roots = vec![root.path().to_path_buf()];
+
+        let err = WriteHandler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": "link/sub/new.txt", "content": "evil" }),
+            )
+            .await
+            .expect_err("symlink escape must be denied");
+
+        assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "nothing may be created outside the root",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overwrite_keeps_executable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().expect("create tempdir");
+        let path = tmp.path().join("run.sh");
+        std::fs::write(&path, "#!/bin/sh\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let roots = vec![tmp.path().to_path_buf()];
+
+        WriteHandler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": "run.sh", "content": "#!/bin/sh\necho hi\n" }),
+            )
+            .await
+            .expect("overwrite succeeds");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

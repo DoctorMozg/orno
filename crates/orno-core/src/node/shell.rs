@@ -12,18 +12,16 @@
 //! buffer (the overflow is drained to `/dev/null`). This is the only
 //! built-in defense against a node that prints unbounded output.
 
-use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 use tracing::{instrument, warn};
 
 use crate::error::NodeError;
 use crate::events::{Event, EventSink};
+use crate::util::child_guard::{Capture, ChildGuard, Collected};
 
 use super::{NodeExecutor, NodeRequest, NodeResponse, ShellNodeRequest};
 
@@ -34,11 +32,6 @@ use super::{NodeExecutor, NodeRequest, NodeResponse, ShellNodeRequest};
 /// `engine_default_node_output_cap_matches_shell_executor` test in
 /// `execution::scheduler::tests`.
 pub const DEFAULT_MAX_NODE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-
-/// Pipe drain buffer size. A 16 KB read fits in a typical pipe buffer
-/// (64 KiB on Linux, 16 KiB on macOS) so the child rarely blocks
-/// waiting for the reader.
-const READ_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Allowlist of environment variable names propagated from the orno
 /// process into a shell node child. Everything else is stripped by
@@ -119,16 +112,11 @@ impl NodeExecutor for ShellExecutor {
             });
         };
 
-        // kill_on_drop keeps the child tree from outliving orno if the
-        // parent process is interrupted. stdin defaults to `Stdio::null()`
-        // so a child reading stdin cannot hang the pipeline in CI; it is
-        // upgraded to `Stdio::piped()` only when the node declares a
-        // stdin payload.
+        // stdin is null unless the node declares a payload, so a child
+        // reading stdin cannot hang the pipeline in CI. `ChildGuard` owns
+        // process-group cleanup and the output readers.
         let mut cmd = Command::new(&command);
-        cmd.args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.args(&args);
 
         // Defense against secret leakage: a child inheriting the orno
         // process's full environment can see API keys, MCP bearer
@@ -148,67 +136,39 @@ impl NodeExecutor for ShellExecutor {
             cmd.env(k, v);
         }
 
-        if stdin.is_some() {
-            cmd.stdin(Stdio::piped());
-        } else {
-            cmd.stdin(Stdio::null());
-        }
-
-        let mut child = cmd.spawn().map_err(|e| NodeError::Execution {
+        let to_node_err = |e: std::io::Error| NodeError::Execution {
             id: id.to_string(),
             source: Box::new(e),
-        })?;
-
-        // When a stdin payload is present, drive it from a concurrent
-        // task so the parent can drain stdout/stderr at the same time.
-        // Writing stdin inline would deadlock against a child that
-        // produces enough output to fill its pipe buffer before it
-        // finishes reading stdin. A broken-pipe write is expected
-        // whenever the child exits before consuming everything (e.g.
-        // `head`) — log and move on; the child's own exit code tells
-        // the real story.
-        let writer_handle = if let Some(payload) = stdin {
-            let mut child_stdin = child.stdin.take().expect("stdin was piped");
-            Some(tokio::spawn(async move {
-                let res = child_stdin.write_all(payload.as_bytes()).await;
-                drop(child_stdin.shutdown().await);
-                res
-            }))
-        } else {
-            None
         };
-
-        // Take the pipes before awaiting — `child.wait()` consumes the
-        // handle and would also drop the pipe ends, defeating the
-        // concurrent-drain pattern.
-        let stdout_pipe = child.stdout.take().expect("stdout was piped");
-        let stderr_pipe = child.stderr.take().expect("stderr was piped");
-
         let cap = self.cap;
-        let stdout_handle = tokio::spawn(read_capped(stdout_pipe, cap));
-        let stderr_handle = tokio::spawn(read_capped(stderr_pipe, cap));
-
-        let status = child.wait().await.map_err(|e| NodeError::Execution {
-            id: id.to_string(),
-            source: Box::new(e),
-        })?;
-
-        let (stdout_buf, stdout_total) = join_pipe_handle(stdout_handle, id, "stdout").await?;
-        let (stderr_buf, stderr_total) = join_pipe_handle(stderr_handle, id, "stderr").await?;
-
-        if let Some(handle) = writer_handle {
-            match handle.await {
-                Ok(Ok(())) => {},
-                Ok(Err(err)) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                    warn!(node.id = %id, "child closed stdin before full payload written");
+        let Collected {
+            status,
+            stdout:
+                Capture {
+                    bytes: stdout_buf,
+                    total: stdout_total,
                 },
-                Ok(Err(err)) => {
-                    warn!(node.id = %id, error = %err, "stdin writer failed");
+            stderr:
+                Capture {
+                    bytes: stderr_buf,
+                    total: stderr_total,
                 },
-                Err(join_err) => {
-                    warn!(node.id = %id, error = %join_err, "stdin writer task panicked");
-                },
-            }
+            stdin_error,
+        } = ChildGuard::spawn(&mut cmd, stdin)
+            .map_err(to_node_err)?
+            .run_capped(cap)
+            .await
+            .map_err(to_node_err)?;
+
+        // A broken pipe is expected whenever the child exits before
+        // consuming everything (e.g. `head`); the exit code tells the
+        // real story.
+        match stdin_error {
+            Some(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                warn!(node.id = %id, "child closed stdin before full payload written");
+            },
+            Some(err) => warn!(node.id = %id, error = %err, "stdin writer failed"),
+            None => {},
         }
 
         // Emit one envelope per truncated stream. The cap is reported
@@ -242,30 +202,6 @@ impl NodeExecutor for ShellExecutor {
             }),
         })
     }
-}
-
-/// Resolve a pipe-reader join handle into the captured bytes and the
-/// child's total write count, mapping both the join failure and the
-/// inner I/O failure into a `NodeError::Execution` keyed on the node
-/// id. `stream` names the pipe in the panic message so the failure
-/// surface keeps stdout / stderr distinguishable.
-async fn join_pipe_handle(
-    handle: JoinHandle<std::io::Result<(Vec<u8>, usize)>>,
-    id: &str,
-    stream: &str,
-) -> Result<(Vec<u8>, usize), NodeError> {
-    handle
-        .await
-        .map_err(|e| NodeError::Execution {
-            id: id.to_string(),
-            source: Box::new(std::io::Error::other(format!(
-                "{stream} reader task panicked: {e}",
-            ))),
-        })?
-        .map_err(|e| NodeError::Execution {
-            id: id.to_string(),
-            source: Box::new(e),
-        })
 }
 
 /// Log and emit a single `NodeOutputTruncated` envelope for one of the
@@ -303,85 +239,6 @@ async fn emit_truncation(
         cap_bytes: cap as u64,
     })
     .await;
-}
-
-/// Stream a child pipe into a `Vec<u8>` capped at `cap` bytes. Returns
-/// `(captured_buffer, total_bytes_written_by_child)`. Past the cap, the
-/// reader keeps draining the pipe to a scratch buffer so the child does
-/// not block on a full PIPE — the overflow bytes are counted but
-/// discarded. Truncates the captured buffer on a UTF-8 boundary to
-/// avoid splitting a multi-byte sequence; the truncation point stays at
-/// `<= cap`.
-async fn read_capped<R>(mut pipe: R, cap: usize) -> std::io::Result<(Vec<u8>, usize)>
-where
-    R: AsyncReadExt + Unpin + Send,
-{
-    let mut captured: Vec<u8> = Vec::with_capacity(cap.min(READ_CHUNK_BYTES));
-    let mut total: usize = 0;
-    let mut scratch = vec![0u8; READ_CHUNK_BYTES];
-
-    loop {
-        let n = pipe.read(&mut scratch).await?;
-        if n == 0 {
-            break;
-        }
-        total += n;
-        if captured.len() < cap {
-            let remaining = cap - captured.len();
-            let take = remaining.min(n);
-            captured.extend_from_slice(&scratch[..take]);
-        }
-        // After the cap, captured stays put and `total` keeps climbing.
-    }
-
-    // Walk back to the nearest UTF-8 boundary. `from_utf8_lossy` can
-    // tolerate a mid-sequence split (it produces U+FFFD), but the
-    // event reports the captured slice's exact byte count, so we
-    // prefer to land on a boundary so downstream consumers do not see
-    // a phantom replacement char in the captured stdout/stderr.
-    if captured.len() == cap {
-        let mut end = captured.len();
-        while end > 0 {
-            // A continuation byte has the high bits 10xxxxxx.
-            if (captured[end - 1] & 0b1100_0000) == 0b1000_0000 {
-                end -= 1;
-            } else {
-                break;
-            }
-        }
-        // If we walked back past a leading byte that takes more bytes
-        // than we have, drop that leading byte too. `start_byte_len`
-        // returns the expected sequence length 1..=4.
-        if end > 0 && (captured[end - 1] & 0b1000_0000) != 0 {
-            let lead = captured[end - 1];
-            let expected = utf8_lead_byte_len(lead);
-            let have = captured.len() - end + 1;
-            if expected > have {
-                end -= 1;
-            }
-        }
-        captured.truncate(end);
-    }
-
-    Ok((captured, total))
-}
-
-/// Decode the expected length of a UTF-8 sequence given its leading
-/// byte. Returns 1 for ASCII / invalid leads (which then fall through
-/// to a single-byte truncation), so the caller never reads past
-/// `captured.len()`.
-fn utf8_lead_byte_len(b: u8) -> usize {
-    if b & 0b1000_0000 == 0 {
-        1
-    } else if b & 0b1110_0000 == 0b1100_0000 {
-        2
-    } else if b & 0b1111_0000 == 0b1110_0000 {
-        3
-    } else if b & 0b1111_1000 == 0b1111_0000 {
-        4
-    } else {
-        1
-    }
 }
 
 /// Extract the terminating signal number from a child process exit
@@ -789,24 +646,48 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn sh_node(script: String) -> NodeRequest {
+        NodeRequest::Shell(ShellNodeRequest {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            stdin: None,
+            env: BTreeMap::new(),
+        })
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn read_capped_keeps_utf8_boundary_on_truncation() {
-        // A buffer containing a multi-byte UTF-8 char straddling the
-        // cap boundary must be truncated *before* the leading byte so
-        // the captured slice is valid UTF-8 by itself. Synthetic — no
-        // process spawned — to pin the boundary logic in isolation.
-        // "h" + "é" (2 bytes 0xC3 0xA9) + "llo" = 6 bytes total.
-        let cap = 4;
-        let stream = std::io::Cursor::new(b"h\xC3\xA9llo".to_vec());
-        let (buf, total) = read_capped(stream, cap).await.expect("read succeeds");
-        assert_eq!(total, 6, "total counts every byte the source wrote");
-        // After UTF-8 alignment, the captured prefix must round-trip
-        // through `from_utf8` cleanly. The contract is "valid UTF-8
-        // and length <= cap", not "exactly cap bytes".
+    async fn background_grandchild_does_not_hang_the_node() {
+        let exec = ShellExecutor::default();
+        let run = exec.execute("run_test", "bg", sh_node("sleep 100 & echo hi".into()));
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("node must not wait for the grandchild")
+            .unwrap();
+
+        assert_eq!(resp.output["stdout"], json!("hi\n"));
+        assert_eq!(resp.output["exit_code"], json!(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_node_leaves_no_grandchild() {
+        use crate::util::child_guard::test_support::{read_pid_file, wait_until_gone};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let script = format!("sleep 100 & echo $! > {}; wait", pid_file.display());
+
+        let exec = ShellExecutor::default();
+        let run = exec.execute("run_test", "slow", sh_node(script));
+        // Mirrors the scheduler's node `timeout:`, which drops the future.
+        let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), run).await;
+        assert!(timed_out.is_err(), "node should still be running");
+
+        let pid = read_pid_file(&pid_file).await;
         assert!(
-            std::str::from_utf8(&buf).is_ok(),
-            "captured bytes must be valid UTF-8: {buf:?}",
+            wait_until_gone(pid).await,
+            "grandchild {pid} survived the timeout"
         );
-        assert!(buf.len() <= cap, "captured length never exceeds cap");
     }
 }

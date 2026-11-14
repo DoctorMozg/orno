@@ -7,6 +7,13 @@ once the first tagged release ships.
 
 ## Unreleased
 
+### Security
+
+- `Read` / `Write` / `Edit` no longer follow a symlinked directory out
+  of the root when the target does not exist yet (`link/new.txt` with
+  `link -> /elsewhere`), and relative paths resolve against the root
+  instead of the process cwd.
+
 ### Added
 
 - Optional per-server `call_timeout_secs` on `mcp_servers` entries
@@ -25,6 +32,19 @@ once the first tagged release ships.
 - `orno run` emits `run_finished { ok: false }` when the DAG walker or
   the `vars:` render fails before the first node, and engine errors no
   longer skip MCP shutdown or tape flushing.
+
+### Fixed
+
+- `Read`, `Write` and `Edit` reject FIFOs, devices and directories
+  instead of hanging, and run their file I/O off the async workers.
+- `Write` and `Edit` keep the target's permissions (a 0755 script stays
+  0755).
+- `Read` decodes invalid UTF-8 lossily for files of every size.
+- Shell nodes and `Bash` run in their own process group and SIGKILL it on
+  exit, timeout or cancellation, so a background grandchild neither hangs
+  the node on the inherited pipes nor outlives a timeout.
+- Capped shell and `Bash` output no longer collapses to empty when it
+  ends in stray UTF-8 continuation bytes.
 
 ### Removed
 

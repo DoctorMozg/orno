@@ -130,6 +130,10 @@ lru = { version = "0.18", default-features = false }
 # level so both crates share the same version.
 tempfile = "3"
 
+# Process-group SIGKILL for `ChildGuard`; `unsafe_code = "forbid"` rules out
+# raw libc. Already in the tree via tempfile.
+rustix = { version = "1.1", default-features = false, features = ["std", "process"] }
+
 # Testing
 assert_cmd = "2"
 insta = { version = "1", features = ["yaml"] }

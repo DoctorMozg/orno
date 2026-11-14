@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::instrument;
 
-use super::path_guard::jail_path;
+use super::fs_util::run_blocking;
+use super::path_guard::jail_file;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::ToolError;
 
@@ -61,7 +62,7 @@ impl ToolHandler for ReadHandler {
             })?;
 
         let resolved: PathBuf = if let Some(root) = inv.roots.first() {
-            jail_path(root, &path)?
+            jail_file(root, &path).await?
         } else {
             // BS1: empty roots means no jail boundary — refuse rather than
             // allowing unrestricted host filesystem access.
@@ -72,37 +73,31 @@ impl ToolHandler for ReadHandler {
             });
         };
 
-        let metadata = std::fs::metadata(&resolved).map_err(|e| ToolError::Invocation {
-            name: "Read".to_string(),
-            source: Box::new(e),
-        })?;
-
-        if metadata.len() > MAX_READ_BYTES {
-            // Stream-read only the cap so a giant file does not pin
-            // 10 MiB plus the rest in RSS while we copy.
-            let cap = usize::try_from(MAX_READ_BYTES).expect("MAX_READ_BYTES=10MiB fits in usize");
-            let mut buf = Vec::with_capacity(cap);
-            std::fs::File::open(&resolved)
-                .and_then(|f| f.take(MAX_READ_BYTES).read_to_end(&mut buf).map(|_| ()))
-                .map_err(|e| ToolError::Invocation {
-                    name: "Read".to_string(),
-                    source: Box::new(e),
-                })?;
-            let mut content = String::from_utf8_lossy(&buf).into_owned();
-            let _ = write!(
-                content,
-                "\n[truncated: file is {} bytes, showing first {} bytes]",
-                metadata.len(),
-                MAX_READ_BYTES,
-            );
-            return Ok(content);
-        }
-
-        std::fs::read_to_string(&resolved).map_err(|err| ToolError::Invocation {
-            name: "Read".to_string(),
-            source: Box::new(err),
-        })
+        run_blocking("Read", move || read_capped_lossy(&resolved)).await
     }
+}
+
+/// Read up to `MAX_READ_BYTES` and decode lossily, so invalid UTF-8
+/// behaves the same for small and large files.
+fn read_capped_lossy(path: &Path) -> Result<String, ToolError> {
+    let invocation = |e: std::io::Error| ToolError::Invocation {
+        name: "Read".to_string(),
+        source: Box::new(e),
+    };
+    let file = std::fs::File::open(path).map_err(invocation)?;
+    let file_len = file.metadata().map_err(invocation)?.len();
+    let mut buf = Vec::new();
+    file.take(MAX_READ_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(invocation)?;
+    let mut content = String::from_utf8_lossy(&buf).into_owned();
+    if file_len > MAX_READ_BYTES {
+        let _ = write!(
+            content,
+            "\n[truncated: file is {file_len} bytes, showing first {MAX_READ_BYTES} bytes]",
+        );
+    }
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -202,5 +197,60 @@ mod tests {
             matches!(err, ToolError::Denied { .. }),
             "expected Denied when roots is empty, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn relative_path_reads_root_copy_not_cwd_copy() {
+        // The test cwd (the crate dir) also contains a Cargo.toml.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "root copy").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let out = ReadHandler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": "Cargo.toml" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "root copy");
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_decoded_lossily() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("bin.txt"), b"ok\xff\xfeend").unwrap();
+        let roots = vec![tmp.path().to_path_buf()];
+        let out = ReadHandler
+            .invoke(
+                ToolInvocation::for_test_with_roots("call-1", &roots),
+                json!({ "path": "bin.txt" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "ok\u{fffd}\u{fffd}end");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_is_rejected_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let roots = vec![tmp.path().to_path_buf()];
+        let call = ReadHandler.invoke(
+            ToolInvocation::for_test_with_roots("call-1", &roots),
+            json!({ "path": "pipe" }),
+        );
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), call)
+            .await
+            .expect("Read must not block on a FIFO")
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "got {err:?}");
     }
 }

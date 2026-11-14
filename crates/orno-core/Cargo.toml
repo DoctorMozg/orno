@@ -36,6 +36,9 @@ async-trait = "0.1"
 # rather than `[dev-dependencies]`.
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 rstest = { workspace = true }
 # Used in tests to capture and assert on `tracing::warn!` output from
