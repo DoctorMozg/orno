@@ -20,8 +20,8 @@ name: dogfood-self-review
 #   5. `OPENROUTER_API_KEY` is delivered via `--secrets-file` so the value
 #      lives only inside orno's secret store, gets redacted from every
 #      event, and never reaches a tool's environment. `GH_TOKEN` is in the
-#      step env (not the secrets file) because `gh pr comment` reads it via
-#      env-inheritance from the shell child orno spawns.
+#      step env; the `post_comment` shell node hands it to `gh` through its
+#      `env:` map because the shell executor clears the inherited env.
 
 on:
   pull_request:

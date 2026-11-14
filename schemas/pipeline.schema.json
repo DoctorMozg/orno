@@ -187,7 +187,7 @@
           "$ref": "#/$defs/OnParseError"
         },
         "roots": {
-          "description": "Filesystem roots the `Read` / `Write` / `Edit` builtins are\njailed to. When the agent's `allowed_tools` list contains any\nof those names, this list must be non-empty — `LoopAgent`\nrejects with `AgentError::InvalidPolicy` at run start.\nCurrently only `roots[0]` is consulted; multi-root agents are\na v0.2+ extension.",
+          "description": "Filesystem roots the `Read` / `Write` / `Edit` builtins are\njailed to. When the agent's `allowed_tools` list contains any\nof those names, this list must be non-empty — `LoopAgent`\nrejects with `AgentError::InvalidPolicy` at run start.\nCurrently only `roots[0]` is consulted; multi-root agents are\na v0.2+ extension.\n\nEach entry is rendered through the template engine at dispatch\ntime (the same context as `initial_prompt` and `system`), so\n`\"{{ env.WORKSPACE }}\"` is valid and resolves to the current\nvalue of that variable.",
           "type": "array",
           "default": [],
           "items": {
@@ -425,7 +425,7 @@
           "type": "string"
         },
         "env": {
-          "description": "Environment variable overrides for the spawned child. The\nexecutor clears the inherited environment, restores a small\nallowlist of safe variables (`PATH`, `HOME`, etc.), then\napplies these entries on top so per-node values shadow the\nallowlist. Operator-supplied — not rendered through the\ntemplate engine.",
+          "description": "Environment variable overrides for the spawned child. The\nexecutor clears the inherited environment, restores a small\nallowlist of safe variables (`PATH`, `HOME`, etc.), then\napplies these entries on top so per-node values shadow the\nallowlist. Values are rendered through the template engine\n(the same context as `command`, `args`, and `stdin`); keys\nare not rendered — they are identifiers.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

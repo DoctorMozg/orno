@@ -17,12 +17,10 @@ feature-depth = 1
 version = 2
 yanked  = "warn"
 ignore  = [
-    # RUSTSEC-2025-0026: lru HashMap aliasing UB under Stacked Borrows.
-    # lru is used for the template cache (pipeline/template.rs). The UB
-    # requires a specific Rust toolchain + aliasing analysis mode to trigger
-    # and does not affect orno's read-through cache usage pattern. Tracked
-    # for upgrade once lru >=0.16.3 stabilizes in the dependency graph.
-    "RUSTSEC-2026-0002",
+    # unsafe-libyaml is unmaintained (no fixed release). It arrives only via
+    # serde_yaml_ng, which parses operator-authored pipeline files; revisit
+    # when serde_yaml_ng moves to a maintained backend.
+    "RUSTSEC-2024-0449",
 ]
 
 # --- License policy (AGPL-3.0 project; only permissive deps allowed) ---

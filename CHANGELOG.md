@@ -7,6 +7,23 @@ once the first tagged release ships.
 
 ## Unreleased
 
+### Changed
+
+- `policy.roots` entries and shell-node `env:` values are rendered
+  through the template engine, so `{{ vars.* }}` / `{{ env.* }}` work
+  there.
+- `orno run` emits `run_finished { ok: false }` when the DAG walker or
+  the `vars:` render fails before the first node, and engine errors no
+  longer skip MCP shutdown or tape flushing.
+
+### Removed
+
+- `Event::BudgetExceeded` (never emitted; budget breaches surface as
+  `NodeFailure::BudgetExceeded` on `node_finished`).
+- `AgentError::SubagentDepthExceeded` and `LlmError::NotImplemented`
+  (never constructed).
+- The uncompiled `orno_core::config` module.
+
 ## 0.2.0 - 2026-05-03
 
 ### Security
