@@ -10,12 +10,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::path_guard::jail_path;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
-use crate::util::child_guard::{ChildGuard, Collected};
+use crate::error::{RecoverableKind, ToolError};
+use crate::util::child_guard::{ChildGuard, Collected, Finished};
 
 /// Default `timeout_secs` when the caller omits the field.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -163,29 +163,36 @@ impl ToolHandler for BashHandler {
             name: "Bash".to_string(),
             source: Box::new(e),
         })?;
-        // Dropping the timed-out future drops the guard, which kills the
-        // whole process group.
+        let finished = guard
+            .run_capped_within(
+                MAX_OUTPUT_BYTES_PER_STREAM,
+                Some(Duration::from_secs(timeout_secs)),
+            )
+            .await
+            .map_err(|e| ToolError::Invocation {
+                name: "Bash".to_string(),
+                source: Box::new(e),
+            })?;
         let Collected {
             status,
             stdout,
             stderr,
             ..
-        } = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            guard.run_capped(MAX_OUTPUT_BYTES_PER_STREAM),
-        )
-        .await
-        .map_err(|_| ToolError::Invocation {
-            name: "Bash".to_string(),
-            source: Box::new(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("command timed out after {timeout_secs}s"),
-            )),
-        })?
-        .map_err(|e| ToolError::Invocation {
-            name: "Bash".to_string(),
-            source: Box::new(e),
-        })?;
+        } = match finished {
+            Finished::Exited(collected) => collected,
+            Finished::TimedOut { stdout, stderr } => {
+                warn!(timeout_secs, "shell command timed out");
+                return Err(ToolError::Recoverable {
+                    name: "Bash".to_string(),
+                    kind: RecoverableKind::Timeout,
+                    message: format!(
+                        "command timed out after {timeout_secs}s\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&stdout.bytes),
+                        String::from_utf8_lossy(&stderr.bytes),
+                    ),
+                });
+            },
+        };
         let stdout_truncated = stdout.total > MAX_OUTPUT_BYTES_PER_STREAM;
         let stderr_truncated = stderr.total > MAX_OUTPUT_BYTES_PER_STREAM;
         let stdout = String::from_utf8_lossy(&stdout.bytes);
@@ -549,6 +556,26 @@ mod tests {
             .expect("Bash must not wait for the grandchild")
             .unwrap();
         assert!(out.contains("exit_code: 0") && out.contains("hi"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_is_recoverable_and_keeps_partial_output() {
+        let err = BashHandler
+            .invoke(
+                ToolInvocation::for_test("call-1"),
+                json!({ "command": "echo started; sleep 100", "timeout_secs": 1 }),
+            )
+            .await
+            .expect_err("command must time out");
+        assert!(
+            matches!(
+                &err,
+                ToolError::Recoverable { kind: RecoverableKind::Timeout, message, .. }
+                    if message.contains("started")
+            ),
+            "{err:?}",
+        );
     }
 
     #[cfg(unix)]

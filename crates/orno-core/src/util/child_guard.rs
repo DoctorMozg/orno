@@ -42,6 +42,17 @@ pub(crate) struct Collected {
     pub stdin_error: Option<std::io::Error>,
 }
 
+/// How [`ChildGuard::run_capped_within`] ended.
+#[derive(Debug)]
+pub(crate) enum Finished {
+    Exited(Collected),
+    /// The time limit hit first; the output is the prefix captured so far.
+    TimedOut {
+        stdout: Capture,
+        stderr: Capture,
+    },
+}
+
 /// Owns a spawned child and its I/O tasks; see the module docs.
 pub(crate) struct ChildGuard {
     child: Child,
@@ -84,12 +95,25 @@ impl ChildGuard {
 
     /// Drive the child to completion, capturing at most `cap` bytes per
     /// output stream. Dropping the returned future kills the process group.
-    pub(crate) async fn run_capped(mut self, cap: usize) -> std::io::Result<Collected> {
+    pub(crate) async fn run_capped(self, cap: usize) -> std::io::Result<Collected> {
+        match self.run_capped_within(cap, None).await? {
+            Finished::Exited(collected) => Ok(collected),
+            Finished::TimedOut { .. } => unreachable!("no time limit was set"),
+        }
+    }
+
+    /// Like [`Self::run_capped`], but kills the process group once `limit`
+    /// elapses and hands back whatever the child had written by then.
+    pub(crate) async fn run_capped_within(
+        mut self,
+        cap: usize,
+        limit: Option<Duration>,
+    ) -> std::io::Result<Finished> {
         let (stop_tx, stop_rx) = watch::channel(false);
 
         // Written from its own task so a child that fills its stdout pipe
         // before consuming stdin cannot deadlock against us.
-        let mut writer = self.stdin_payload.take().map(|payload| {
+        let writer = self.stdin_payload.take().map(|payload| {
             let mut stdin = self.child.stdin.take().expect("stdin was piped");
             let handle = tokio::spawn(async move {
                 let res = stdin.write_all(payload.as_bytes()).await;
@@ -107,8 +131,17 @@ impl ChildGuard {
         self.tasks.push(stdout_task.abort_handle());
         self.tasks.push(stderr_task.abort_handle());
 
-        let status = self.child.wait().await?;
-        // The leader is gone; reap stragglers so they release the pipes.
+        let status = match limit {
+            Some(limit) => match tokio::time::timeout(limit, self.child.wait()).await {
+                Ok(status) => Some(status?),
+                Err(_elapsed) => None,
+            },
+            None => Some(self.child.wait().await?),
+        };
+        if status.is_none() {
+            self.child.start_kill()?;
+        }
+        // The leader is gone (or killed); reap stragglers so they release the pipes.
         self.kill_group();
 
         let joined = tokio::time::timeout(PIPE_DRAIN_GRACE, async {
@@ -126,27 +159,17 @@ impl ChildGuard {
         let stdout = join_reader(stdout, "stdout")?;
         let stderr = join_reader(stderr, "stderr")?;
 
-        let stdin_error = match writer.as_mut() {
-            Some(handle) => match tokio::time::timeout(PIPE_DRAIN_GRACE, &mut *handle).await {
-                Ok(Ok(Ok(()))) => None,
-                Ok(Ok(Err(e))) => Some(e),
-                Ok(Err(join_err)) => Some(std::io::Error::other(format!(
-                    "stdin writer task failed: {join_err}"
-                ))),
-                Err(_) => {
-                    handle.abort();
-                    None
-                },
-            },
-            None => None,
-        };
+        let stdin_error = writer_outcome(writer).await;
 
-        Ok(Collected {
+        let Some(status) = status else {
+            return Ok(Finished::TimedOut { stdout, stderr });
+        };
+        Ok(Finished::Exited(Collected {
             status,
             stdout,
             stderr,
             stdin_error,
-        })
+        }))
     }
 
     #[cfg(unix)]
@@ -179,6 +202,25 @@ impl Drop for ChildGuard {
         for task in &self.tasks {
             task.abort();
         }
+    }
+}
+
+/// How the stdin writer ended, waiting briefly for it and aborting a
+/// writer stuck on a child that never reads.
+async fn writer_outcome(
+    writer: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> Option<std::io::Error> {
+    let mut handle = writer?;
+    match tokio::time::timeout(PIPE_DRAIN_GRACE, &mut handle).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(e))) => Some(e),
+        Ok(Err(join_err)) => Some(std::io::Error::other(format!(
+            "stdin writer task failed: {join_err}"
+        ))),
+        Err(_) => {
+            handle.abort();
+            None
+        },
     }
 }
 

@@ -80,16 +80,13 @@ impl ToolHandler for ReadHandler {
 /// Read up to `MAX_READ_BYTES` and decode lossily, so invalid UTF-8
 /// behaves the same for small and large files.
 fn read_capped_lossy(path: &Path) -> Result<String, ToolError> {
-    let invocation = |e: std::io::Error| ToolError::Invocation {
-        name: "Read".to_string(),
-        source: Box::new(e),
-    };
-    let file = std::fs::File::open(path).map_err(invocation)?;
-    let file_len = file.metadata().map_err(invocation)?.len();
+    let io_failure = |e: std::io::Error| ToolError::from_io("Read", &path.display().to_string(), e);
+    let file = std::fs::File::open(path).map_err(io_failure)?;
+    let file_len = file.metadata().map_err(io_failure)?.len();
     let mut buf = Vec::new();
     file.take(MAX_READ_BYTES)
         .read_to_end(&mut buf)
-        .map_err(invocation)?;
+        .map_err(io_failure)?;
     let mut content = String::from_utf8_lossy(&buf).into_owned();
     if file_len > MAX_READ_BYTES {
         let _ = write!(
@@ -103,6 +100,7 @@ fn read_capped_lossy(path: &Path) -> Result<String, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::RecoverableKind;
     use serde_json::json;
 
     #[tokio::test]
@@ -169,7 +167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonexistent_file_returns_invocation_error() {
+    async fn nonexistent_file_returns_recoverable_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("does-not-exist.txt");
         let roots = vec![tmp.path().to_path_buf()];
@@ -180,8 +178,11 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ToolError::Invocation { name, .. } => assert_eq!(name, "Read"),
-            other => panic!("expected Invocation, got {other:?}"),
+            ToolError::Recoverable { name, kind, .. } => {
+                assert_eq!(name, "Read");
+                assert_eq!(kind, RecoverableKind::NotFound);
+            },
+            other => panic!("expected Recoverable, got {other:?}"),
         }
     }
 

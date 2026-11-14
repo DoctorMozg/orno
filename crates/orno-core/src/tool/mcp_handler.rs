@@ -13,7 +13,7 @@ use serde_json::Value;
 use tracing::instrument;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
+use crate::error::{RecoverableKind, ToolError};
 use crate::events::{Event, EventSink, truncate_excerpt};
 use crate::mcp::McpClient;
 
@@ -133,7 +133,15 @@ impl ToolHandler for McpToolHandler {
                         output_excerpt,
                     })
                     .await;
-                Ok(result.content)
+                if result.ok {
+                    Ok(result.content)
+                } else {
+                    Err(ToolError::Recoverable {
+                        name: self.config.yaml_name.clone(),
+                        kind: RecoverableKind::ToolReported,
+                        message: result.content,
+                    })
+                }
             },
             Err(e) => {
                 let reason = e.to_string();
@@ -312,6 +320,37 @@ mod tests {
         }
     }
 
+    struct ToolReportedErrClient;
+
+    impl std::fmt::Debug for ToolReportedErrClient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ToolReportedErrClient").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for ToolReportedErrClient {
+        fn server_name(&self) -> &str {
+            "fs"
+        }
+        async fn initialize(&mut self) -> Result<Vec<McpTool>, McpError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<McpToolCallResult, McpError> {
+            Ok(McpToolCallResult {
+                ok: false,
+                content: "no such directory".to_string(),
+            })
+        }
+        async fn shutdown(&mut self) -> Result<(), McpError> {
+            Ok(())
+        }
+    }
+
     fn make_handler(client: Arc<dyn McpClient>) -> (McpToolHandler, Arc<InMemorySink>) {
         let sink = Arc::new(InMemorySink::new());
         let handler = McpToolHandler::new(
@@ -374,6 +413,29 @@ mod tests {
         assert!(matches!(events[0].event, Event::McpToolCallSent { .. }));
         assert!(matches!(
             events[1].event,
+            Event::McpToolCallCompleted { ok: false, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn is_error_result_becomes_recoverable_failure_and_records_ok_false() {
+        let (handler, sink) = make_handler(Arc::new(ToolReportedErrClient));
+
+        let err = handler
+            .invoke(ToolInvocation::for_test("call-3"), json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ToolError::Recoverable { kind: RecoverableKind::ToolReported, message, .. }
+                    if message == "no such directory"
+            ),
+            "got {err:?}",
+        );
+        assert!(matches!(
+            sink.snapshot()[1].event,
             Event::McpToolCallCompleted { ok: false, .. }
         ));
     }

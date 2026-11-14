@@ -18,16 +18,18 @@
 //! `Event::SubagentDepthExceeded` and never reaches
 //! [`SubagentHandler::invoke`].
 
+use std::path::Component;
 use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::agent::{Agent, AgentRequest, LoopAgent};
 use crate::error::ToolError;
 use crate::events::{Event, EventSink};
+use crate::node::render_agent_templates;
 use crate::pipeline::{AgentConfig, AgentPolicy};
 
 #[derive(Clone)]
@@ -107,6 +109,49 @@ impl SubagentHandler {
         }
     }
 
+    /// Render the child's templated `system` and `roots` against the
+    /// parent node's scope, then check the roots still sit inside the
+    /// parent's. The load-time compose-down check only saw template text.
+    fn render_child(
+        &self,
+        inv: &ToolInvocation<'_>,
+    ) -> Result<(Option<String>, AgentPolicy), ToolError> {
+        let (system, policy) = match inv.render_scope {
+            Some(scope) => render_agent_templates(&self.child_config, scope).map_err(|e| {
+                ToolError::Invocation {
+                    name: self.yaml_name.clone(),
+                    source: Box::new(e),
+                }
+            })?,
+            None => (
+                self.child_config.system.clone(),
+                self.child_config.policy.clone(),
+            ),
+        };
+        // An unjailed parent does not constrain its children.
+        if !inv.roots.is_empty() {
+            for root in &policy.roots {
+                let escapes = root.components().any(|c| c == Component::ParentDir)
+                    || !inv.roots.iter().any(|parent| root.starts_with(parent));
+                if escapes {
+                    warn!(
+                        subagent.child = %self.child_agent_name,
+                        subagent.root = %root.display(),
+                        "rendered subagent root is outside the parent's roots",
+                    );
+                    return Err(ToolError::Denied {
+                        reason: format!(
+                            "subagent `{}` root `{}` is not inside any parent root",
+                            self.child_agent_name,
+                            root.display(),
+                        ),
+                    });
+                }
+            }
+        }
+        Ok((system, policy))
+    }
+
     /// Accessor for the child agent's name. Used by `LoopAgent` when
     /// emitting `SubagentDepthExceeded` before the call reaches
     /// `invoke` — the parent already knows the handler by YAML name
@@ -175,6 +220,7 @@ impl ToolHandler for SubagentHandler {
         })?;
 
         let child_depth = inv.depth + 1;
+        let (system, policy) = self.render_child(&inv)?;
 
         self.sink
             .record(Event::SubagentStarted {
@@ -188,19 +234,16 @@ impl ToolHandler for SubagentHandler {
         let child_req = AgentRequest {
             agent_name: self.child_agent_name.clone(),
             initial_prompt: Arc::from(prompt),
-            system: self.child_config.system.as_deref().map(Arc::from),
+            system: system.map(Arc::from),
             provider: Arc::from(self.child_config.provider.as_str()),
             model: Arc::from(self.child_config.model.as_str()),
-            policy: self.child_config.policy.clone(),
+            policy,
             allowed_tools: self.child_config.allowed_tools.clone(),
             depth: child_depth,
-            // Hand the parent loop's local token counter to the child
-            // request so the child's per-LLM-response usage reaches the
-            // parent. `token_budget_share` is `Some` for any tool call
-            // dispatched through `LoopAgent`; it is `None` only for
-            // direct handler unit tests, which never construct a
-            // `SubagentHandler` to begin with.
-            parent_token_counter: inv.token_budget_share.clone(),
+            // Charging the parent's scope is what makes token and tool-call
+            // limits hold across the whole subagent tree.
+            parent_budget: inv.budget.clone(),
+            render_scope: inv.render_scope.cloned(),
         };
 
         debug!(

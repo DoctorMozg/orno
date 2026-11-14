@@ -8,20 +8,21 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use tracing::{instrument, warn};
 
-use crate::agent::{Agent, AgentOutput, AgentRequest};
+use crate::agent::{Agent, AgentOutput, AgentRequest, BudgetScope};
 use crate::error::AgentError;
+use crate::events::BudgetKind;
 use crate::events::redactor::Keep;
-use crate::events::{BudgetKind, Event, LlmFailure};
+use crate::events::{Event, LlmFailure};
 use crate::llm::{LlmRequest, OrnoChatMessage, OrnoChatTool};
 use crate::tool::net_guard::DomainRules;
 use crate::tool::{StateHandle, ToolInvocation};
 
+use super::history::History;
 use super::{LoopAgent, SUBAGENT_PREFIX, wire_name_from_yaml};
 
 /// Default cap on the per-call tool output bytes appended to the
@@ -32,66 +33,6 @@ use super::{LoopAgent, SUBAGENT_PREFIX, wire_name_from_yaml};
 /// gigabyte of output gets truncated to this cap before it reaches the
 /// LLM transport.
 const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
-
-/// Approximate byte cost of a single conversation message. Used by the
-/// history-cap check so the loop does not need to serialize the full
-/// history on every push. Content strings dominate; the small fixed
-/// overhead per variant is intentionally ignored to keep the estimate
-/// cheap and consistent across variants.
-fn estimated_message_bytes(msg: &OrnoChatMessage) -> usize {
-    #[expect(
-        unreachable_patterns,
-        reason = "OrnoChatMessage is #[non_exhaustive]; the catch-all handles future variants"
-    )]
-    match msg {
-        OrnoChatMessage::User { content } | OrnoChatMessage::Assistant { content } => content.len(),
-        OrnoChatMessage::ToolCalls { calls } => calls
-            .iter()
-            .map(|c| c.fn_name.len() + c.fn_arguments.to_string().len())
-            .sum(),
-        OrnoChatMessage::ToolResult { call_id, content } => call_id.len() + content.len(),
-        // Non-exhaustive guard: new variants default to 0 so the cap
-        // degrades gracefully rather than failing to compile.
-        _ => 0,
-    }
-}
-
-/// Enforce the `policy.max_message_history_bytes` soft cap on the
-/// conversation history vector. When the total estimated byte size
-/// exceeds the cap, evicts the oldest messages until the total is
-/// below the cap, always keeping at least the two most recent messages
-/// so the model sees at least one request-response pair.
-fn enforce_message_history_cap(messages: &mut Vec<OrnoChatMessage>, cap: usize) {
-    let mut total: usize = messages.iter().map(estimated_message_bytes).sum();
-    if total <= cap {
-        return;
-    }
-    // Single-pass O(n) eviction: maintain a running total by subtracting
-    // each evicted message's estimated bytes instead of re-summing the
-    // whole vector on every iteration. Defer the front shift to a single
-    // `drain(..evict)` call so the underlying memmove also runs once.
-    // Stop at len-2 so the model always sees at least one tool-call/result
-    // pair even when the cap is smaller than any single message.
-    let mut evict = 0usize;
-    while messages.len() - evict > 2 {
-        let msg_bytes = estimated_message_bytes(&messages[evict]);
-        total = total.saturating_sub(msg_bytes);
-        evict += 1;
-        if total <= cap {
-            break;
-        }
-    }
-    if evict > 0 {
-        messages.drain(..evict);
-    }
-    // Emit the warning once per truncation event, after eviction, so
-    // the log shows the post-truncation byte total.
-    let current_bytes: usize = messages.iter().map(estimated_message_bytes).sum();
-    warn!(
-        cap_bytes = cap,
-        current_bytes, "message history truncated to stay within cap",
-    );
-}
 
 /// Snapshot the per-node state buffer for `AgentOutput.state`. Returns
 /// `None` when no `SetState` call landed — keeps the wire shape of
@@ -212,20 +153,16 @@ impl Agent for LoopAgent {
         let prompt_str = req.initial_prompt.to_string();
         let system_str = req.system.as_deref().map(str::to_string);
 
-        // Growing conversation history across iterations. The initial
-        // user turn rides in `LlmRequest.prompt`; this vector captures
-        // assistant tool-call turns and their paired `ToolResult`s so
-        // the model can reason over what it already did.
-        let mut messages: Arc<Vec<OrnoChatMessage>> = Arc::new(Vec::new());
-        let mut tool_call_count: u32 = 0;
-        // Per-call token counter. Replaces the previous `u64` so subagent
-        // tool calls can be handed an `Arc` pointer to bump on every
-        // child-loop LLM response — that keeps the parent's
-        // `policy.max_total_tokens` budget transitively covering child
-        // spend without each loop maintaining a private total. The
-        // `Arc<AtomicU64>` is shared via `ToolInvocation.token_budget_share`
-        // and via `AgentRequest.parent_token_counter` for nested children.
-        let token_counter: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        // Assistant tool-call turns and their paired `ToolResult`s; the
+        // initial user turn rides in `LlmRequest.prompt`.
+        let mut history = History::new();
+        // Linked to the parent's scope so child and grandchild spend
+        // count against every ancestor's token and tool-call limits.
+        let budget = BudgetScope::new(
+            req.policy.max_total_tokens,
+            req.policy.max_tool_calls,
+            req.parent_budget.clone(),
+        );
 
         for iteration in 0..req.policy.max_iterations {
             self.config
@@ -249,30 +186,16 @@ impl Agent for LoopAgent {
             // retry per `call_id` within the iteration that produced it.
             let mut retried_parse_errors: HashSet<String> = HashSet::new();
 
-            // Each request asks for the budget remaining AFTER previous
-            // iterations' usage. `token_counter` is updated below from
-            // the response's `Usage`; the saturating subtraction guards
-            // against the model overshooting the prior cap. `Relaxed` is
-            // sufficient because the loop is single-tasked and the
-            // counter is only observed across `.await` points within the
-            // same task — there is no cross-thread race to order against.
-            let max_tokens = if req.policy.max_total_tokens == 0 {
-                None
-            } else {
-                let used = token_counter.load(Ordering::Relaxed);
-                let remaining = req.policy.max_total_tokens.saturating_sub(used);
-                // Pre-check: token budget fully consumed. Returning
-                // `BudgetExceeded` before issuing the next LLM call
-                // prevents an uncapped (`max_tokens: None`) request from
-                // being billed and only being detected after the
-                // response — the breach happens at iteration boundaries
-                // too, not just inside a response that pushes us over.
-                if remaining == 0 {
+            // Ask for what is left on the tightest limit up the chain. A
+            // spent budget fails here, before an uncapped, billable call.
+            let max_tokens = match budget.tokens_remaining() {
+                None => None,
+                Some(0) => {
                     return Err(AgentError::BudgetExceeded {
                         kind: BudgetKind::Tokens,
                     });
-                }
-                Some(u32::try_from(remaining).unwrap_or(u32::MAX))
+                },
+                Some(remaining) => Some(u32::try_from(remaining).unwrap_or(u32::MAX)),
             };
 
             let llm_req = LlmRequest {
@@ -282,7 +205,7 @@ impl Agent for LoopAgent {
                 system: system_str.clone(),
                 temperature: None,
                 max_tokens,
-                messages: Arc::clone(&messages),
+                messages: history.snapshot(),
                 tools: Arc::clone(&declared_tools),
             };
 
@@ -336,38 +259,9 @@ impl Agent for LoopAgent {
                 .await;
 
             if let Some(usage) = &response.usage {
-                let delta = u64::from(usage.total_tokens);
-                // Saturating add prevents `u64` wrap-around from
-                // bypassing the token-budget check below: a near-`u64::MAX`
-                // counter plus a large `delta` would otherwise wrap to
-                // near 0 and silently re-enable an exhausted budget.
-                // `fetch_update` retries on CAS failure but the closure
-                // always returns `Some`, so the update succeeds on the
-                // first try in this single-tasked loop.
-                token_counter
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                        Some(old.saturating_add(delta))
-                    })
-                    .ok();
-                // Bump the parent's counter in lockstep so a parent
-                // loop's `policy.max_total_tokens` budget transitively
-                // covers child subagent token spend. The chain is
-                // recursive: a grandchild loop's responses reach the
-                // grandparent through the parent's `parent_token_counter`
-                // hop on the next-up loop's iteration check.
-                if let Some(parent) = &req.parent_token_counter {
-                    parent
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
-                            Some(old.saturating_add(delta))
-                        })
-                        .ok();
-                }
-                let total_tokens = token_counter.load(Ordering::Relaxed);
-                if req.policy.max_total_tokens > 0 && total_tokens > req.policy.max_total_tokens {
-                    return Err(AgentError::BudgetExceeded {
-                        kind: BudgetKind::Tokens,
-                    });
-                }
+                budget
+                    .charge_tokens(u64::from(usage.total_tokens))
+                    .map_err(|kind| AgentError::BudgetExceeded { kind })?;
             } else if req.policy.max_total_tokens > 0 {
                 // The provider returned no `usage` block. Token-budget
                 // enforcement is intrinsically per-response — without
@@ -397,31 +291,19 @@ impl Agent for LoopAgent {
                     finish_reason: response.finish_reason,
                     usage: response.usage,
                     iterations: iteration,
-                    total_tokens: token_counter.load(Ordering::Relaxed),
+                    total_tokens: budget.tokens_used(),
                     state,
                 });
             }
 
-            // Record the assistant's tool-call turn so the next LLM
-            // request carries the full causal chain.
-            //
-            // INVARIANT: messages must have refcount 1 here — no transport may retain
-            // an Arc clone across the await point. If violated, make_mut deep-clones
-            // the entire history on every iteration (O(n²)). See LlmTransport contract.
-            Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolCalls {
+            history.push(OrnoChatMessage::ToolCalls {
                 calls: response.tool_calls.clone(),
             });
-            if let Some(cap) = req.policy.max_message_history_bytes {
-                enforce_message_history_cap(Arc::make_mut(&mut messages), cap);
-            }
 
             for tool_call in &response.tool_calls {
-                tool_call_count = tool_call_count.saturating_add(1);
-                if req.policy.max_tool_calls > 0 && tool_call_count > req.policy.max_tool_calls {
-                    return Err(AgentError::BudgetExceeded {
-                        kind: BudgetKind::ToolCalls,
-                    });
-                }
+                budget
+                    .charge_tool_call()
+                    .map_err(|kind| AgentError::BudgetExceeded { kind })?;
 
                 let yaml_name = wire_to_yaml
                     .get(&tool_call.fn_name)
@@ -437,6 +319,21 @@ impl Agent for LoopAgent {
                         name: tool_call.fn_name.clone(),
                     });
                 }
+
+                let make_inv = || ToolInvocation {
+                    run_id,
+                    node_id,
+                    call_id: &tool_call.call_id,
+                    depth: req.depth,
+                    state_handle: Some(state_handle),
+                    budget: Some(Arc::clone(&budget)),
+                    render_scope: req.render_scope.as_ref(),
+                    roots: &req.policy.roots,
+                    domains: DomainRules {
+                        allowed: &req.policy.allowed_domains,
+                        blocked: &req.policy.blocked_domains,
+                    },
+                };
 
                 // Subagent calls are routed through the recursion-depth
                 // gate before dispatch. If the gate fires, the child
@@ -471,19 +368,7 @@ impl Agent for LoopAgent {
                                 name: tool_call.fn_name.clone(),
                             }
                         })?;
-                        let inv = ToolInvocation {
-                            run_id,
-                            node_id,
-                            call_id: &tool_call.call_id,
-                            depth: req.depth,
-                            state_handle: Some(state_handle),
-                            token_budget_share: Some(Arc::clone(&token_counter)),
-                            roots: &req.policy.roots,
-                            domains: DomainRules {
-                                allowed: &req.policy.allowed_domains,
-                                blocked: &req.policy.blocked_domains,
-                            },
-                        };
+                        let inv = make_inv();
                         self.invoke_with_parse_retry(
                             handler,
                             tool_call,
@@ -500,19 +385,7 @@ impl Agent for LoopAgent {
                             name: tool_call.fn_name.clone(),
                         }
                     })?;
-                    let inv = ToolInvocation {
-                        run_id,
-                        node_id,
-                        call_id: &tool_call.call_id,
-                        depth: req.depth,
-                        state_handle: Some(state_handle),
-                        token_budget_share: Some(Arc::clone(&token_counter)),
-                        roots: &req.policy.roots,
-                        domains: DomainRules {
-                            allowed: &req.policy.allowed_domains,
-                            blocked: &req.policy.blocked_domains,
-                        },
-                    };
+                    let inv = make_inv();
                     self.invoke_with_parse_retry(
                         handler,
                         tool_call,
@@ -556,16 +429,15 @@ impl Agent for LoopAgent {
                     self.config
                         .redactor
                         .redact_bounded(&result_content, cap, Keep::Head);
-                // INVARIANT: messages must have refcount 1 here — no transport may retain
-                // an Arc clone across the await point. If violated, make_mut deep-clones
-                // the entire history on every iteration (O(n²)). See LlmTransport contract.
-                Arc::make_mut(&mut messages).push(OrnoChatMessage::ToolResult {
+                history.push(OrnoChatMessage::ToolResult {
                     call_id: tool_call.call_id.clone(),
                     content: redacted,
                 });
-                if let Some(cap) = req.policy.max_message_history_bytes {
-                    enforce_message_history_cap(Arc::make_mut(&mut messages), cap);
-                }
+            }
+            // Once per turn, after every result is in, so a multi-call turn
+            // is never cut between a call and its result.
+            if let Some(cap) = req.policy.max_message_history_bytes {
+                history.enforce_cap(cap);
             }
         }
 

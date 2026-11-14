@@ -24,7 +24,9 @@ pub mod telemetry;
 pub mod tool;
 pub mod util;
 
-pub use error::{AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, ToolError};
+pub use error::{
+    AgentError, CoreError, LlmError, McpError, NodeError, PipelineError, RecoverableKind, ToolError,
+};
 
 /// Render the pipeline JSON Schema as a pretty-printed string. Used by the
 /// `orno schema` subcommand; IDEs can reference the committed file via a

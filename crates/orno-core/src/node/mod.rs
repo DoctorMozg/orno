@@ -14,6 +14,7 @@ pub use registry::NodeRegistry;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use crate::error::{NodeError, PipelineError};
 use crate::execution::context::Context;
 use crate::pipeline::NodeKind;
 use crate::pipeline::schema::{AgentConfig, AgentPolicy};
-use crate::pipeline::template::TemplateEngine;
+use crate::pipeline::template::{RenderScope, TemplateEngine};
 
 /// Input to a node. `#[non_exhaustive]` so we can grow the variant list
 /// without breaking on-disk replays.
@@ -63,6 +64,11 @@ pub struct AgentNodeRequest {
     /// driving `LoopAgent`; an unknown name terminates the agent loop.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
+    /// Template scope the node was rendered under; lets subagents render
+    /// their own `system` and `roots` the same way. Runtime handle, never
+    /// serialized.
+    #[serde(skip)]
+    pub render_scope: Option<RenderScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,11 +125,11 @@ pub trait NodeExecutor: Send + Sync {
 /// - `PipelineError::Template` if any field fails to render.
 pub fn render_request(
     kind: &NodeKind,
-    tmpl: &TemplateEngine,
+    tmpl: &Arc<TemplateEngine>,
     ctx: &Context,
     agents: &BTreeMap<String, AgentConfig>,
 ) -> Result<NodeRequest, PipelineError> {
-    let ctx_json = ctx.snapshot_for_template();
+    let ctx_json = Arc::new(ctx.snapshot_for_template());
     match kind {
         NodeKind::Agent(n) => {
             let cfg = agents
@@ -131,23 +137,9 @@ pub fn render_request(
                 .ok_or_else(|| PipelineError::UnknownAgent {
                     name: n.agent.clone(),
                 })?;
-            let initial_prompt =
-                tmpl.render("agent.initial_prompt", &n.initial_prompt, &ctx_json)?;
-            let system = match cfg.system.as_deref() {
-                Some(s) => Some(tmpl.render("agent.system", s, &ctx_json)?),
-                None => None,
-            };
-            let mut policy = cfg.policy.clone();
-            if !policy.roots.is_empty() {
-                let mut roots = Vec::with_capacity(policy.roots.len());
-                for (i, root) in cfg.policy.roots.iter().enumerate() {
-                    let s = root.to_string_lossy();
-                    let rendered =
-                        tmpl.render(&format!("agent.policy.roots[{i}]"), s.as_ref(), &ctx_json)?;
-                    roots.push(PathBuf::from(rendered));
-                }
-                policy.roots = roots;
-            }
+            let scope = RenderScope::new(Arc::clone(tmpl), Arc::clone(&ctx_json));
+            let initial_prompt = scope.render("agent.initial_prompt", &n.initial_prompt)?;
+            let (system, policy) = render_agent_templates(cfg, &scope)?;
             Ok(NodeRequest::Agent(AgentNodeRequest {
                 agent: n.agent.clone(),
                 initial_prompt,
@@ -156,6 +148,7 @@ pub fn render_request(
                 model: cfg.model.clone(),
                 policy,
                 allowed_tools: cfg.allowed_tools.clone(),
+                render_scope: Some(scope),
             }))
         },
         NodeKind::Shell(n) => {
@@ -183,6 +176,29 @@ pub fn render_request(
             }))
         },
     }
+}
+
+/// Render the templated parts of an agent config, `system` and
+/// `policy.roots`, against `scope`. Shared by node dispatch and subagent
+/// dispatch so parent and child resolve templates the same way.
+///
+/// Errors: `PipelineError::Template` if any field fails to render.
+pub fn render_agent_templates(
+    cfg: &AgentConfig,
+    scope: &RenderScope,
+) -> Result<(Option<String>, AgentPolicy), PipelineError> {
+    let system = cfg
+        .system
+        .as_deref()
+        .map(|s| scope.render("agent.system", s))
+        .transpose()?;
+    let mut policy = cfg.policy.clone();
+    for (i, root) in policy.roots.iter_mut().enumerate() {
+        let rendered =
+            scope.render(&format!("agent.policy.roots[{i}]"), &root.to_string_lossy())?;
+        *root = PathBuf::from(rendered);
+    }
+    Ok((system, policy))
 }
 
 /// Registry lookup key for a `NodeKind`. Matches the
@@ -255,7 +271,7 @@ mod tests {
             agent: "writer".into(),
             initial_prompt: "hi".into(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Agent(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
@@ -277,7 +293,7 @@ mod tests {
             agent: "missing".into(),
             initial_prompt: String::new(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let err =
@@ -297,7 +313,7 @@ mod tests {
             stdin: None,
             env: BTreeMap::new(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
@@ -319,7 +335,7 @@ mod tests {
             stdin: None,
             env: env.clone(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let ctx = Context::new(BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
 
         let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
@@ -339,7 +355,7 @@ mod tests {
             stdin: None,
             env: env_template,
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let mut env_ctx = BTreeMap::new();
         env_ctx.insert("TOKEN".to_string(), "secret-value".to_string());
         let ctx = Context::new(BTreeMap::new(), env_ctx, BTreeMap::new());
@@ -373,7 +389,7 @@ mod tests {
             agent: "worker".into(),
             initial_prompt: String::new(),
         });
-        let tmpl = TemplateEngine::new();
+        let tmpl = Arc::new(TemplateEngine::new());
         let mut vars = BTreeMap::new();
         vars.insert("workspace".to_string(), json!("/home/runner/work"));
         let ctx = Context::new(vars, BTreeMap::new(), BTreeMap::new());

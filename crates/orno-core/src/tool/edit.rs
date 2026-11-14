@@ -12,7 +12,7 @@ use tracing::{debug, instrument};
 use super::fs_util::{atomic_write, run_blocking};
 use super::path_guard::jail_file;
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
+use crate::error::{RecoverableKind, ToolError};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -71,21 +71,21 @@ impl ToolHandler for EditHandler {
 
         let target = resolved.clone();
         run_blocking("Edit", move || {
-            let original = std::fs::read_to_string(&target).map_err(|e| ToolError::Invocation {
-                name: "Edit".to_string(),
-                source: Box::new(e),
-            })?;
+            let original = std::fs::read_to_string(&target)
+                .map_err(|e| ToolError::from_io("Edit", &target.display().to_string(), e))?;
 
             let occurrences = original.matches(&old_string).count();
             if occurrences == 0 {
-                return Err(ToolError::InvalidArgs {
+                return Err(ToolError::Recoverable {
                     name: "Edit".to_string(),
+                    kind: RecoverableKind::NoMatch,
                     message: format!("old_string not found in {}", target.display()),
                 });
             }
             if occurrences > 1 {
-                return Err(ToolError::InvalidArgs {
+                return Err(ToolError::Recoverable {
                     name: "Edit".to_string(),
+                    kind: RecoverableKind::NoMatch,
                     message: format!(
                         "old_string is not unique in {}: found {occurrences} occurrences",
                         target.display(),
@@ -159,14 +159,19 @@ mod tests {
             .expect_err("edit must fail when old_string absent");
 
         match err {
-            ToolError::InvalidArgs { name, message } => {
+            ToolError::Recoverable {
+                name,
+                kind,
+                message,
+            } => {
                 assert_eq!(name, "Edit");
+                assert_eq!(kind, RecoverableKind::NoMatch);
                 assert!(
                     message.contains("not found"),
                     "message should mention 'not found': {message}"
                 );
             },
-            other => panic!("expected InvalidArgs, got {other:?}"),
+            other => panic!("expected Recoverable, got {other:?}"),
         }
     }
 
@@ -191,14 +196,19 @@ mod tests {
             .expect_err("edit must fail when old_string is ambiguous");
 
         match err {
-            ToolError::InvalidArgs { name, message } => {
+            ToolError::Recoverable {
+                name,
+                kind,
+                message,
+            } => {
                 assert_eq!(name, "Edit");
+                assert_eq!(kind, RecoverableKind::NoMatch);
                 assert!(
                     message.contains("not unique") && message.contains('2'),
                     "message should mention uniqueness and count: {message}"
                 );
             },
-            other => panic!("expected InvalidArgs, got {other:?}"),
+            other => panic!("expected Recoverable, got {other:?}"),
         }
     }
 

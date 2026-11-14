@@ -226,7 +226,8 @@ mod tests {
             call_id,
             depth: 0,
             state_handle: Some(StateHandle::new(buf)),
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
             domains: DomainRules::default(),
         }
@@ -470,7 +471,8 @@ mod tests {
             call_id: "c1",
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
             domains: DomainRules::default(),
         };

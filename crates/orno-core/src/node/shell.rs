@@ -374,6 +374,7 @@ mod tests {
             model: "gpt-5".into(),
             policy: test_policy(),
             allowed_tools: Vec::new(),
+            render_scope: None,
         });
 
         let err = exec

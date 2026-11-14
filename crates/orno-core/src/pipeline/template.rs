@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
 use minijinja::{AutoEscape, Environment, UndefinedBehavior};
@@ -36,6 +36,36 @@ const MAX_TEMPLATE_SOURCE_BYTES: usize = 64 * 1024;
 /// past this bound are re-compiled on next use (a parse cost, not a
 /// correctness issue).
 const TEMPLATE_CACHE_CAPACITY: usize = 128;
+
+/// A template engine bound to the context snapshot a node was rendered
+/// under, so a subagent dispatched mid-run renders its own config against
+/// the same data as its parent.
+#[derive(Clone)]
+pub struct RenderScope {
+    engine: Arc<TemplateEngine>,
+    ctx: Arc<Value>,
+}
+
+impl RenderScope {
+    #[must_use]
+    pub fn new(engine: Arc<TemplateEngine>, ctx: Arc<Value>) -> Self {
+        Self { engine, ctx }
+    }
+
+    /// Render `source` against the bound context.
+    ///
+    /// Errors: see [`TemplateEngine::render`].
+    pub fn render(&self, name: &str, source: &str) -> Result<String, PipelineError> {
+        self.engine.render(name, source, &self.ctx)
+    }
+}
+
+impl std::fmt::Debug for RenderScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The context can hold secrets, so it is never printed.
+        f.debug_struct("RenderScope").finish_non_exhaustive()
+    }
+}
 
 pub struct TemplateEngine {
     inner: Mutex<Inner>,

@@ -55,6 +55,24 @@ fn collect_urls(value: &Value, key: Option<&str>, out: &mut Vec<reqwest::Url>) {
     }
 }
 
+/// Tool-result text for a recoverable failure. The caller's redaction
+/// pass runs on it like on any other tool output.
+fn recoverable_feedback(tool: &str, err: &ToolError) -> String {
+    let kind = match err {
+        ToolError::Recoverable { kind, .. } => kind.to_string(),
+        _ => "not_implemented".to_string(),
+    };
+    // The message can echo user data, so only the kind is logged.
+    tracing::warn!(tool.name = %tool, error.kind = %kind, "tool failed; feeding the error back to the model");
+    match err {
+        ToolError::Recoverable { message, .. } => format!("error: {message}"),
+        ToolError::NotImplemented { name, feature } => {
+            format!("error: tool `{name}` not yet implemented: {feature}")
+        },
+        other => format!("error: {other}"),
+    }
+}
+
 impl LoopAgent {
     /// Emit a `ToolDenied` event and return the denial string fed back
     /// to the model. `tool_name` is the wire-form name the LLM called
@@ -189,8 +207,9 @@ impl LoopAgent {
 
     /// Apply the effect-based policy gate and invoke the handler. A
     /// policy denial is *not* a terminal error — it is fed back to the
-    /// model as a `ToolResult` denial string so the model can adapt. A
-    /// handler error still terminates the loop via [`AgentError::Tool`].
+    /// model as a `ToolResult` denial string so the model can adapt. So is
+    /// a recoverable handler error ([`ToolError::is_recoverable`]); any
+    /// other handler error terminates the loop via [`AgentError::Tool`].
     /// `wire_to_yaml` is the per-`run()` reverse map used by `deny` to
     /// surface the YAML-form name on every denial event and feed-back
     /// string.
@@ -286,12 +305,7 @@ impl LoopAgent {
 
         match handler.invoke(inv, tool_call.fn_arguments.clone()).await {
             Ok(output) => Ok(output),
-            // A stub handler that declared itself NotImplemented is a
-            // predictable condition — feed it back to the model rather
-            // than terminating the loop, matching the denial semantics.
-            Err(ToolError::NotImplemented { name, feature }) => Ok(format!(
-                "error: tool `{name}` not yet implemented: {feature}",
-            )),
+            Err(err) if err.is_recoverable() => Ok(recoverable_feedback(&tool_call.fn_name, &err)),
             Err(source) => Err(AgentError::Tool {
                 name: tool_call.fn_name.clone(),
                 source,

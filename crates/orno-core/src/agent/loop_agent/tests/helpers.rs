@@ -67,7 +67,8 @@ pub(super) fn request() -> AgentRequest {
         policy: policy(),
         allowed_tools: Vec::new(),
         depth: 0,
-        parent_token_counter: None,
+        parent_budget: None,
+        render_scope: None,
     }
 }
 
@@ -178,6 +179,7 @@ pub(super) struct RecordingScriptedTransport {
     pub(super) responses: Mutex<VecDeque<LlmResponse>>,
     pub(super) max_tokens_seen: Mutex<Vec<Option<u32>>>,
     pub(super) messages_seen: Mutex<Vec<Vec<OrnoChatMessage>>>,
+    pub(super) systems_seen: Mutex<Vec<Option<String>>>,
 }
 
 impl RecordingScriptedTransport {
@@ -186,7 +188,15 @@ impl RecordingScriptedTransport {
             responses: Mutex::new(responses.into()),
             max_tokens_seen: Mutex::new(Vec::new()),
             messages_seen: Mutex::new(Vec::new()),
+            systems_seen: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(super) fn systems_seen(&self) -> Vec<Option<String>> {
+        self.systems_seen
+            .lock()
+            .expect("RecordingScriptedTransport mutex poisoned")
+            .clone()
     }
 
     pub(super) fn max_tokens_seen(&self) -> Vec<Option<u32>> {
@@ -211,6 +221,10 @@ impl LlmTransport for RecordingScriptedTransport {
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")
             .push(req.max_tokens);
+        self.systems_seen
+            .lock()
+            .expect("RecordingScriptedTransport mutex poisoned")
+            .push(req.system.clone());
         self.messages_seen
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")
@@ -274,5 +288,32 @@ impl FixedResolver {
 impl HostResolver for FixedResolver {
     async fn resolve(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
         Ok(vec![self.0])
+    }
+}
+
+/// Response asking for one or more tool calls, each given as
+/// `(call_id, tool name, args)`.
+pub(super) fn tool_calls_response(calls: &[(&str, &str, serde_json::Value)]) -> LlmResponse {
+    LlmResponse {
+        content: String::new(),
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+        tool_calls: calls
+            .iter()
+            .map(|(id, name, args)| crate::llm::OrnoChatToolCall {
+                call_id: (*id).into(),
+                fn_name: (*name).into(),
+                fn_arguments: args.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn text_response(content: &str) -> LlmResponse {
+    LlmResponse {
+        content: content.into(),
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+        tool_calls: Vec::new(),
     }
 }

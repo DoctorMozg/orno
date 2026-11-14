@@ -38,6 +38,14 @@ once the first tagged release ships.
 
 ### Changed
 
+- A recoverable tool failure (missing file, non-UTF-8 content, Bash or
+  WebFetch timeout, `Edit` with no or several matches, MCP `isError: true`)
+  is fed back to the model as an `error: ...` tool result and the loop
+  continues; a Bash timeout includes the partial output. Jail and policy
+  denials and internal failures still terminate the run.
+- `max_total_tokens` and `max_tool_calls` now cover the whole subagent
+  tree: grandchild spend counts against the root, and a child's tool
+  calls count against each ancestor. Iterations stay per loop.
 - **Breaking (wire):** `schema_version` is now `4`.
   `node_output_truncated.captured_bytes` is renamed `total_bytes`
   (it always held the total the child wrote), and `Event::BudgetExceeded`
@@ -71,6 +79,12 @@ once the first tagged release ships.
 
 ### Fixed
 
+- History eviction no longer leaves a `ToolResult` without its tool call
+  (providers answered 400); it drops whole turns once per turn, off a
+  running byte total instead of re-summing the history.
+- A subagent's `system` and `policy.roots` templates are rendered with the
+  parent node's context, and a rendered root outside the parent's roots
+  is rejected.
 - `..` in `policy.roots` is rejected, so `/work/../etc` no longer passes
   the subagent roots check against `/work`.
 - A templated MCP server `url` is now validated (http/https, loopback-only

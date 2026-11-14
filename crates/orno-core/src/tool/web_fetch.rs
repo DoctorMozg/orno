@@ -14,7 +14,7 @@ use super::net_guard::{
     DomainRules, DomainVerdict, GuardedDns, SystemResolver, is_blocked_ip, literal_ip,
 };
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
+use crate::error::{RecoverableKind, ToolError};
 
 /// Cap on the number of redirects this client will follow. Lower than
 /// reqwest's default of 10 so a redirect-amplification chain does not
@@ -177,10 +177,7 @@ impl ToolHandler for WebFetchHandler {
                 .timeout(request_timeout)
                 .send()
                 .await
-                .map_err(|err| ToolError::Invocation {
-                    name: "WebFetch".to_string(),
-                    source: Box::new(err),
-                })?;
+                .map_err(request_failure)?;
 
             if !response.status().is_redirection() {
                 break response;
@@ -251,13 +248,7 @@ impl ToolHandler for WebFetchHandler {
         let mut buf = Vec::with_capacity(MAX_BODY_BYTES.min(65_536));
         let mut truncated = false;
         loop {
-            match response
-                .chunk()
-                .await
-                .map_err(|err| ToolError::Invocation {
-                    name: "WebFetch".to_string(),
-                    source: Box::new(err),
-                })? {
+            match response.chunk().await.map_err(request_failure)? {
                 None => break,
                 Some(chunk) => {
                     let remaining = MAX_BODY_BYTES.saturating_sub(buf.len());
@@ -281,6 +272,22 @@ impl ToolHandler for WebFetchHandler {
             out.push_str("\n[truncated at 1 MiB]");
         }
         Ok(out)
+    }
+}
+
+/// A request timeout is something the model can retry with a longer
+/// `timeout_secs`; every other transport failure stays terminal.
+fn request_failure(err: reqwest::Error) -> ToolError {
+    if err.is_timeout() {
+        return ToolError::Recoverable {
+            name: "WebFetch".to_string(),
+            kind: RecoverableKind::Timeout,
+            message: format!("request timed out: {err}"),
+        };
+    }
+    ToolError::Invocation {
+        name: "WebFetch".to_string(),
+        source: Box::new(err),
     }
 }
 

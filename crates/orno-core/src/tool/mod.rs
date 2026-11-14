@@ -20,13 +20,14 @@ pub mod write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::agent::BudgetScope;
 use crate::error::ToolError;
 use crate::events::Redactor;
+use crate::pipeline::template::RenderScope;
 use net_guard::DomainRules;
 
 pub use bash::BashHandler;
@@ -147,21 +148,19 @@ pub struct ToolInvocation<'a> {
     /// `N` agent dispatches the child at depth `N + 1`, bounded by
     /// `AgentPolicy.max_subagent_depth`.
     pub depth: u32,
-    /// Writable handle to the current node's `state` buffer.
-    /// `Some` only when the node's `allow_context_writes` policy is set
-    /// and the handler is dispatched through `LoopAgent`. `SetState`
-    /// reaches for this; every other handler leaves it alone.
+    /// Writable handle to the current node's `state` buffer. `Some` for
+    /// every `LoopAgent` dispatch; `SetState` is gated by
+    /// `allow_context_writes` before it runs, so other handlers never
+    /// reach for it. `None` outside a `LoopAgent` (unit tests).
     pub state_handle: Option<StateHandle<'a>>,
-    /// Shared handle to the calling loop's per-call token counter.
-    /// `SubagentHandler` forwards this into its child `AgentRequest` as
-    /// `parent_token_counter` so the child loop bumps the parent's
-    /// counter on every LLM response — the parent's
-    /// `policy.max_total_tokens` budget transitively covers any
-    /// subagent loop spend. `None` when the handler is dispatched
-    /// outside a `LoopAgent` (unit tests, future direct-handler call
-    /// sites). Adding this field is why `ToolInvocation` is `Clone` but
-    /// no longer `Copy` — `Arc` is not trivially copyable.
-    pub token_budget_share: Option<Arc<AtomicU64>>,
+    /// Budget scope of the calling loop. `SubagentHandler` hands it to
+    /// the child loop so child and grandchild spend count against every
+    /// ancestor's token and tool-call limits. `None` outside a
+    /// `LoopAgent` (unit tests).
+    pub budget: Option<Arc<BudgetScope>>,
+    /// Template scope the calling node was rendered under, used by
+    /// `SubagentHandler` to render the child's `system` and `roots`.
+    pub render_scope: Option<&'a RenderScope>,
     /// Filesystem roots the file builtins (`Read` / `Write` / `Edit`)
     /// are jailed to. Borrowed from the agent's `AgentPolicy.roots`.
     /// Empty when the calling agent did not declare any root or when
@@ -210,7 +209,8 @@ impl<'a> ToolInvocation<'a> {
             call_id,
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots: &[],
             domains: DomainRules::default(),
         }
@@ -226,7 +226,8 @@ impl<'a> ToolInvocation<'a> {
             call_id,
             depth: 0,
             state_handle: None,
-            token_budget_share: None,
+            budget: None,
+            render_scope: None,
             roots,
             domains: DomainRules::default(),
         }

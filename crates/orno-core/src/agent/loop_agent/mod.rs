@@ -29,6 +29,7 @@
 //! all unit tests; `policy.rs` owns the effect-gate and parse-retry
 //! helpers; `run.rs` owns the `impl Agent for LoopAgent` body.
 
+mod history;
 pub(crate) mod policy;
 mod run;
 
@@ -163,6 +164,7 @@ mod tests {
     mod strictness_resources;
     mod strictness_tools;
     mod subagent;
+    mod tool_errors;
 
     use super::wire_name_from_yaml;
 

@@ -1,6 +1,7 @@
 //! Error hierarchy. One enum per subsystem, `#[source]` for chaining,
 //! `#[from]` only where the conversion is unambiguous.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -91,7 +92,7 @@ pub enum NodeError {
 }
 
 /// Agent-loop errors surfaced from [`crate::agent::Agent::run`]. Carries
-/// the variants enforced by the strictness contract: `PolicyInvalid`,
+/// the variants enforced by the strictness contract: `InvalidPolicy`,
 /// `IterationLimitExceeded`, `UnknownToolCalled`, `BudgetExceeded`, and
 /// `ParseFailed`.
 #[derive(Debug, Error)]
@@ -132,7 +133,8 @@ pub enum AgentError {
     #[error("tool `{tool}` arguments failed to parse: {error}")]
     ParseFailed { tool: String, error: String },
 
-    /// A tool handler returned an error. `name` is the tool name for
+    /// A tool handler returned a terminal error (see
+    /// [`ToolError::is_recoverable`]). `name` is the tool name for
     /// context; `source` is the underlying `ToolError`.
     #[error("tool `{name}` failed")]
     Tool {
@@ -256,12 +258,52 @@ pub enum McpError {
     UnknownTool { server: String, tool: String },
 }
 
+/// Why a tool run failed in a way the model can act on. Matched on by
+/// the tape and by tests; the human-readable detail lives in the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RecoverableKind {
+    /// A path the model named does not exist.
+    NotFound,
+    /// A file exists but its content cannot be used as asked (not UTF-8).
+    InvalidData,
+    /// The tool hit its own time limit.
+    Timeout,
+    /// An edit's `old_string` matched zero or several places in the file.
+    NoMatch,
+    /// An external tool ran and reported a failure (MCP `isError: true`).
+    ToolReported,
+}
+
+impl std::fmt::Display for RecoverableKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "not_found",
+            Self::InvalidData => "invalid_data",
+            Self::Timeout => "timeout",
+            Self::NoMatch => "no_match",
+            Self::ToolReported => "tool_reported",
+        })
+    }
+}
+
 /// Errors surfaced from [`crate::tool::ToolHandler::invoke`].
 /// Handlers return these; [`AgentError::Tool`] wraps them with
 /// the tool name for caller context.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ToolError {
+    /// The tool ran and failed in a way the model can react to (missing
+    /// file, timeout, tool-reported error). The agent loop feeds
+    /// `message` back as a tool result instead of terminating.
+    #[error("tool `{name}` failed ({kind}): {message}")]
+    Recoverable {
+        name: String,
+        kind: RecoverableKind,
+        message: String,
+    },
+
     /// The underlying I/O or API call failed. `source` carries the
     /// original error chain.
     #[error("tool `{name}` invocation failed")]
@@ -301,4 +343,37 @@ pub enum ToolError {
     /// root-jail when the requested path escapes the configured roots.
     #[error("tool access denied: {reason}")]
     Denied { reason: String },
+}
+
+impl ToolError {
+    /// True when the agent loop should show the failure to the model and
+    /// continue. Jail and policy violations, oversize state and internal
+    /// invocation failures stay terminal.
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Recoverable { .. } | Self::NotImplemented { .. })
+    }
+
+    /// Wrap an I/O failure, classifying the kinds the model can fix by
+    /// changing its request. `context` names the path or command.
+    #[must_use]
+    pub fn from_io(name: &str, context: &str, err: std::io::Error) -> Self {
+        let kind = match err.kind() {
+            std::io::ErrorKind::NotFound => Some(RecoverableKind::NotFound),
+            std::io::ErrorKind::InvalidData => Some(RecoverableKind::InvalidData),
+            std::io::ErrorKind::TimedOut => Some(RecoverableKind::Timeout),
+            _ => None,
+        };
+        match kind {
+            Some(kind) => Self::Recoverable {
+                name: name.to_string(),
+                kind,
+                message: format!("{context}: {err}"),
+            },
+            None => Self::Invocation {
+                name: name.to_string(),
+                source: Box::new(err),
+            },
+        }
+    }
 }

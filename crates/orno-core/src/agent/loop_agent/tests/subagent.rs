@@ -1,4 +1,6 @@
-use super::helpers::{DottedEchoTool, RecordingScriptedTransport, request};
+use super::helpers::{
+    DottedEchoTool, RecordingScriptedTransport, request, text_response, tool_calls_response,
+};
 use crate::agent::Agent;
 use crate::agent::loop_agent::{LoopAgent, LoopAgentConfig};
 use crate::error::AgentError;
@@ -342,5 +344,285 @@ async fn unlisted_subagent_call_terminates_with_unknown_tool(#[case] called: &st
     assert!(
         matches!(&err, AgentError::UnknownToolCalled { name } if name == called),
         "got {err:?}",
+    );
+}
+
+/// Tool that counts how many times it ran.
+struct CountingTool(std::sync::atomic::AtomicU32);
+
+#[async_trait::async_trait]
+impl ToolHandler for CountingTool {
+    fn name(&self) -> &str {
+        "CountingTool"
+    }
+    fn description(&self) -> &str {
+        "Counts calls."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn effect(&self) -> crate::tool::ToolEffect {
+        crate::tool::ToolEffect::ReadOnly
+    }
+    async fn invoke(
+        &self,
+        _inv: crate::tool::ToolInvocation<'_>,
+        _args: serde_json::Value,
+    ) -> Result<String, crate::error::ToolError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok("counted".into())
+    }
+}
+
+/// Parent loop wired with a `SubagentHandler` per `(name, config)` pair, the
+/// same way the CLI does it.
+fn agent_with_subagents(
+    transport: Arc<dyn LlmTransport>,
+    sink: Arc<dyn EventSink>,
+    children: Vec<(&'static str, AgentConfig)>,
+    extra_tools: Vec<Arc<dyn ToolHandler>>,
+) -> Arc<LoopAgent> {
+    Arc::new_cyclic(|weak: &Weak<LoopAgent>| {
+        let mut tools = extra_tools;
+        for (name, config) in children {
+            tools.push(Arc::new(crate::tool::SubagentHandler::new(
+                format!("subagent.{name}"),
+                name.into(),
+                config,
+                weak.clone(),
+                sink.clone(),
+            )));
+        }
+        LoopAgent::new(LoopAgentConfig {
+            transport,
+            sink,
+            redactor: Arc::new(Redactor::default()),
+            body_excerpt_max_bytes: 256,
+            tools,
+        })
+    })
+}
+
+#[tokio::test]
+async fn grandchild_token_spend_trips_the_root_budget() {
+    // The grandchild's own limit is generous; only the root's 100 can stop it.
+    let mut child = child_agent_config();
+    child.allowed_tools = vec!["subagent.grandchild".into()];
+    child.policy.max_iterations = 3;
+    child.policy.max_subagent_depth = 2;
+    let mut grandchild = child_agent_config();
+    grandchild.policy.max_total_tokens = 10_000;
+
+    let grandchild_reply = LlmResponse {
+        usage: Some(Usage {
+            prompt_tokens: 75,
+            completion_tokens: 75,
+            total_tokens: 150,
+        }),
+        ..text_response("grandchild done")
+    };
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        tool_calls_response(&[("c1", "subagent_child", serde_json::json!({"prompt": "go"}))]),
+        tool_calls_response(&[(
+            "c2",
+            "subagent_grandchild",
+            serde_json::json!({"prompt": "go deeper"}),
+        )]),
+        grandchild_reply,
+        text_response("never requested"),
+    ]));
+    let agent = agent_with_subagents(
+        transport.clone(),
+        Arc::new(InMemorySink::new()),
+        vec![("child", child), ("grandchild", grandchild)],
+        Vec::new(),
+    );
+
+    let mut req = request();
+    req.policy.max_iterations = 4;
+    req.policy.max_total_tokens = 100;
+    req.policy.max_subagent_depth = 2;
+    req.allowed_tools = vec!["subagent.child".into()];
+
+    let err = agent
+        .run("run_test", "n", req)
+        .await
+        .expect_err("depth-2 spend must reach the root budget");
+
+    assert!(
+        matches!(
+            err,
+            AgentError::BudgetExceeded {
+                kind: BudgetKind::Tokens
+            }
+        ),
+        "got {err:?}",
+    );
+    assert_eq!(
+        transport.max_tokens_seen().len(),
+        3,
+        "no LLM call may follow the breach",
+    );
+}
+
+#[tokio::test]
+async fn child_tool_calls_count_against_the_parent_limit() {
+    let mut child = child_agent_config();
+    child.allowed_tools = vec!["CountingTool".into()];
+    child.policy.max_iterations = 5;
+    let counting = Arc::new(CountingTool(std::sync::atomic::AtomicU32::new(0)));
+
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        tool_calls_response(&[("c1", "subagent_child", serde_json::json!({"prompt": "go"}))]),
+        tool_calls_response(&[("c2", "CountingTool", serde_json::json!({}))]),
+        tool_calls_response(&[("c3", "CountingTool", serde_json::json!({}))]),
+        text_response("parent carries on"),
+    ]));
+    let sink = Arc::new(InMemorySink::new());
+    let agent = agent_with_subagents(
+        transport,
+        sink.clone(),
+        vec![("child", child)],
+        vec![counting.clone()],
+    );
+
+    let mut req = request();
+    req.policy.max_iterations = 4;
+    // One call for the subagent itself plus one child call fit; the second child call does not.
+    req.policy.max_tool_calls = 2;
+    req.policy.max_subagent_depth = 1;
+    req.allowed_tools = vec!["subagent.child".into()];
+
+    agent
+        .run("run_test", "n", req)
+        .await
+        .expect("the parent survives its child's failure");
+
+    assert_eq!(
+        counting.0.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the child's second call must be refused",
+    );
+    let failed = sink.snapshot().into_iter().find_map(|e| match e.event {
+        Event::SubagentFailed { error, .. } => Some(error),
+        _ => None,
+    });
+    assert!(
+        failed.is_some_and(|e| e.contains("ToolCalls")),
+        "child must fail on the tool-call budget",
+    );
+}
+
+fn templated_child(roots: Vec<std::path::PathBuf>) -> AgentConfig {
+    let mut child = child_agent_config();
+    child.system = Some("You are {{ vars.name }}".into());
+    child.allowed_tools = vec!["Read".into()];
+    child.policy.max_iterations = 3;
+    child.policy.roots = roots;
+    child
+}
+
+fn render_scope(vars: &serde_json::Value) -> crate::pipeline::template::RenderScope {
+    crate::pipeline::template::RenderScope::new(
+        Arc::new(crate::pipeline::template::TemplateEngine::new()),
+        Arc::new(serde_json::json!({ "vars": vars })),
+    )
+}
+
+#[tokio::test]
+async fn child_system_and_roots_are_rendered_against_the_parent_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    std::fs::write(tmp.path().join("sub/hello.txt"), "hello contents").unwrap();
+    let root = tmp.path().to_path_buf();
+
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![
+        tool_calls_response(&[("c1", "subagent_child", serde_json::json!({"prompt": "go"}))]),
+        tool_calls_response(&[("c2", "Read", serde_json::json!({"path": "hello.txt"}))]),
+        text_response("child done"),
+        text_response("parent done"),
+    ]));
+    let agent = agent_with_subagents(
+        transport.clone(),
+        Arc::new(InMemorySink::new()),
+        vec![("child", templated_child(vec!["{{ vars.root }}/sub".into()]))],
+        vec![Arc::new(crate::tool::ReadHandler)],
+    );
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_subagent_depth = 1;
+    req.policy.roots = vec![root.clone()];
+    req.allowed_tools = vec!["subagent.child".into()];
+    req.render_scope = Some(render_scope(
+        &serde_json::json!({ "name": "alpha", "root": root }),
+    ));
+
+    let out = agent.run("run_test", "n", req).await.expect("run succeeds");
+
+    assert_eq!(out.content, "parent done");
+    assert_eq!(
+        transport.systems_seen()[1].as_deref(),
+        Some("You are alpha"),
+        "child system prompt must be rendered",
+    );
+    let child_second_request = &transport.messages_seen()[2];
+    assert!(
+        child_second_request.iter().any(|m| matches!(
+            m,
+            crate::llm::OrnoChatMessage::ToolResult { content, .. } if content == "hello contents"
+        )),
+        "the rendered root must let the child read inside it: {child_second_request:?}",
+    );
+}
+
+#[rstest::rstest]
+#[case::sibling_directory("{{ vars.outside }}")]
+#[case::parent_dir_component("{{ vars.root }}/../escape")]
+#[tokio::test]
+async fn rendered_child_root_outside_the_parent_roots_is_rejected(#[case] child_root: &str) {
+    let parent_dir = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+
+    let transport = Arc::new(RecordingScriptedTransport::new(vec![tool_calls_response(
+        &[("c1", "subagent_child", serde_json::json!({"prompt": "go"}))],
+    )]));
+    let agent = agent_with_subagents(
+        transport.clone(),
+        Arc::new(InMemorySink::new()),
+        vec![("child", templated_child(vec![child_root.into()]))],
+        vec![Arc::new(crate::tool::ReadHandler)],
+    );
+
+    let mut req = request();
+    req.policy.max_iterations = 3;
+    req.policy.max_subagent_depth = 1;
+    req.policy.roots = vec![parent_dir.path().to_path_buf()];
+    req.allowed_tools = vec!["subagent.child".into()];
+    req.render_scope = Some(render_scope(&serde_json::json!({
+        "name": "alpha",
+        "root": parent_dir.path(),
+        "outside": outside.path(),
+    })));
+
+    let err = agent
+        .run("run_test", "n", req)
+        .await
+        .expect_err("a root outside the parent's must be a terminal policy error");
+
+    assert!(
+        matches!(
+            &err,
+            AgentError::Tool {
+                source: crate::error::ToolError::Denied { .. },
+                ..
+            }
+        ),
+        "got {err:?}",
+    );
+    assert_eq!(
+        transport.max_tokens_seen().len(),
+        1,
+        "the child loop must never start",
     );
 }

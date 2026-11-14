@@ -69,6 +69,7 @@ impl NodeExecutor for AgentExecutor {
             model,
             policy,
             allowed_tools,
+            render_scope,
         }) = req
         else {
             return Err(NodeError::Execution {
@@ -93,10 +94,10 @@ impl NodeExecutor for AgentExecutor {
             // subagent tool call from depth N dispatches the child at
             // `N + 1`; see `LoopAgent::run` for the recursion gate.
             depth: 0,
-            // Root request has no parent loop to charge — the parent
-            // counter is `Some` only on subagent recursion (set inside
-            // `SubagentHandler::invoke`).
-            parent_token_counter: None,
+            // The root has no parent loop to charge; children get
+            // theirs from `SubagentHandler::invoke`.
+            parent_budget: None,
+            render_scope,
         };
 
         let output = self
@@ -221,6 +222,7 @@ mod tests {
             model: "gpt-5".into(),
             policy: policy(),
             allowed_tools: Vec::new(),
+            render_scope: None,
         })
     }
 
