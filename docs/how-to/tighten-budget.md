@@ -197,7 +197,7 @@ nodes:
 
 Why separate? Because wall-clock is an executor concern, not an agent-loop concern. A shell node can also time out; the field lives on the node, not the policy.
 
-A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. It does **not** fire when an agent is mid-LLM-call; orno polls for the deadline between turns. To kill mid-call you need OS-level signals (e.g., `timeout` wrapper around `orno run`).
+A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. The deadline wraps the whole node, so it also cuts off an LLM call or tool call that is still in flight; a shell node's process group is killed.
 
 ## Step 7 — Counting denied calls
 

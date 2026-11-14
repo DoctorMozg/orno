@@ -69,7 +69,7 @@ pub enum Command {
         max_node_output_bytes: Option<usize>,
 
         /// Write all LLM request/response pairs to a tape file for later
-        /// replay. Creates or truncates the file. Mutually exclusive with
+        /// replay. Fails if the file already exists. Mutually exclusive with
         /// `--replay-tape`.
         #[arg(
             long = "record-tape",
@@ -89,7 +89,7 @@ pub enum Command {
         replay_tape: Option<PathBuf>,
 
         /// Write all tool invocation results to a tape file for later
-        /// replay. Creates or truncates the file. Mutually exclusive
+        /// replay. Fails if the file already exists. Mutually exclusive
         /// with `--replay-tool-tape`.
         #[arg(
             long = "record-tool-tape",

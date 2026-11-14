@@ -60,7 +60,7 @@ If a gate fails on something unrelated to the current change (e.g. a newly-repor
 
 Two crates:
 
-- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine, telemetry. The binary's `clap` dependency does NOT live here; `tokio` is used with an explicit, minimal feature list.
+- `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine. The binary's `clap` dependency does NOT live here; `tokio` is used with an explicit, minimal feature list.
 - `crates/orno-cli/` — binary (`orno`). Subcommand dispatch, output formatting, clap derive. Depends on `orno-core` only.
 
 Do not split further without a concrete consumer or a build-parallelism justification.
