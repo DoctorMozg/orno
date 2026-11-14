@@ -32,7 +32,7 @@ A clean working tree should pass orno's full quality gate:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets
+cargo test --workspace --all-targets --all-features
 cargo deny check
 cargo machete
 typos

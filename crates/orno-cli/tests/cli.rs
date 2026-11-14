@@ -6,17 +6,45 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use predicates::str::contains;
 
+/// Provider key env vars stripped from every child so no test can reach a
+/// live, billed LLM with the developer's credentials.
+const PROVIDER_KEY_ENVS: [&str; 3] = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"];
+
 fn orno() -> Command {
-    Command::cargo_bin("orno").expect("orno binary should build")
+    let mut cmd = Command::cargo_bin("orno").expect("orno binary should build");
+    for name in PROVIDER_KEY_ENVS {
+        cmd.env_remove(name);
+    }
+    cmd
 }
 
-/// Build an `orno` command with the test-only `DummyTransport` env var
-/// set. Needed for any test that drives an `agent` node without a real
-/// LLM API key — otherwise the run hits the live provider. The var
-/// name mirrors `run.rs::TEST_TRANSPORT_ENV`.
+/// Without the feature the binary ignores `ORNO_TEST_LLM_TRANSPORT`, so fail
+/// with the fix instead of a confusing missing-key error.
+#[cfg(not(feature = "test-transport"))]
+fn require_test_transport() {
+    panic!(
+        "this test needs the fake LLM transport: run with `--features test-transport` (or `--all-features`)"
+    );
+}
+
+#[cfg(feature = "test-transport")]
+fn require_test_transport() {}
+
+/// `orno` with the deterministic `DummyTransport`; the var name mirrors
+/// `run.rs::TEST_TRANSPORT_ENV`.
 fn orno_with_dummy_transport() -> Command {
+    require_test_transport();
     let mut cmd = orno();
     cmd.env("ORNO_TEST_LLM_TRANSPORT", "dummy");
+    cmd
+}
+
+/// `orno` with `ScriptedTransport` answering from the JSON array at `tape`.
+fn orno_with_scripted_transport(tape: &std::path::Path) -> Command {
+    require_test_transport();
+    let mut cmd = orno();
+    cmd.env("ORNO_TEST_LLM_TRANSPORT", "scripted")
+        .env("ORNO_TEST_SCRIPTED_TAPE", tape);
     cmd
 }
 
@@ -414,6 +442,82 @@ fn record_bundle_then_replay_exits_success() {
         stdout.contains(r#""type":"run_finished""#),
         "expected run_finished after replay: {stdout}",
     );
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one record-then-replay scenario with its inline pipeline and tape"
+)]
+fn replay_keeps_recorded_mutation_policy_without_touching_the_host() {
+    // A recorded Write must replay as allowed (not denied) so the next LLM
+    // request hashes to the recorded key, yet replay must not write the file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("out.txt");
+    let yaml = format!(
+        r#"
+version: 1
+agents:
+  a:
+    model: openai/gpt-5
+    provider: openrouter
+    allowed_tools: [Write]
+    policy:
+      max_iterations: 3
+      max_total_tokens: 10000
+      max_tool_calls: 2
+      max_subagent_depth: 0
+      allow_mutations: true
+      allow_network: false
+      roots: ["{root}"]
+      on_parse_error: fail
+nodes:
+  - id: n
+    kind: agent
+    agent: a
+    initial_prompt: "write it"
+"#,
+        root = dir.path().display()
+    );
+    let pipeline = write_pipeline(&yaml);
+    let tape = write_pipeline(
+        &serde_json::json!([
+            {
+                "content": "",
+                "finish_reason": "tool_calls",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "tool_calls": [{"call_id": "c1", "fn_name": "Write",
+                    "fn_arguments": {"path": target.to_str().unwrap(), "content": "hello"}}]
+            },
+            {"content": "done", "finish_reason": "stop",
+             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+        ])
+        .to_string(),
+    );
+    let bundle = dir.path().join("bundle.ndjson");
+
+    orno_with_scripted_transport(tape.path())
+        .args([
+            "run",
+            pipeline.path().to_str().unwrap(),
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+    std::fs::remove_file(&target).unwrap();
+
+    let assert = orno()
+        .args(["replay", bundle.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains(r#""type":"tool_denied""#),
+        "stdout: {stdout}"
+    );
+    assert!(!target.exists(), "replay must answer Write from the tape");
 }
 
 const ENV_AND_SECRET_PIPELINE: &str = r#"
@@ -912,9 +1016,7 @@ nodes:
     let tape = write_pipeline(&format!(
         r#"[{{"content": "the key is {key}", "finish_reason": "stop"}}]"#
     ));
-    let assert = orno()
-        .env("ORNO_TEST_LLM_TRANSPORT", "scripted")
-        .env("ORNO_TEST_SCRIPTED_TAPE", tape.path())
+    let assert = orno_with_scripted_transport(tape.path())
         .env("OPENAI_API_KEY", key)
         .args(["run", pipeline.path().to_str().unwrap()])
         .assert()

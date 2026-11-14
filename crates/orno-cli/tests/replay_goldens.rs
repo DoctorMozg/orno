@@ -87,3 +87,31 @@ fn hello_bundle_replays_to_stable_event_stream() {
 
     insta::assert_yaml_snapshot!(events);
 }
+
+/// Every bundle checked in under `examples/` must still replay, so a
+/// request-shape change that strands a committed recording fails CI.
+#[test]
+fn example_bundles_still_replay() {
+    let examples = std::path::Path::new("../../examples");
+    let mut bundles: Vec<_> = std::fs::read_dir(examples)
+        .expect("read examples/")
+        .filter_map(|entry| {
+            let path = entry.expect("examples entry").path().join("bundle.ndjson");
+            path.is_file().then_some(path)
+        })
+        .collect();
+    bundles.sort();
+    assert!(
+        !bundles.is_empty(),
+        "no example bundles found under examples/"
+    );
+
+    for bundle in bundles {
+        orno()
+            .env_remove("OPENROUTER_API_KEY")
+            .arg("replay")
+            .arg(&bundle)
+            .assert()
+            .success();
+    }
+}

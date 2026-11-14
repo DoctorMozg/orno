@@ -143,6 +143,16 @@ once the first tagged release ships.
   the node on the inherited pipes nor outlives a timeout.
 - Capped shell and `Bash` output no longer collapses to empty when it
   ends in stray UTF-8 continuation bytes.
+- `orno replay` keeps each agent's recorded `allow_mutations` and
+  `allow_network`, so recorded MCP and mutating tool calls replay instead
+  of being denied and missing the next LLM entry. Replay still runs
+  nothing live: tool calls answer from the tape.
+- `examples/mcp-http-demo/bundle.ndjson` is re-recorded with the current
+  request shape, and a test replays every bundle under `examples/` so a
+  stranded recording fails CI.
+- CLI integration tests strip provider API keys from the child env, so a
+  `cargo test` without `--features test-transport` fails with a clear
+  message instead of calling a live, billed LLM.
 
 ### Removed
 

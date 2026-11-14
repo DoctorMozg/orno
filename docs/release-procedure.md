@@ -14,16 +14,16 @@ This page is the operator-facing checklist for cutting an orno release. The rele
 1. **Fix source first.** No tag goes out unless the commit it points at is independently green. If you spot a regression after tagging, revert the tag — never rewrite history on a published version.
 2. **Push the version tag.**
    ```
-   git tag v0.1.<n>
-   git push origin v0.1.<n>
+   git tag v<X.Y.Z>
+   git push origin v<X.Y.Z>
    ```
-   Pre-release? Use `v0.1.<n>-rc.1` (or similar `-` suffix). The release workflow auto-detects pre-releases via `contains(github.ref, '-')`.
+   Pre-release? Use `v<X.Y.Z>-rc.1` (or similar `-` suffix). The release workflow auto-detects pre-releases via `contains(github.ref, '-')`.
    The tag must equal `workspace.package.version` in the root `Cargo.toml`; the workflow fails otherwise. Also bump the pinned `v0.2.0` in the README install command to the new tag.
 3. **Wait for the draft release.** The `release` workflow creates the GitHub Release as a **draft** first, then runs the `upload-assets` matrix. If any platform build fails, `fail-fast: true` aborts the rest and the draft stays in place for you to triage. **Do not retry by re-tagging** — fix the source, delete the draft, retag.
 4. **Verify all assets attached.** On the draft release page, confirm:
-   - `orno-v0.1.<n>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`)
-   - `orno-v0.1.<n>-aarch64-apple-darwin.tar.gz` (+ `.sha256`)
-   - `orno-v0.1.<n>-x86_64-pc-windows-msvc.zip` (+ `.sha256`)
+   - `orno-v<X.Y.Z>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`)
+   - `orno-v<X.Y.Z>-aarch64-apple-darwin.tar.gz` (+ `.sha256`)
+   - `orno-v<X.Y.Z>-x86_64-pc-windows-msvc.zip` (+ `.sha256`)
    Six files total. Anything missing means the matrix didn't complete — investigate before continuing.
 5. **Approve publication.** The `publish-release` job flips `draft: false` automatically once `upload-assets` reports green. There's no manual checkbox today, but the draft window is your verification step. If you spot a problem, delete the draft before the un-draft step lands.
 
@@ -40,11 +40,11 @@ If a published version turns out broken or compromised:
 1. **Yank the GitHub Release** — flip it back to draft or delete it. This stops `install.sh`'s "latest release" lookup from finding it.
 2. **Rewind the major tag** to the previous good release:
    ```
-   git tag -f v0 v0.1.<previous-good>
+   git tag -f v0 v<previous-good>
    git push -f origin v0
    ```
    This is the single point of truth for `uses: DoctorMozg/orno@v0` consumers — once the major tag moves, new CI runs pick up the rollback automatically.
-3. **Do not delete the version tag** (`v0.1.<bad>`). Keep the bad tag in git so users referencing it get a clean, identifiable version rather than a confusing 404. Note the rollback in `CHANGELOG.md` under `### Security` if the cause was a vulnerability.
+3. **Do not delete the version tag** (`v<bad>`). Keep the bad tag in git so users referencing it get a clean, identifiable version rather than a confusing 404. Note the rollback in `CHANGELOG.md` under `### Security` if the cause was a vulnerability.
 4. **Cut a fixed release** on top of master with the next patch number. Roll the major tag forward to it.
 
 ## CHANGELOG security format

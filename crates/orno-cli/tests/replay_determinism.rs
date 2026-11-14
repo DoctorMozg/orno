@@ -11,11 +11,32 @@ use assert_cmd::Command;
 use predicates::str::contains;
 use serde_json::json;
 
+/// Provider key env vars stripped from every child so no test can reach a
+/// live, billed LLM with the developer's credentials.
+const PROVIDER_KEY_ENVS: [&str; 3] = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"];
+
 fn orno() -> Command {
-    Command::cargo_bin("orno").expect("orno binary should build")
+    let mut cmd = Command::cargo_bin("orno").expect("orno binary should build");
+    for name in PROVIDER_KEY_ENVS {
+        cmd.env_remove(name);
+    }
+    cmd
 }
 
+/// Without the feature the binary ignores `ORNO_TEST_LLM_TRANSPORT`, so fail
+/// with the fix instead of a confusing missing-key error.
+#[cfg(not(feature = "test-transport"))]
+fn require_test_transport() {
+    panic!(
+        "this test needs the fake LLM transport: run with `--features test-transport` (or `--all-features`)"
+    );
+}
+
+#[cfg(feature = "test-transport")]
+fn require_test_transport() {}
+
 fn orno_with_dummy_transport() -> Command {
+    require_test_transport();
     let mut cmd = orno();
     cmd.env("ORNO_TEST_LLM_TRANSPORT", "dummy");
     cmd
@@ -311,6 +332,7 @@ fn three_subagent_run_record_then_replay_preserves_event_sequence() {
 
     // Record: run three-lens.yaml with ScriptedTransport and
     // capture the LLM tape.
+    require_test_transport();
     let record_assert = orno()
         .env("ORNO_TEST_LLM_TRANSPORT", "scripted")
         .env(

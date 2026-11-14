@@ -252,7 +252,7 @@ After 5–10 runs, tighten to the observed p99 + 20%.
 A scheduled CI job needs a hard cost ceiling. Get the worst-case token count from `orno plan`:
 
 ```bash
-orno plan pipeline.yaml | jq -r '.[] | select(.type == "plan_summary") | .max_tokens_total'
+orno plan pipeline.yaml | jq -r 'select(.type == "plan_summary") | .max_tokens_total'
 # 130000
 ```
 

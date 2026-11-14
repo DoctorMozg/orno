@@ -9,6 +9,10 @@
 //! - each `mcp.*` tool an agent allows gets a stub carrying the recorded
 //!   description and schema, so the replayed request matches the tape key;
 //! - `RunInputs` comes from the bundle, with every secret value masked.
+//!
+//! Agent policies stay as recorded so allow/deny decisions replay
+//! identically. Nothing runs live regardless: tool calls answer from the
+//! tape, MCP servers are never spawned, and shell nodes are refused.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -45,7 +49,6 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     // and fails pre-flight with `UnknownToolCalled`.
     let server_tool_names = derive_server_tools(&mcp_tool_defs, &pipeline);
     pipeline::load::expand_mcp_wildcards(&mut pipeline, &server_tool_names);
-    disable_live_effects(&mut pipeline);
 
     // A tape miss surfaces as `LlmError::ReplayMiss`; there is no fallback
     // to the live API.
@@ -100,24 +103,6 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     };
 
     super::finalize_run(&streaming_sink, &outcome, "replay")
-}
-
-/// A bundle must not mutate the host or reach the network whatever its
-/// embedded YAML claims, so both flags are forced off on every agent.
-fn disable_live_effects(pipeline: &mut pipeline::Pipeline) {
-    let had_mutations = pipeline.agents.values().any(|a| a.policy.allow_mutations);
-    let had_network = pipeline.agents.values().any(|a| a.policy.allow_network);
-    for agent_cfg in pipeline.agents.values_mut() {
-        agent_cfg.policy.allow_mutations = false;
-        agent_cfg.policy.allow_network = false;
-    }
-    if had_mutations || had_network {
-        tracing::info!(
-            had_mutations,
-            had_network,
-            "replay: allow_mutations and allow_network overridden to false"
-        );
-    }
 }
 
 /// Builtin handlers plus one stub per declared `mcp.*` tool, each wrapped

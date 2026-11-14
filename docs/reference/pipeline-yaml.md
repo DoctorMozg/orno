@@ -46,8 +46,8 @@ Numbers, booleans, and nulls pass through unchanged. Arrays and objects recurse,
 `vars.commits: ["{{ env.SHA }}"]` and `vars.opts: { tag: "{{ env.TAG }}" }` both expand
 element-by-element.
 
-Cross-var references (`vars.b: "{{ vars.a }}"`) are intentionally **not** supported in
-v0.1.x, because the rendering context exposes only `env` and `secrets`. A `{{ vars.x }}` lookup
+Cross-var references (`vars.b: "{{ vars.a }}"`) are intentionally **not** supported,
+because the rendering context exposes only `env` and `secrets`. A `{{ vars.x }}` lookup
 inside another `vars` entry will fail with `PipelineError::Template { name: "vars.b", … }`.
 
 ## Environment and secrets

@@ -149,6 +149,17 @@ Don't trust a remote MCP server's claim that a tool is "read-only" or "non-mutat
 For high-trust scenarios (a server you control), the bearer-auth + domain-filter combination is the strictest:
 
 ```yaml
+secrets:
+  - INTERNAL_MCP_TOKEN
+
+mcp_servers:
+  internal:
+    transport: http
+    url: "https://internal-mcp.company.com/mcp"
+    auth:
+      kind: bearer
+      token: "{{ secrets.INTERNAL_MCP_TOKEN }}"
+
 agents:
   trusted_caller:
     allowed_tools:
