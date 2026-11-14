@@ -214,7 +214,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
     });
     let engine = build_engine(sink.clone(), loop_agent, engine_config);
 
-    let run_outcome = tokio::select! {
+    let run_result = tokio::select! {
         biased;
         () = super::sigint_with_warning() => {
             handle_sigint(
@@ -226,7 +226,10 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
             ).await;
             return Err(super::Interrupted.into());
         }
-        res = engine.run(&run_id, &pipeline, inputs) => res?,
+        // Do not propagate engine errors here — cleanup must run first
+        // so MCP clients drain and the recording tape flushes even when
+        // the engine terminates with a CoreError.
+        res = engine.run(&run_id, &pipeline, inputs) => res,
     };
 
     flush_and_assemble(
@@ -236,7 +239,7 @@ pub async fn run(path: &Path, mut flags: RunFlags) -> Result<()> {
         path,
     )?;
     shutdown_mcp_servers(&sink, &run_id, &mcp_clients).await;
-    finalize_run(&streaming_sink, &run_outcome)
+    finalize_run(&streaming_sink, &run_result?)
 }
 
 /// Derive the `(bundle, llm_tmp, tool_tmp)` paths that back

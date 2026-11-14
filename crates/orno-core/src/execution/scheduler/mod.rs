@@ -176,16 +176,28 @@ impl Engine {
             })
             .await;
 
-        let mut walker = DagWalker::new(pipeline).inspect_err(|err| {
-            // Walker construction failures (cycles, unknown `needs:`
-            // targets) prevent any node from running, so they never
-            // reach the per-node failure path. Surface them on the
-            // human-facing log stream before propagating — the CLI
-            // also prints the chain on exit, but a structured WARN
-            // gives log pipelines a hook with `pipeline.run_id` in
-            // the span.
-            tracing::warn!(error = %err, "walker construction failed");
-        })?;
+        let mut walker = match DagWalker::new(pipeline) {
+            Ok(w) => w,
+            Err(err) => {
+                // Walker construction failures (cycles, unknown `needs:`
+                // targets) prevent any node from running, so they never
+                // reach the per-node failure path. Surface them on the
+                // human-facing log stream before propagating — the CLI
+                // also prints the chain on exit, but a structured WARN
+                // gives log pipelines a hook with `pipeline.run_id` in
+                // the span.
+                tracing::warn!(error = %err, "walker construction failed");
+                self.sink
+                    .record(Event::RunFinished {
+                        run_id: run_id.clone(),
+                        ok: false,
+                        failed_nodes: vec![],
+                        skipped_nodes: vec![],
+                    })
+                    .await;
+                return Err(err.into());
+            },
+        };
         // id → discriminator string ("agent" / "shell"). Used by the
         // skip-cascade path which only knows the skipped node's id, not
         // its kind. The map is built once because skip cascade can
@@ -202,12 +214,25 @@ impl Engine {
         // this step the literal `{{ env.TAG }}` would land in
         // `vars.tag` and downstream `{{ vars.tag }}` references would
         // substitute the unrendered template source verbatim.
-        let rendered_vars = crate::pipeline::template::render_pipeline_vars(
+        let rendered_vars = match crate::pipeline::template::render_pipeline_vars(
             &self.templates,
             &pipeline.vars,
             &inputs.env,
             &inputs.secrets,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                self.sink
+                    .record(Event::RunFinished {
+                        run_id: run_id.clone(),
+                        ok: false,
+                        failed_nodes: vec![],
+                        skipped_nodes: vec![],
+                    })
+                    .await;
+                return Err(err.into());
+            },
+        };
         let mut context = Context::new(rendered_vars, inputs.env, inputs.secrets);
         let mut run_ok = true;
         // `RunFinished` aggregates. Both vectors capture

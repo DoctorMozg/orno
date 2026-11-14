@@ -50,10 +50,6 @@ pub enum Event {
         node_kind: String,
         reason: SkipReason,
     },
-    BudgetExceeded {
-        run_id: String,
-        reason: String,
-    },
     /// Emitted at the start of each agent iteration before the LLM
     /// transport is called. `iteration` is 0-based so a single-shot
     /// agent emits `iteration: 0`.

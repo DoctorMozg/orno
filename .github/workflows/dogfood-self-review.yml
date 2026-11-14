@@ -105,9 +105,10 @@ jobs:
           PR_REPO: ${{ github.workspace }}/pr-head
           TRUSTED_ROOT: ${{ github.workspace }}/trusted-master
           GH_REPO: ${{ github.repository }}
-          # gh pr comment reads GH_TOKEN from the inherited process env;
-          # orno does not strip env when spawning shell children, so the
-          # `post_comment` shell node sees this token automatically.
+          # GH_TOKEN is listed in the pipeline's `pass_env:` block so it
+          # becomes available as `{{ env.GH_TOKEN }}` in templates.
+          # The `post_comment` node delivers it to `gh` via its `env:` map
+          # because the shell executor clears the inherited process env.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           version: v0.2.0

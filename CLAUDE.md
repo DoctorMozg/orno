@@ -4,11 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## About orno
 
-Orno is a CI-native runner for **strict agentic loops** (Rust workspace) in pre-v0.1 skeleton state. Trait seams and module tree are in place; the agent loop, tool handlers, LLM transport wiring, MCP client, scheduler parallelism, and record/replay are intentionally unimplemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
+Orno is a CI-native runner for **strict agentic loops** (Rust workspace) at v0.2.0. The agent loop, tool handlers (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`, `SubagentHandler`, `McpHandler`), LLM transport (via `genai`), MCP client (via `rmcp`), execution scheduler, and record/replay are all implemented. Budget enforcement is **inlined** in `loop_agent/run.rs` (per-iteration token, tool-call, and subagent-depth checks) — there is no separate `BudgetEnforcer` seam.
 
-"Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style, ADR 0006), not peer-to-peer messaging between agents.
-
-Read `docs/adr/` before making architectural changes — nine committed ADRs constrain most design decisions. `docs/yaml-spec.md` is the target user-facing YAML shape; `docs/roadmap.md` phases the v0.1.0 build.
+"Multi-agent" in orno means recursive single-agent loops where a parent treats a child as a tool call (Claude Code-style), not peer-to-peer messaging between agents.
 
 ## Common commands
 
@@ -38,7 +36,7 @@ cargo machete                                       # unused-dep scan
 cargo nextest run --workspace --all-targets         # faster test runner (optional)
 ```
 
-CI (`.github/workflows/ci.yml`) runs 9 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `test`, `msrv`, and `coverage`. A release-build matrix runs on ubuntu-latest, macos-14, and windows-2022. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — Phase 2 activation after doc comments exist.
+CI (`.github/workflows/ci.yml`) runs 14 parallel jobs: `fmt`, `clippy`, `docs`, `deny`, `machete`, `typos`, `shellcheck`, `test`, `test-mcp-real`, `msrv`, `coverage`, `build-matrix`, `install-smoke`, and `dogfood`. All jobs use `actions/checkout@v6` and `Swatinem/rust-cache@v2`. Toolchain pinned by `rust-toolchain.toml` (1.95). The `docs` job does NOT yet enforce `RUSTDOCFLAGS="-D rustdoc::all"` — phase activation after doc comments land.
 
 ## Verification after every change batch
 
@@ -60,7 +58,7 @@ If a gate fails on something unrelated to the current change (e.g. a newly-repor
 
 ## Workspace shape
 
-Two crates, enforced by ADR 0001:
+Two crates:
 
 - `crates/orno-core/` — library. Pipeline schema, agent loop, node trait, LLM transport trait, tool handlers, MCP client, event log, execution engine, config, telemetry. The binary's `clap` and `tokio` dependencies do NOT live here.
 - `crates/orno-cli/` — binary (`orno`). Subcommand dispatch, output formatting, clap derive. Depends on `orno-core` only.
@@ -71,18 +69,14 @@ Do not split further without a concrete consumer or a build-parallelism justific
 
 Seven traits constrain the architecture. Every executor path routes through one of these; nothing side-steps them. Additions are append-only.
 
-**Existing in the skeleton:**
-
 1. **`LlmTransport`** (`orno-core/src/llm/mod.rs`) — every LLM call. Concrete impl wraps `genai` (ADR 0002); record/replay lands as a decorator. Do NOT expose `genai` types on orno's public surface.
 2. **`NodeExecutor`** (`orno-core/src/node/mod.rs`) — every node kind. Subprocess plugins return post-v0.1 as a `transport:` axis on the existing kinds (ADR 0017 §3 supersedes the earlier `NodeKind::External` stub from ADR 0004).
 3. **`EventSink`** (`orno-core/src/events/sink.rs`) — every lifecycle event. `InMemorySink` today; feature-gated `SqliteSink` plugs in without scheduler changes.
 4. **`EventEnvelope { schema_version, seq, timestamp, event }`** (`orno-core/src/events/mod.rs`) with `#[non_exhaustive]` on `Event` — versioned wire format. `timestamp` is RFC 3339 UTC (ADR 0018); `seq` stays the strict-ordering key for replay. `Event::NodeSkipped` is part of the wire format; its `reason` field is a `#[non_exhaustive]` `SkipReason` enum (ADR 0021). `Event::NodeFinished` carries `failure: Option<NodeFailure>` populated exactly when `ok: false`; `NodeFailure` is `#[non_exhaustive]` and discriminates `NoExecutorRegistered`, `TemplateRenderFailed`, `ExecutorError`, `NodePayloadFailure { exit_code, stderr_tail }` (ADR 0022). On failed shell nodes, `Engine` also records `resp.output` into `Context.nodes.<id>` so downstream templates can read the unbounded `stderr` / `exit_code`. `Event::LlmRequestFailed { failure: LlmFailure }` pairs every dangling `LlmRequestStarted` on a transport failure; `LlmFailure` is `#[non_exhaustive]` with typed variants (`AuthFailed`, `RateLimited`, `ModelNotFound`, `ApiError { status, body_excerpt }`, `Transport`, `ConfigError`, `ParseError`, `ReplayMiss`, `Other`). `Event::RunFinished` carries `failed_nodes: Vec<String>` and `skipped_nodes: Vec<String>` aggregates in causal order so a tail-line read of the stream summarizes the failure footprint without folding (ADR 0023).
 
-**Planned by ADRs 0005–0008, not yet implemented:**
-
-5. **`Agent`** — agent-loop trait; `LoopAgent` implements ADR 0005's five strictness dimensions.
-6. **`ToolHandler`** — one impl per builtin tool (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`) plus `SubagentHandler` (ADR 0006) and `McpHandler` (ADR 0007). See ADR 0008 for the fixed tool set.
-7. **`McpClient`** — MCP protocol client. Wraps `rmcp` (ADR 0007); swap without touching tool dispatch.
+5. **`Agent`** — agent-loop trait; `LoopAgent` implements the five strictness dimensions.
+6. **`ToolHandler`** — one impl per builtin tool (`BashHandler`, `ReadHandler`, `EditHandler`, `WriteHandler`, `WebFetchHandler`) plus `SubagentHandler` and `McpHandler`.
+7. **`McpClient`** — MCP protocol client. Wraps `rmcp`; swap without touching tool dispatch.
 
 ## The five strictness dimensions
 
@@ -98,7 +92,7 @@ Parallel tool calls are executed **serially** in declaration order. Parallelism 
 
 ## Pipeline wire format
 
-User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.1.0 target):
+User YAML is defined by `orno_core::pipeline::Pipeline`. Top-level blocks (v0.2.0):
 
 - `version: u32` — schema version.
 - `vars: Map<String, Value>` — template variables (MiniJinja).
@@ -111,7 +105,7 @@ Two distinct serde tag conventions are intentional:
 - `Event` uses `#[serde(tag = "type")]` — lifecycle events.
 - `NodeKind` / `NodeRequest` use `#[serde(tag = "kind")]` — pipeline node discriminator.
 
-Both are `#[non_exhaustive]`. v0.1.0 node kinds are `agent` and `shell` (ADR 0009 collapsed `llm` into `agent`; ADR 0017 §1 removed the former `external` variant entirely — it returns post-v0.1 as a `transport:` axis on the existing kinds, not as a sibling kind). `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
+Both are `#[non_exhaustive]`. v0.2.0 node kinds are `agent` and `shell`. `http`/`parse`/`assert` are not separate kinds — their work happens inside agent tooling. After adding a variant that affects user pipelines, regenerate `schemas/pipeline.schema.json` via `cargo run -p orno-cli -- schema`.
 
 Execution model: `Engine::run` drives a generator-style `DagWalker` (`execution::walker`) over the pipeline's DAG, dispatches each ready node through `NodeRegistry::get(kind_str).execute(id, req)` against a per-node `Context` (`execution::context`), and on node failure emits `NodeSkipped { reason: SkipReason::DependencyFailed { upstream } }` for every transitively-dependent node (ADR 0021). Disjoint branches keep running.
 

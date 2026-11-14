@@ -68,7 +68,7 @@ A tail-line read of `run_finished` summarizes the run's failure footprint withou
 Emitted just before a node's executor is invoked.
 
 ```json
-{ "type": "node_started", "run_id": "run_...", "node_id": "review" }
+{ "type": "node_started", "run_id": "run_...", "node_id": "review", "node_kind": "agent" }
 ```
 
 ### `node_finished`
@@ -80,15 +80,17 @@ Emitted after a node's executor returns (with success or failure).
   "type": "node_finished",
   "run_id": "run_...",
   "node_id": "review",
+  "node_kind": "agent",
   "ok": true,
   "failure": null
 }
 ```
 
-| Field     | Type            | Description                                                                                |
-| --------- | --------------- | ------------------------------------------------------------------------------------------ |
-| `ok`      | boolean         | `true` iff the executor's payload reported success.                                        |
-| `failure` | NodeFailure?    | Populated **only** when `ok: false`. Internally tagged on `kind`. See [NodeFailure](#nodefailure). |
+| Field       | Type            | Description                                                                                |
+| ----------- | --------------- | ------------------------------------------------------------------------------------------ |
+| `node_kind` | string          | Discriminator mirroring `NodeKind`'s serde tag (`"agent"` or `"shell"`). Added in `schema_version: 2`. |
+| `ok`        | boolean         | `true` iff the executor's payload reported success.                                        |
+| `failure`   | NodeFailure?    | Populated **only** when `ok: false`. Internally tagged on `kind`. See [NodeFailure](#nodefailure). |
 
 ### `node_skipped`
 
@@ -99,6 +101,7 @@ Emitted for every transitively-dependent node when an upstream fails. Disjoint b
   "type": "node_skipped",
   "run_id": "run_...",
   "node_id": "publish",
+  "node_kind": "shell",
   "reason": { "kind": "dependency_failed", "upstream": "review" }
 }
 ```
@@ -158,6 +161,7 @@ Emitted at the start of each agent loop turn, before the LLM transport is called
   "type": "agent_iteration_started",
   "run_id": "run_...",
   "node_id": "review",
+  "node_kind": "agent",
   "iteration": 0
 }
 ```
@@ -416,20 +420,6 @@ Emitted when a server exited mid-run unexpectedly. The owning agent terminates w
 }
 ```
 
-## Budget event
-
-### `budget_exceeded`
-
-Emitted when a run-level budget breaches. The breach is also surfaced on `node_finished.failure` with a typed `BudgetKind`.
-
-```json
-{
-  "type": "budget_exceeded",
-  "run_id": "run_...",
-  "reason": "max_total_tokens=5000 exceeded by node review (used=5012)"
-}
-```
-
 ## NodeFailure
 
 Carried on `node_finished.failure` exactly when `ok: false`. Internally tagged on `kind`, `#[non_exhaustive]`.
@@ -478,5 +468,5 @@ Stderr tails truncate from the **front** (the relevant signal sits at the end of
 
 - [CLI › `orno run`](cli.md#orno-run) — how to capture and replay event streams.
 - [Errors](errors.md) — typed error enums that mirror `NodeFailure` and `LlmFailure` on the internal API.
-- [Exit codes](exit-codes.md) — when `run_finished.ok` and the process exit code can disagree.
+- [Exit codes](exit-codes.md) — process exit code semantics and how `run_finished.ok` maps to them.
 - [Tools](tools.md) — what fires `tool_call_recorded`, `tool_denied`, and the MCP envelope variants.

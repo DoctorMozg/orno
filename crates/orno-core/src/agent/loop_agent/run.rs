@@ -448,6 +448,18 @@ impl Agent for LoopAgent {
                     .cloned()
                     .unwrap_or_else(|| tool_call.fn_name.clone());
 
+                // `wire_to_yaml` is built only from allowed tools, but the
+                // `.unwrap_or_else` fallback lets an unallowed wire name
+                // reach `find_handler`, which searches ALL registered handlers.
+                // Enforce the allowlist boundary before any dispatch.
+                if !yaml_name.starts_with(SUBAGENT_PREFIX)
+                    && !req.allowed_tools.iter().any(|n| n == &yaml_name)
+                {
+                    return Err(AgentError::UnknownToolCalled {
+                        name: tool_call.fn_name.clone(),
+                    });
+                }
+
                 // Subagent calls are routed through the recursion-depth
                 // gate before dispatch. If the gate fires, the child
                 // loop is never entered; the parent's next LLM turn

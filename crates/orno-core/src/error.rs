@@ -128,10 +128,6 @@ pub enum AgentError {
     #[error("agent exceeded budget: {kind:?}")]
     BudgetExceeded { kind: crate::events::BudgetKind },
 
-    /// Subagent recursion exceeded `max_subagent_depth`.
-    #[error("subagent depth exceeded ({max})")]
-    SubagentDepthExceeded { max: u32 },
-
     /// A tool's arguments failed to parse and `on_parse_error: fail`
     /// was set.
     #[error("tool `{tool}` arguments failed to parse: {error}")]
@@ -155,9 +151,6 @@ pub enum AgentError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum LlmError {
-    #[error("LLM transport is not wired yet (skeleton stub)")]
-    NotImplemented,
-
     #[error("LLM request rejected: {0}")]
     Rejected(String),
 

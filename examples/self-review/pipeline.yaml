@@ -26,10 +26,11 @@
 #   PR_REPO       — absolute path to the PR-head checkout (`roots` for Read)
 #   TRUSTED_ROOT  — absolute path to the trusted-master checkout
 #   GH_REPO       — owner/name string for `gh pr comment --repo`
-#   GH_TOKEN      — set on the workflow step's `env:` block; inherited by the
-#                   `gh` shell child via the standard process-env model. Not
-#                   declared in `secrets:` because gh reads it directly from
-#                   env, not from a template.
+#   GH_TOKEN      — listed in `pass_env:` so it is available as
+#                   `{{ env.GH_TOKEN }}` in templates. Delivered to the
+#                   `post_comment` shell node via its `env:` map; not in
+#                   `secrets:` because it is not an LLM-provider key and
+#                   does not need to be redacted from event output.
 #
 # Secrets (via `--secrets-file`)
 # ------------------------------
@@ -54,6 +55,7 @@ pass_env:
   - PR_REPO
   - TRUSTED_ROOT
   - GH_REPO
+  - GH_TOKEN
 
 agents:
   reviewer:
@@ -160,9 +162,11 @@ nodes:
     stdin: "{{ nodes.review.output }}"
 
   - id: post_comment
-    # `gh pr comment` reads GH_TOKEN from the inherited process env — the
-    # workflow's `env:` block on the orno-pipeline step puts the token there
-    # and the engine does not strip env when spawning shell children.
+    # `gh pr comment` reads GH_TOKEN from the child's environment. The
+    # shell executor clears the inherited process env; GH_TOKEN is
+    # delivered explicitly via this node's `env:` map, rendered from
+    # the `{{ env.GH_TOKEN }}` template variable (populated via
+    # `pass_env:` from the workflow step's `env:` block).
     kind: shell
     needs: [save_verdict]
     command: gh
@@ -174,3 +178,5 @@ nodes:
       - "{{ vars.gh_repo }}"
       - "--body-file"
       - "{{ vars.verdict_path }}"
+    env:
+      GH_TOKEN: "{{ env.GH_TOKEN }}"

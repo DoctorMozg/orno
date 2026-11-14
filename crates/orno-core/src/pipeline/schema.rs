@@ -102,8 +102,9 @@ pub struct ShellNode {
     /// executor clears the inherited environment, restores a small
     /// allowlist of safe variables (`PATH`, `HOME`, etc.), then
     /// applies these entries on top so per-node values shadow the
-    /// allowlist. Operator-supplied — not rendered through the
-    /// template engine.
+    /// allowlist. Values are rendered through the template engine
+    /// (the same context as `command`, `args`, and `stdin`); keys
+    /// are not rendered — they are identifiers.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -173,6 +174,11 @@ pub struct AgentPolicy {
     /// rejects with `AgentError::InvalidPolicy` at run start.
     /// Currently only `roots[0]` is consulted; multi-root agents are
     /// a v0.2+ extension.
+    ///
+    /// Each entry is rendered through the template engine at dispatch
+    /// time (the same context as `initial_prompt` and `system`), so
+    /// `"{{ env.WORKSPACE }}"` is valid and resolves to the current
+    /// value of that variable.
     #[serde(default)]
     pub roots: Vec<std::path::PathBuf>,
     /// Soft cap on the approximate byte size of the accumulated

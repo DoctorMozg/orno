@@ -12,7 +12,6 @@
 #![allow(clippy::unnecessary_literal_bound)] // dynamic ToolHandler::name() lifetime bound
 
 pub mod agent;
-pub mod config;
 pub mod error;
 pub mod events;
 pub mod execution;

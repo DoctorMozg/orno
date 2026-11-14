@@ -469,6 +469,11 @@ async fn blocked_domains_does_not_match_unrelated_host_with_shared_suffix() {
     req.policy.max_iterations = 3;
     req.policy.allow_network = true;
     req.policy.blocked_domains = vec!["evil.com".into()];
+    // Explicitly allowlist the target host so that DNS failure in sandboxed
+    // test environments is treated as a warning rather than a denial. The
+    // test is verifying the blocked_domains suffix-match logic (not DNS),
+    // and that check runs before DNS resolution.
+    req.policy.allowed_domains = vec!["notevil.com".into()];
     req.allowed_tools = vec!["EchoTool".into()];
 
     agent

@@ -148,6 +148,174 @@ impl LoopAgent {
         format!("denied: tool `{yaml_name}` blocked by {reason}")
     }
 
+    /// Apply the domain/SSRF gate for any network-reaching tool call.
+    /// Called from both [`ToolEffect::Network`] and
+    /// [`ToolEffect::MutationsAndNetwork`] arms so domain policy is
+    /// consistently enforced for all network tools, including MCP tools.
+    /// Returns `Some(denial)` when the request should be denied (the
+    /// caller feeds the string back to the model as a `ToolResult`),
+    /// or `None` to allow the call through.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "domain/SSRF gate enumerates every check inline; splitting would obscure the ordering invariants"
+    )]
+    async fn gate_network_url(
+        &self,
+        tool_call: &OrnoChatToolCall,
+        policy: &AgentPolicy,
+        inv: &ToolInvocation<'_>,
+        wire_to_yaml: &HashMap<String, String>,
+    ) -> Option<String> {
+        // Egress with no allowlist means every domain not in
+        // `blocked_domains` is reachable — surface this so an
+        // operator who forgot to populate the allowlist sees it.
+        if policy.allowed_domains.is_empty() {
+            tracing::warn!(
+                tool.name = %tool_call.fn_name,
+                "allow_network=true but allowed_domains is empty; every non-blocked domain is reachable",
+            );
+        }
+        // Domain gate: URL extracted from any common URL-shaped
+        // arg. Missing/unparsable URLs fall through to the
+        // handler which produces its own error — the handler
+        // cannot reach the network without a URL anyway.
+        if let Some(parsed) = extract_network_url(&tool_call.fn_arguments) {
+            // Deny non-HTTP(S) schemes to block file://, ftp://, data://.
+            let scheme = parsed.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Some(
+                    self.deny(
+                        inv,
+                        &tool_call.fn_name,
+                        format!(
+                            "scheme `{scheme}` not permitted; \
+                             only http and https are allowed"
+                        ),
+                        wire_to_yaml,
+                    )
+                    .await,
+                );
+            }
+            if let Some(host) = parsed.host_str().map(str::to_string) {
+                // Literal-IP block list. Hostnames are also
+                // pre-resolved below — but only after the cheap
+                // domain-list checks pass, since a host already
+                // rejected by the operator's allowlist need not
+                // burn a DNS round-trip.
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    let blocked = match ip {
+                        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+                        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+                    };
+                    if blocked {
+                        return Some(
+                            self.deny(
+                                inv,
+                                &tool_call.fn_name,
+                                format!(
+                                    "IP `{ip}` is not routable \
+                                     (loopback / private / link-local / \
+                                     CGNAT / documentation)"
+                                ),
+                                wire_to_yaml,
+                            )
+                            .await,
+                        );
+                    }
+                }
+                // Suffix match: `d` matches host `h` if `h == d` or
+                // `h` ends with `.d`. This closes the footgun where
+                // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
+                // through under naive equality, and applies the same
+                // rule to the allowlist.
+                let host_matches =
+                    |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
+                if policy.blocked_domains.iter().any(host_matches) {
+                    return Some(
+                        self.deny(
+                            inv,
+                            &tool_call.fn_name,
+                            format!("blocked_domains contains `{host}`"),
+                            wire_to_yaml,
+                        )
+                        .await,
+                    );
+                }
+                let explicitly_allowed = !policy.allowed_domains.is_empty()
+                    && policy.allowed_domains.iter().any(host_matches);
+                if !policy.allowed_domains.is_empty() && !explicitly_allowed {
+                    return Some(
+                        self.deny(
+                            inv,
+                            &tool_call.fn_name,
+                            format!("allowed_domains does not contain `{host}`"),
+                            wire_to_yaml,
+                        )
+                        .await,
+                    );
+                }
+                // Hostname input that survived the domain rules:
+                // pre-resolve DNS and reject if any returned address
+                // is in a blocked range. For open-network requests
+                // (no allowlist) fail closed on DNS errors — a
+                // failing resolver must not bypass the gate. For
+                // explicitly-allowlisted hosts DNS failure is treated
+                // as a transient resolver issue and the request is
+                // allowed through with a warning; the operator
+                // accepted responsibility when they added the domain.
+                if host.parse::<IpAddr>().is_err() {
+                    match resolve_host(&host).await {
+                        Ok(addrs) => {
+                            if let Some(blocked_ip) = addrs.iter().find(|ip| match ip {
+                                IpAddr::V4(v4) => is_blocked_ipv4(*v4),
+                                IpAddr::V6(v6) => is_blocked_ipv6(*v6),
+                            }) {
+                                return Some(
+                                    self.deny(
+                                        inv,
+                                        &tool_call.fn_name,
+                                        format!(
+                                            "host `{host}` resolved to blocked IP \
+                                             `{blocked_ip}`"
+                                        ),
+                                        wire_to_yaml,
+                                    )
+                                    .await,
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            if explicitly_allowed {
+                                tracing::warn!(
+                                    host = %host,
+                                    error = ?e,
+                                    "DNS resolution failed for allowlisted host; \
+                                     allowing request (operator-trusted domain)",
+                                );
+                            } else {
+                                tracing::warn!(
+                                    host = %host,
+                                    error = ?e,
+                                    "DNS resolution failed; denying request",
+                                );
+                                return Some(
+                                    self.deny(
+                                        inv,
+                                        &tool_call.fn_name,
+                                        format!("DNS resolution failed for host `{host}`: {e}"),
+                                        wire_to_yaml,
+                                    )
+                                    .await,
+                                );
+                            }
+                        },
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Apply the effect-based policy gate and invoke the handler. A
     /// policy denial is *not* a terminal error — it is fed back to the
     /// model as a `ToolResult` denial string so the model can adapt. A
@@ -195,148 +363,11 @@ impl LoopAgent {
                         )
                         .await);
                 }
-                // Egress with no allowlist means every domain not in
-                // `blocked_domains` is reachable — surface this so an
-                // operator who forgot to populate the allowlist sees it.
-                if policy.allowed_domains.is_empty() {
-                    tracing::warn!(
-                        tool.name = %tool_call.fn_name,
-                        "allow_network=true but allowed_domains is empty; every non-blocked domain is reachable",
-                    );
-                }
-                // Domain gate: URL extracted from any common URL-shaped
-                // arg. Missing/unparsable URLs fall through to the
-                // handler which produces its own error — the handler
-                // cannot reach the network without a URL anyway.
-                if let Some(parsed) = extract_network_url(&tool_call.fn_arguments) {
-                    // Deny non-HTTP(S) schemes to block file://, ftp://, data://.
-                    let scheme = parsed.scheme();
-                    if scheme != "http" && scheme != "https" {
-                        return Ok(self
-                            .deny(
-                                &inv,
-                                &tool_call.fn_name,
-                                format!(
-                                    "scheme `{scheme}` not permitted; \
-                                     only http and https are allowed"
-                                ),
-                                wire_to_yaml,
-                            )
-                            .await);
-                    }
-                    if let Some(host) = parsed.host_str().map(str::to_string) {
-                        // Literal-IP block list. Hostnames are also
-                        // pre-resolved below — but only after the cheap
-                        // domain-list checks pass, since a host already
-                        // rejected by the operator's allowlist need not
-                        // burn a DNS round-trip.
-                        if let Ok(ip) = host.parse::<IpAddr>() {
-                            let blocked = match ip {
-                                IpAddr::V4(v4) => is_blocked_ipv4(v4),
-                                IpAddr::V6(v6) => is_blocked_ipv6(v6),
-                            };
-                            if blocked {
-                                return Ok(self
-                                    .deny(
-                                        &inv,
-                                        &tool_call.fn_name,
-                                        format!(
-                                            "IP `{ip}` is not routable \
-                                             (loopback / private / link-local / \
-                                             CGNAT / documentation)"
-                                        ),
-                                        wire_to_yaml,
-                                    )
-                                    .await);
-                            }
-                        }
-                        // Suffix match: `d` matches host `h` if `h == d` or
-                        // `h` ends with `.d`. This closes the footgun where
-                        // `blocked_domains: ["evil.com"]` lets `sub.evil.com`
-                        // through under naive equality, and applies the same
-                        // rule to the allowlist.
-                        let host_matches =
-                            |d: &String| -> bool { host == *d || host.ends_with(&format!(".{d}")) };
-                        if policy.blocked_domains.iter().any(host_matches) {
-                            return Ok(self
-                                .deny(
-                                    &inv,
-                                    &tool_call.fn_name,
-                                    format!("blocked_domains contains `{host}`"),
-                                    wire_to_yaml,
-                                )
-                                .await);
-                        }
-                        let explicitly_allowed = !policy.allowed_domains.is_empty()
-                            && policy.allowed_domains.iter().any(host_matches);
-                        if !policy.allowed_domains.is_empty() && !explicitly_allowed {
-                            return Ok(self
-                                .deny(
-                                    &inv,
-                                    &tool_call.fn_name,
-                                    format!("allowed_domains does not contain `{host}`"),
-                                    wire_to_yaml,
-                                )
-                                .await);
-                        }
-                        // Hostname input that survived the domain rules:
-                        // pre-resolve DNS and reject if any returned address
-                        // is in a blocked range. For open-network requests
-                        // (no allowlist) fail closed on DNS errors — a
-                        // failing resolver must not bypass the gate. For
-                        // explicitly-allowlisted hosts DNS failure is treated
-                        // as a transient resolver issue and the request is
-                        // allowed through with a warning; the operator
-                        // accepted responsibility when they added the domain.
-                        if host.parse::<IpAddr>().is_err() {
-                            match resolve_host(&host).await {
-                                Ok(addrs) => {
-                                    if let Some(blocked_ip) = addrs.iter().find(|ip| match ip {
-                                        IpAddr::V4(v4) => is_blocked_ipv4(*v4),
-                                        IpAddr::V6(v6) => is_blocked_ipv6(*v6),
-                                    }) {
-                                        return Ok(self
-                                            .deny(
-                                                &inv,
-                                                &tool_call.fn_name,
-                                                format!(
-                                                    "host `{host}` resolved to blocked IP \
-                                                     `{blocked_ip}`"
-                                                ),
-                                                wire_to_yaml,
-                                            )
-                                            .await);
-                                    }
-                                },
-                                Err(e) => {
-                                    if explicitly_allowed {
-                                        tracing::warn!(
-                                            host = %host,
-                                            error = ?e,
-                                            "DNS resolution failed for allowlisted host; \
-                                             allowing request (operator-trusted domain)",
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            host = %host,
-                                            error = ?e,
-                                            "DNS resolution failed; denying request",
-                                        );
-                                        return Ok(self
-                                            .deny(
-                                                &inv,
-                                                &tool_call.fn_name,
-                                                format!(
-                                                    "DNS resolution failed for host `{host}`: {e}"
-                                                ),
-                                                wire_to_yaml,
-                                            )
-                                            .await);
-                                    }
-                                },
-                            }
-                        }
-                    }
+                if let Some(denial) = self
+                    .gate_network_url(tool_call, policy, &inv, wire_to_yaml)
+                    .await
+                {
+                    return Ok(denial);
                 }
             },
             ToolEffect::MutationsAndNetwork => {
@@ -359,6 +390,12 @@ impl LoopAgent {
                             wire_to_yaml,
                         )
                         .await);
+                }
+                if let Some(denial) = self
+                    .gate_network_url(tool_call, policy, &inv, wire_to_yaml)
+                    .await
+                {
+                    return Ok(denial);
                 }
             },
             ToolEffect::ContextSelf => {

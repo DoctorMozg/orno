@@ -13,6 +13,7 @@ pub mod shell;
 pub use registry::NodeRegistry;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -105,10 +106,12 @@ pub trait NodeExecutor: Send + Sync {
 /// template field rendered through `TemplateEngine` in `ctx`, and
 /// every agent-config field materialized from `agents`.
 ///
-/// Shell: renders `command` and every entry in `args`.
-/// Agent: renders `initial_prompt` and the agent's `system` prompt,
-/// then bundles provider, model, policy, and `allowed_tools` onto the
-/// request so the executor is self-contained at dispatch time.
+/// Shell: renders `command`, every entry in `args`, `stdin`, and every
+/// value in the `env` map (keys are not rendered — they are identifiers).
+/// Agent: renders `initial_prompt`, the agent's `system` prompt, and
+/// every entry in `policy.roots`, then bundles provider, model, policy,
+/// and `allowed_tools` onto the request so the executor is self-contained
+/// at dispatch time.
 ///
 /// Errors:
 /// - `PipelineError::UnknownAgent` if the node references a name not
@@ -134,13 +137,24 @@ pub fn render_request(
                 Some(s) => Some(tmpl.render("agent.system", s, &ctx_json)?),
                 None => None,
             };
+            let mut policy = cfg.policy.clone();
+            if !policy.roots.is_empty() {
+                let mut roots = Vec::with_capacity(policy.roots.len());
+                for (i, root) in cfg.policy.roots.iter().enumerate() {
+                    let s = root.to_string_lossy();
+                    let rendered =
+                        tmpl.render(&format!("agent.policy.roots[{i}]"), s.as_ref(), &ctx_json)?;
+                    roots.push(PathBuf::from(rendered));
+                }
+                policy.roots = roots;
+            }
             Ok(NodeRequest::Agent(AgentNodeRequest {
                 agent: n.agent.clone(),
                 initial_prompt,
                 system,
                 provider: cfg.provider.clone(),
                 model: cfg.model.clone(),
-                policy: cfg.policy.clone(),
+                policy,
                 allowed_tools: cfg.allowed_tools.clone(),
             }))
         },
@@ -154,11 +168,18 @@ pub fn render_request(
                 Some(s) => Some(tmpl.render("shell.stdin", s, &ctx_json)?),
                 None => None,
             };
+            let mut env = BTreeMap::new();
+            for (k, v) in &n.env {
+                env.insert(
+                    k.clone(),
+                    tmpl.render(&format!("shell.env[{k}]"), v, &ctx_json)?,
+                );
+            }
             Ok(NodeRequest::Shell(ShellNodeRequest {
                 command,
                 args,
                 stdin,
-                env: n.env.clone(),
+                env,
             }))
         },
     }
@@ -304,5 +325,61 @@ mod tests {
             panic!("expected NodeRequest::Shell");
         };
         assert_eq!(req.env, env);
+    }
+
+    #[test]
+    fn render_request_renders_shell_env_values() {
+        let agents: BTreeMap<String, AgentConfig> = BTreeMap::new();
+        let mut env_template = BTreeMap::new();
+        env_template.insert("MY_VAR".to_string(), "{{ env.TOKEN }}".to_string());
+        let kind = NodeKind::Shell(ShellNode {
+            command: "true".into(),
+            args: Vec::new(),
+            stdin: None,
+            env: env_template,
+        });
+        let tmpl = TemplateEngine::new();
+        let mut env_ctx = BTreeMap::new();
+        env_ctx.insert("TOKEN".to_string(), "secret-value".to_string());
+        let ctx = Context::new(BTreeMap::new(), env_ctx, BTreeMap::new());
+
+        let NodeRequest::Shell(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
+            panic!("expected NodeRequest::Shell");
+        };
+        assert_eq!(
+            req.env.get("MY_VAR").map(String::as_str),
+            Some("secret-value")
+        );
+    }
+
+    #[test]
+    fn render_request_renders_agent_roots() {
+        use serde_json::json;
+        let mut agents = BTreeMap::new();
+        let mut policy = default_policy();
+        policy.roots = vec![PathBuf::from("{{ vars.workspace }}")];
+        agents.insert(
+            "worker".to_string(),
+            AgentConfig {
+                model: "m".into(),
+                provider: "p".into(),
+                system: None,
+                allowed_tools: Vec::new(),
+                policy,
+            },
+        );
+        let kind = NodeKind::Agent(AgentNode {
+            agent: "worker".into(),
+            initial_prompt: String::new(),
+        });
+        let tmpl = TemplateEngine::new();
+        let mut vars = BTreeMap::new();
+        vars.insert("workspace".to_string(), json!("/home/runner/work"));
+        let ctx = Context::new(vars, BTreeMap::new(), BTreeMap::new());
+
+        let NodeRequest::Agent(req) = render_request(&kind, &tmpl, &ctx, &agents).unwrap() else {
+            panic!("expected NodeRequest::Agent");
+        };
+        assert_eq!(req.policy.roots, vec![PathBuf::from("/home/runner/work")]);
     }
 }
