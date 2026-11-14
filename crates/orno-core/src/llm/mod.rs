@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::LlmError;
 
 pub use bundle::{
-    BundleContents, BundleEntry, BundleError, CURRENT_BUNDLE_VERSION, read_bundle,
-    scrub_pipeline_secrets, write_bundle,
+    BundleContents, BundleEntry, BundleError, BundleRunInputs, BundleSources,
+    CURRENT_BUNDLE_VERSION, read_bundle, scrub_pipeline_secrets, write_bundle,
 };
 pub use dummy::DummyTransport;
 pub use dummy::ScriptedTransport;

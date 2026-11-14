@@ -1,43 +1,33 @@
 //! `ReplayTransport` — load a tape written by [`super::RecordingTransport`]
 //! and return responses deterministically without touching the network.
 //!
-//! Keyed by `(provider, model, blake3(serialized request))`. A tape
-//! miss returns [`LlmError::ReplayMiss`]; `ReplayTransport` never falls
-//! through to a live call. That's what makes it usable as the
-//! bounded-non-determinism guarantee in the strictness contract.
+//! Keyed by `(key, seq)`: the n-th request that hashes to a key gets the
+//! entry recorded with seq n. A tape miss returns
+//! [`LlmError::ReplayMiss`]; `ReplayTransport` never falls through to a
+//! live call. That's what makes it usable as the bounded-non-determinism
+//! guarantee in the strictness contract.
 //!
 //! Both `Ok` and `Err` outcomes are replayed: a tape entry recorded
 //! with `TapeOutcome::Err` is reconstructed back into the same
 //! `LlmError` class via [`crate::events::LlmFailure::to_llm_error`]
-//! using the originating request's provider/model fields. This keeps
-//! replay indistinguishable from the live call from the agent loop's
-//! perspective — a transient API failure that drove a downstream
-//! branching decision in the live run replays as the same failure
-//! without ever touching the network.
+//! using the originating request's provider/model fields, so a
+//! transient API failure that drove a branching decision in the live
+//! run replays as the same failure without touching the network.
 
-use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::Mutex;
 
 use async_trait::async_trait;
+use tracing::instrument;
 
 use crate::error::LlmError;
-use crate::util::canonical_json;
+use crate::util::{TapeIndex, read_tape};
 
-use super::recording::{TapeEntry, TapeOutcome};
+use super::recording::{TapeEntry, TapeOutcome, tape_key};
 use super::{LlmRequest, LlmResponse, LlmTransport};
 
 #[derive(Debug)]
 pub struct ReplayTransport {
-    // Per-key FIFO of recorded outcomes: a pipeline that issues the
-    // same request twice (same provider, model, prompt, message
-    // history, sampling knobs) produced two tape entries on the live
-    // run, and replay must hand them back in the same order. A flat
-    // `HashMap<_, TapeOutcome>` collapsed those entries into one,
-    // silently dropping every duplicate after the first.
-    entries: Mutex<HashMap<String, VecDeque<TapeOutcome>>>,
+    index: TapeIndex<TapeOutcome>,
 }
 
 impl ReplayTransport {
@@ -46,77 +36,30 @@ impl ReplayTransport {
     /// readable tapes replay stale responses silently, which defeats
     /// the whole point of replay.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, LlmError> {
-        let file = File::open(path.as_ref()).map_err(|e| {
-            LlmError::ConfigError(format!(
-                "could not open tape `{}`: {}",
-                path.as_ref().display(),
-                e,
-            ))
-        })?;
-        let mut entries: HashMap<String, VecDeque<TapeOutcome>> = HashMap::new();
-        for (lineno, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|e| {
-                LlmError::ConfigError(format!("tape read error on line {}: {}", lineno + 1, e))
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let entry: TapeEntry = serde_json::from_str(&line).map_err(|e| {
-                LlmError::ConfigError(format!("tape parse error on line {}: {}", lineno + 1, e))
-            })?;
-            let key = tape_key(&entry.req);
-            let deque = entries.entry(key.clone()).or_default();
-            if !deque.is_empty() {
-                tracing::warn!(
-                    key_prefix = %&key[..20.min(key.len())],
-                    "duplicate tape key detected on load — replay will return entries in sequence"
-                );
-            }
-            deque.push_back(entry.outcome);
-        }
-        Ok(Self {
-            entries: Mutex::new(entries),
-        })
+        let entries = read_tape::<TapeEntry>(path.as_ref())
+            .map_err(|e| LlmError::ConfigError(format!("tape parse error: {e}")))?;
+        Self::from_entries(entries)
     }
 
-    /// In-memory constructor for tests — skips file I/O.
-    #[must_use]
-    pub fn from_entries(entries: Vec<TapeEntry>) -> Self {
-        let mut map: HashMap<String, VecDeque<TapeOutcome>> = HashMap::new();
-        for entry in entries {
-            let key = tape_key(&entry.req);
-            let deque = map.entry(key.clone()).or_default();
-            if !deque.is_empty() {
-                tracing::warn!(
-                    key_prefix = %&key[..20.min(key.len())],
-                    "duplicate tape key detected on load — replay will return entries in sequence"
-                );
-            }
-            deque.push_back(entry.outcome);
-        }
-        Self {
-            entries: Mutex::new(map),
-        }
-    }
-
-    /// Pop the next recorded outcome for `key`. Each tape entry is
-    /// consumed exactly once; subsequent calls with the same key
-    /// surface as `ReplayMiss` once the FIFO is drained, which is the
-    /// load-bearing property for duplicate-request replay.
-    fn consume(&self, key: &str) -> Option<TapeOutcome> {
-        self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(key)?
-            .pop_front()
+    /// Build a transport from entries already in memory (a bundle, or a
+    /// test). Two entries claiming the same `(key, seq)` slot are a
+    /// `ConfigError`.
+    pub fn from_entries(entries: Vec<TapeEntry>) -> Result<Self, LlmError> {
+        let index = TapeIndex::new(entries.into_iter().map(|e| (e.key, e.seq, e.outcome)))
+            .map_err(|e| LlmError::ConfigError(e.to_string()))?;
+        Ok(Self { index })
     }
 }
 
 #[async_trait]
 impl LlmTransport for ReplayTransport {
+    #[instrument(
+        skip(self, req),
+        fields(llm.provider = %req.provider, llm.model = %req.model),
+    )]
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
-        let key = tape_key(&req);
-        match self.consume(&key) {
+        let key = tape_key(&req, None);
+        match self.index.take(&key) {
             Some(TapeOutcome::Ok { res }) => Ok(res),
             Some(TapeOutcome::Err { err }) => Err(err.to_llm_error(&req.provider, &req.model)),
             None => Err(LlmError::ReplayMiss { key }),
@@ -124,27 +67,13 @@ impl LlmTransport for ReplayTransport {
     }
 }
 
-/// Tape key = `provider:model:blake3(canonical_json(request))`. The
-/// canonical form recursively sorts every nested JSON object's keys so
-/// a `serde_json::Value` field whose underlying producer (e.g. a tool
-/// argument schema from `schemars`) shifts insertion order across
-/// minor versions does not silently invalidate the tape. blake3
-/// collapses the prompt + system + sampling knobs into a 64-char hex
-/// digest. Truncating the hash would narrow the keyspace for no gain
-/// in readability, so the full digest is kept.
-fn tape_key(req: &LlmRequest) -> String {
-    let value = serde_json::to_value(req).expect("LlmRequest serializes");
-    let canonical = canonical_json(&value);
-    let hash = blake3::hash(canonical.as_bytes());
-    format!("{}:{}:{}", req.provider, req.model, hash.to_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{LlmFailure, Redactor};
-    use crate::llm::{DummyTransport, RecordingTransport, Usage};
-    use std::sync::Arc;
+    use crate::llm::{DummyTransport, OrnoChatMessage, RecordingTransport, Usage};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     fn req(prompt: &str) -> LlmRequest {
         LlmRequest::from_prompt(
@@ -157,31 +86,47 @@ mod tests {
         )
     }
 
-    fn ok_entry(prompt: &str, content: &str) -> TapeEntry {
-        TapeEntry {
-            req: req(prompt),
-            outcome: TapeOutcome::Ok {
-                res: LlmResponse {
-                    content: content.into(),
-                    finish_reason: Some("stop".into()),
-                    usage: Some(Usage {
-                        prompt_tokens: 1,
-                        completion_tokens: 1,
-                        total_tokens: 2,
-                    }),
-                    tool_calls: Vec::new(),
-                },
-            },
+    fn response(content: &str) -> LlmResponse {
+        LlmResponse {
+            content: content.into(),
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+            tool_calls: Vec::new(),
         }
+    }
+
+    fn entry(prompt: &str, seq: u32, outcome: TapeOutcome) -> TapeEntry {
+        TapeEntry {
+            key: tape_key(&req(prompt), None),
+            seq,
+            tools: Vec::new(),
+            outcome,
+        }
+    }
+
+    fn ok_entry(prompt: &str, seq: u32, content: &str) -> TapeEntry {
+        entry(
+            prompt,
+            seq,
+            TapeOutcome::Ok {
+                res: response(content),
+            },
+        )
+    }
+
+    fn fresh_tape() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tape.ndjson");
+        (dir, path)
     }
 
     #[tokio::test]
     async fn round_trip_dummy_to_replay_is_bit_identical() {
-        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
-        // path must not exist before the call. Use a fresh subdirectory
-        // and pick an unused filename inside it.
-        let tmp_dir = tempfile::TempDir::new().unwrap();
-        let path = tmp_dir.path().join("tape.ndjson");
+        let (_dir, path) = fresh_tape();
         let rec = RecordingTransport::create(
             Arc::new(DummyTransport),
             &path,
@@ -189,26 +134,148 @@ mod tests {
         )
         .unwrap();
 
-        let r1 = rec.complete(req("one")).await.unwrap();
-        let r2 = rec.complete(req("two")).await.unwrap();
-        let r3 = rec.complete(req("three")).await.unwrap();
+        let live = [
+            rec.complete(req("one")).await.unwrap(),
+            rec.complete(req("two")).await.unwrap(),
+            rec.complete(req("three")).await.unwrap(),
+        ];
         rec.flush().unwrap();
         drop(rec);
 
         let replay = ReplayTransport::load(&path).unwrap();
-        let p1 = replay.complete(req("one")).await.unwrap();
-        let p2 = replay.complete(req("two")).await.unwrap();
-        let p3 = replay.complete(req("three")).await.unwrap();
+        for (prompt, live) in ["one", "two", "three"].into_iter().zip(&live) {
+            let replayed = replay.complete(req(prompt)).await.unwrap();
+            assert_eq!(replayed.content, live.content);
+            assert_eq!(replayed.finish_reason, live.finish_reason);
+        }
+    }
 
-        assert_eq!(r1.content, p1.content);
-        assert_eq!(r2.content, p2.content);
-        assert_eq!(r3.content, p3.content);
-        assert_eq!(r1.finish_reason, p1.finish_reason);
+    /// Answers with a fixed string that does not echo the prompt, so the
+    /// recorded and the replayed response can be compared exactly.
+    struct FixedAnswer;
+
+    #[async_trait]
+    impl LlmTransport for FixedAnswer {
+        async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(response("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_in_prompt_replays_from_the_redacted_request() {
+        // Replay never sees the secret: the prompt it rebuilds carries
+        // the placeholder, and must still find the entry.
+        let (_dir, path) = fresh_tape();
+        let secrets = BTreeMap::from([("api".to_string(), "sk-secret-abc123".to_string())]);
+        let rec = RecordingTransport::create(
+            Arc::new(FixedAnswer),
+            &path,
+            Arc::new(Redactor::new(&secrets)),
+        )
+        .unwrap();
+        let live = rec
+            .complete(req("authenticate with sk-secret-abc123"))
+            .await
+            .unwrap();
+        rec.flush().unwrap();
+        drop(rec);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("sk-secret-abc123"), "{on_disk}");
+
+        let replay = ReplayTransport::load(&path).unwrap();
+        let replayed = replay
+            .complete(req("authenticate with ***"))
+            .await
+            .expect("redacted request must hit the recorded entry");
+        assert_eq!(replayed.content, live.content);
+        assert_eq!(
+            replayed.usage.map(|u| u.total_tokens),
+            live.usage.map(|u| u.total_tokens)
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_requests_replay_in_call_order_despite_completion_order() {
+        use std::time::Duration;
+
+        /// First call is slow, second is fast, so the second completes
+        /// (and is written to the tape) first.
+        struct SlowFirst {
+            calls: Mutex<u32>,
+        }
+        #[async_trait]
+        impl LlmTransport for SlowFirst {
+            async fn complete(&self, _req: LlmRequest) -> Result<LlmResponse, LlmError> {
+                let n = {
+                    let mut calls = self.calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                if n == 1 {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok(response("first"))
+                } else {
+                    Ok(response("second"))
+                }
+            }
+        }
+
+        let (_dir, path) = fresh_tape();
+        let rec = RecordingTransport::create(
+            Arc::new(SlowFirst {
+                calls: Mutex::new(0),
+            }),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
+        let (a, b) = tokio::join!(rec.complete(req("same")), rec.complete(req("same")));
+        assert_eq!(a.unwrap().content, "first");
+        assert_eq!(b.unwrap().content, "second");
+        rec.flush().unwrap();
+        drop(rec);
+
+        let tape = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            tape.find("\"second\"").unwrap() < tape.find("\"first\"").unwrap(),
+            "precondition: tape is in completion order: {tape}",
+        );
+
+        let replay = ReplayTransport::load(&path).unwrap();
+        assert_eq!(replay.complete(req("same")).await.unwrap().content, "first");
+        assert_eq!(
+            replay.complete(req("same")).await.unwrap().content,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_entries_are_served_by_seq() {
+        let replay = ReplayTransport::from_entries(vec![
+            ok_entry("p", 1, "second"),
+            ok_entry("p", 0, "first"),
+        ])
+        .unwrap();
+
+        assert_eq!(replay.complete(req("p")).await.unwrap().content, "first");
+        assert_eq!(replay.complete(req("p")).await.unwrap().content, "second");
+        assert!(matches!(
+            replay.complete(req("p")).await,
+            Err(LlmError::ReplayMiss { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_key_and_seq_is_rejected() {
+        let err = ReplayTransport::from_entries(vec![ok_entry("p", 0, "a"), ok_entry("p", 0, "b")])
+            .expect_err("two entries in one slot");
+        assert!(matches!(err, LlmError::ConfigError(msg) if msg.contains("duplicate")));
     }
 
     #[tokio::test]
     async fn miss_returns_replay_miss() {
-        let replay = ReplayTransport::from_entries(vec![ok_entry("known", "answer")]);
+        let replay = ReplayTransport::from_entries(vec![ok_entry("known", 0, "answer")]).unwrap();
         match replay.complete(req("unknown")).await {
             Err(LlmError::ReplayMiss { key }) => assert!(key.contains("openai:gpt-5")),
             other => panic!("expected ReplayMiss, got {other:?}"),
@@ -223,50 +290,38 @@ mod tests {
         f.flush().unwrap();
         let err = ReplayTransport::load(f.path()).expect_err("must reject corrupt entry");
         match err {
-            LlmError::ConfigError(msg) => assert!(msg.contains("parse error")),
+            LlmError::ConfigError(msg) => assert!(msg.contains(":1:"), "{msg}"),
             other => panic!("expected ConfigError, got {other:?}"),
         }
     }
 
     #[test]
     fn different_message_history_produces_different_keys() {
-        use crate::llm::OrnoChatMessage;
-
-        let base_req = LlmRequest::from_prompt(
-            "openai".into(),
-            "gpt-5".into(),
-            "hello".into(),
-            None,
-            None,
-            None,
-        );
-
+        let base_req = req("hello");
         let mut with_history = base_req.clone();
         with_history.messages = Arc::new(vec![OrnoChatMessage::User {
             content: "previous turn".into(),
         }]);
 
         assert_ne!(
-            tape_key(&base_req),
-            tape_key(&with_history),
+            tape_key(&base_req, None),
+            tape_key(&with_history, None),
             "different message history must produce different tape keys",
         );
     }
 
     #[tokio::test]
     async fn err_outcome_replays_as_matching_llm_error() {
-        // A failure recorded via `TapeOutcome::Err` must surface to the
-        // agent loop as the same `LlmError` class the live run produced.
         // The `provider`/`model` fields come from the request being
-        // replayed because the on-the-wire `LlmFailure` form does not
-        // carry them.
-        let entry = TapeEntry {
-            req: req("auth-fail"),
-            outcome: TapeOutcome::Err {
+        // replayed because the on-the-wire `LlmFailure` omits them.
+        let replay = ReplayTransport::from_entries(vec![entry(
+            "auth-fail",
+            0,
+            TapeOutcome::Err {
                 err: LlmFailure::AuthFailed,
             },
-        };
-        let replay = ReplayTransport::from_entries(vec![entry]);
+        )])
+        .unwrap();
 
         let err = replay
             .complete(req("auth-fail"))
@@ -280,22 +335,19 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_ok_and_err_entries_route_to_correct_branch() {
-        // Determinism check: two requests with identical provider/model
-        // but different prompts hit different cache slots; an Ok entry
-        // for one must not fulfill an Err entry for the other.
         let replay = ReplayTransport::from_entries(vec![
-            ok_entry("good", "fine"),
-            TapeEntry {
-                req: req("bad"),
-                outcome: TapeOutcome::Err {
+            ok_entry("good", 0, "fine"),
+            entry(
+                "bad",
+                0,
+                TapeOutcome::Err {
                     err: LlmFailure::RateLimited,
                 },
-            },
-        ]);
+            ),
+        ])
+        .unwrap();
 
-        let ok = replay.complete(req("good")).await.unwrap();
-        assert_eq!(ok.content, "fine");
-
+        assert_eq!(replay.complete(req("good")).await.unwrap().content, "fine");
         let err = replay
             .complete(req("bad"))
             .await
@@ -305,16 +357,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_round_trip_records_and_replays_failed_call() {
-        // End-to-end: a failing inner transport runs once through
-        // `RecordingTransport`, the tape is loaded by `ReplayTransport`,
-        // and the second call surfaces the same failure class without
-        // ever invoking the inner transport. Catches regressions in
-        // both the recording and replay paths simultaneously.
-        use async_trait::async_trait;
-        use std::sync::Mutex;
-
+        // A failing inner transport runs once through `RecordingTransport`;
+        // replay surfaces the same failure class without invoking it again.
         struct ApiFailure {
-            // Counter to verify the inner transport runs exactly once.
             calls: Arc<Mutex<usize>>,
         }
         #[async_trait]
@@ -330,12 +375,7 @@ mod tests {
         }
 
         let calls = Arc::new(Mutex::new(0_usize));
-        // `RecordingTransport::create` opens with `O_EXCL`, so the tape
-        // path must not exist before the call. Use a fresh subdirectory
-        // and pick an unused filename inside it.
-        let tmp_dir = tempfile::TempDir::new().unwrap();
-        let path = tmp_dir.path().join("tape.ndjson");
-
+        let (_dir, path) = fresh_tape();
         let rec = RecordingTransport::create(
             Arc::new(ApiFailure {
                 calls: Arc::clone(&calls),
@@ -353,15 +393,9 @@ mod tests {
         rec.flush().unwrap();
         drop(rec);
 
-        // Replay must reproduce the same failure class without
-        // calling the inner transport again.
         let calls_before_replay = *calls.lock().unwrap();
         let replay = ReplayTransport::load(&path).unwrap();
-        let replayed = replay
-            .complete(req("explode"))
-            .await
-            .expect_err("replay must surface recorded failure");
-        match replayed {
+        match replay.complete(req("explode")).await.unwrap_err() {
             LlmError::ApiError {
                 provider,
                 status,

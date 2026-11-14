@@ -26,7 +26,8 @@ use super::{truncate_excerpt, truncate_tail};
 /// than this are dropped; a short fragment would over-redact ordinary text.
 const MIN_DERIVED_PATTERN_LEN: usize = 8;
 
-const MARKER: &str = "***";
+/// What a redacted value is replaced with.
+pub(crate) const REDACTION_MARKER: &str = "***";
 
 /// Which end of an over-long string survives bounding.
 #[derive(Debug, Clone, Copy)]
@@ -143,7 +144,7 @@ impl Redactor {
         let mut last = 0;
         for mat in matches {
             out.push_str(&s[last..mat.start()]);
-            out.push_str(MARKER);
+            out.push_str(REDACTION_MARKER);
             last = mat.end();
         }
         out.push_str(&s[last..]);
@@ -445,7 +446,7 @@ mod tests {
                 let text = format!("data={enc}");
                 let out = r.redact(&text);
                 assert!(
-                    out.contains(MARKER),
+                    out.contains(REDACTION_MARKER),
                     "offset {} not redacted: {out}",
                     prefix.len()
                 );

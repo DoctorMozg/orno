@@ -224,8 +224,11 @@ impl Agent for LoopAgent {
             let response = match self.config.transport.complete(llm_req).await {
                 Ok(resp) => resp,
                 Err(err) => {
-                    let failure =
-                        LlmFailure::from_llm_error(&err, self.config.body_excerpt_max_bytes);
+                    let failure = LlmFailure::from_llm_error(
+                        &err,
+                        &self.config.redactor,
+                        self.config.body_excerpt_max_bytes,
+                    );
                     self.config
                         .sink
                         .record(Event::LlmRequestFailed {

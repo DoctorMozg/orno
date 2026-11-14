@@ -46,6 +46,10 @@ pub struct RunInputs {
     /// so a pipeline cannot resolve a secret through `env.*` and
     /// sidestep redaction.
     pub secrets: BTreeMap<String, String>,
+    /// Pipeline `vars:` already rendered by the caller. When set the
+    /// engine uses them as they are; `orno replay` supplies the vars
+    /// recorded in the bundle, which must not be rendered a second time.
+    pub rendered_vars: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// Run-level outcome surfaced to the caller after `Engine::run`
@@ -157,7 +161,7 @@ impl Engine {
         &self,
         run_id: &str,
         pipeline: &Pipeline,
-        inputs: RunInputs,
+        mut inputs: RunInputs,
     ) -> Result<RunOutcome, CoreError> {
         // Own `run_id` once so every `Event::*` ctor can `clone()` from
         // this local instead of hitting `&str::to_string()` on the
@@ -214,23 +218,26 @@ impl Engine {
         // this step the literal `{{ env.TAG }}` would land in
         // `vars.tag` and downstream `{{ vars.tag }}` references would
         // substitute the unrendered template source verbatim.
-        let rendered_vars = match crate::pipeline::template::render_pipeline_vars(
-            &self.templates,
-            &pipeline.vars,
-            &inputs.env,
-            &inputs.secrets,
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                self.sink
-                    .record(Event::RunFinished {
-                        run_id: run_id.clone(),
-                        ok: false,
-                        failed_nodes: vec![],
-                        skipped_nodes: vec![],
-                    })
-                    .await;
-                return Err(err.into());
+        let rendered_vars = match inputs.rendered_vars.take() {
+            Some(vars) => vars,
+            None => match crate::pipeline::template::render_pipeline_vars(
+                &self.templates,
+                &pipeline.vars,
+                &inputs.env,
+                &inputs.secrets,
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    self.sink
+                        .record(Event::RunFinished {
+                            run_id: run_id.clone(),
+                            ok: false,
+                            failed_nodes: vec![],
+                            skipped_nodes: vec![],
+                        })
+                        .await;
+                    return Err(err.into());
+                },
             },
         };
         let mut context = Context::new(rendered_vars, inputs.env, inputs.secrets);
@@ -1098,6 +1105,7 @@ mod tests {
         let inputs = RunInputs {
             env,
             secrets: BTreeMap::new(),
+            rendered_vars: None,
         };
 
         let outcome = engine

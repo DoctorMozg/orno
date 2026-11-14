@@ -14,7 +14,8 @@ use tracing::instrument;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
 use crate::error::{RecoverableKind, ToolError};
-use crate::events::{Event, EventSink, truncate_excerpt};
+use crate::events::redactor::Keep;
+use crate::events::{Event, EventSink, Redactor};
 use crate::mcp::McpClient;
 
 /// Static metadata for one MCP tool. Grouped so `McpToolHandler::new` stays
@@ -34,6 +35,8 @@ pub struct McpToolHandlerConfig {
     /// How many bytes of input/output JSON to include in excerpt events.
     /// Shared from the engine's `max_output_bytes` cap.
     pub body_excerpt_max_bytes: usize,
+    /// Scrubs secrets from the excerpts before they reach the event stream.
+    pub redactor: Arc<Redactor>,
 }
 
 /// One handler per `(mcp_server_name, tool_name)` pair. Constructed by
@@ -59,6 +62,12 @@ impl std::fmt::Debug for McpToolHandler {
 }
 
 impl McpToolHandler {
+    fn excerpt(&self, text: &str) -> String {
+        self.config
+            .redactor
+            .redact_bounded(text, self.config.body_excerpt_max_bytes, Keep::Head)
+    }
+
     #[must_use]
     pub fn new(
         config: McpToolHandlerConfig,
@@ -100,10 +109,7 @@ impl ToolHandler for McpToolHandler {
         )
     )]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let input_excerpt = truncate_excerpt(
-            &serde_json::to_string(&args).unwrap_or_default(),
-            self.config.body_excerpt_max_bytes,
-        );
+        let input_excerpt = self.excerpt(&serde_json::to_string(&args).unwrap_or_default());
 
         self.sink
             .record(Event::McpToolCallSent {
@@ -120,8 +126,7 @@ impl ToolHandler for McpToolHandler {
 
         match call_result {
             Ok(result) => {
-                let output_excerpt =
-                    truncate_excerpt(&result.content, self.config.body_excerpt_max_bytes);
+                let output_excerpt = self.excerpt(&result.content);
                 self.sink
                     .record(Event::McpToolCallCompleted {
                         run_id: inv.run_id.to_string(),
@@ -153,10 +158,7 @@ impl ToolHandler for McpToolHandler {
                         tool: self.config.tool.clone(),
                         call_id: inv.call_id.to_string(),
                         ok: false,
-                        output_excerpt: truncate_excerpt(
-                            &reason,
-                            self.config.body_excerpt_max_bytes,
-                        ),
+                        output_excerpt: self.excerpt(&reason),
                     })
                     .await;
                 Err(ToolError::Invocation {
@@ -361,6 +363,7 @@ mod tests {
                 description: "Read a file".to_string(),
                 schema: json!({"type": "object"}),
                 body_excerpt_max_bytes: 512,
+                redactor: Arc::new(Redactor::default()),
             },
             client,
             sink.clone(),
@@ -438,6 +441,45 @@ mod tests {
             sink.snapshot()[1].event,
             Event::McpToolCallCompleted { ok: false, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn event_excerpts_are_redacted() {
+        let secrets =
+            std::collections::BTreeMap::from([("t".to_string(), "tok-abcdef123".to_string())]);
+        let sink = Arc::new(InMemorySink::new());
+        let handler = McpToolHandler::new(
+            McpToolHandlerConfig {
+                yaml_name: "mcp.fs.read_file".to_string(),
+                server: "fs".to_string(),
+                tool: "read_file".to_string(),
+                description: String::new(),
+                schema: json!({}),
+                body_excerpt_max_bytes: 512,
+                redactor: Arc::new(Redactor::new(&secrets)),
+            },
+            Arc::new(AlwaysErrClient {
+                server_name: "fs".to_string(),
+            }),
+            sink.clone(),
+        );
+
+        drop(
+            handler
+                .invoke(
+                    ToolInvocation::for_test("c"),
+                    json!({"auth": "tok-abcdef123"}),
+                )
+                .await,
+        );
+
+        match &sink.snapshot()[0].event {
+            Event::McpToolCallSent { input_excerpt, .. } => {
+                assert!(!input_excerpt.contains("tok-abcdef123"), "{input_excerpt}");
+                assert!(input_excerpt.contains("***"), "{input_excerpt}");
+            },
+            other => panic!("expected McpToolCallSent, got {other:?}"),
+        }
     }
 
     #[test]

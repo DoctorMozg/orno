@@ -35,9 +35,20 @@ once the first tagged release ships.
 
 - Optional per-server `call_timeout_secs` on `mcp_servers` entries
   (default 30).
+- Each LLM request attempt is cut off after 5 minutes and surfaces as a
+  transport failure; a timed-out attempt is not retried.
 
 ### Changed
 
+- **Breaking:** the bundle and tape format is version 2. A bundle or
+  tape entry is `{key, seq, outcome}` instead of carrying the full
+  request, so files no longer grow quadratically with the conversation,
+  and a bundle gains a `run_inputs` line. `orno replay` refuses version 1
+  bundles and names both versions; re-record them. The reader also
+  insists on the header first, the trailer last, and exactly one
+  `pipeline_yaml` and `run_inputs`.
+- A missing provider API key is reported as a configuration error that
+  names the env var to set, instead of `AuthFailed`.
 - A recoverable tool failure (missing file, non-UTF-8 content, Bash or
   WebFetch timeout, `Edit` with no or several matches, MCP `isError: true`)
   is fed back to the model as an `error: ...` tool result and the loop
@@ -79,6 +90,24 @@ once the first tagged release ships.
 
 ### Fixed
 
+- A secret in a prompt, a tool argument or a tool result no longer makes
+  `orno replay` miss the tape: entries are keyed on the request with
+  secrets masked, which is the form replay can rebuild.
+- Identical requests issued concurrently replay in call order; each
+  entry carries a per-key sequence number taken when the call started.
+- `--record-bundle` writes to a temporary file and renames it into place,
+  so a failed run leaves no partial bundle; a truncated bundle is
+  rejected instead of replayed with a warning.
+- `orno replay` works for pipelines that read `env.*` or `secrets.*` in
+  `vars` or in node templates: the bundle records the rendered `vars`,
+  the `env` values (redacted) and the secret names with masked values.
+- A replayed tool error keeps its class: a recoverable failure stays
+  recoverable with the same kind, and terminal errors stay terminal.
+- A tool-call turn keeps the text the model wrote beside the call, and a
+  404 only means "model not found" when the body mentions the model, so
+  a wrong `OLLAMA_HOST` shows up as an API error.
+- MCP call excerpts and `llm_request_failed` body excerpts are redacted
+  before truncation.
 - History eviction no longer leaves a `ToolResult` without its tool call
   (providers answered 400); it drops whole turns once per turn, off a
   running byte total instead of re-summing the history.

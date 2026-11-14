@@ -14,8 +14,10 @@
 //!   schema (lifted from the LLM tape). The stub is wrapped in
 //!   `ReplayToolHandler` so actual dispatch reads from the tool tape
 //!   exactly like a builtin would.
-//! - `RunInputs` is empty: rendered prompts and resolved env values
-//!   are already baked into the recorded LLM requests.
+//! - `RunInputs` comes from the bundle's `run_inputs` line: the rendered
+//!   `vars`, the `env` namespace, and the `secrets` namespace with every
+//!   value masked, so templates render the same prompts as the recorded
+//!   run without a real secret being available.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -98,8 +100,10 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     // Replay transport is seeded directly from the bundle entries; a
     // tape miss surfaces as `LlmError::ReplayMiss` at call time.
     // No fallback to the live API — non-determinism is bounded.
-    let transport: Arc<dyn LlmTransport> =
-        Arc::new(ReplayTransport::from_entries(bundle.llm_entries));
+    let transport: Arc<dyn LlmTransport> = Arc::new(
+        ReplayTransport::from_entries(bundle.llm_entries)
+            .context("indexing LLM entries from bundle")?,
+    );
 
     // No live secrets in replay — `secrets.*` values are not resolved
     // at replay time, so the redactor is a no-op. Constructing one
@@ -121,16 +125,12 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     // `(tool_name, call_id, args)` so siblings sharing the entry list
     // never collide — a `Bash` call and a `Read` call with the same
     // call_id index different tape rows.
-    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> =
-        builtin_handlers(&redactor, body_excerpt_max_bytes)
-            .into_iter()
-            .map(|handler| {
-                Arc::new(ReplayToolHandler::from_entries(
-                    handler,
-                    tool_entries.clone(),
-                )) as Arc<dyn ToolHandler>
-            })
-            .collect();
+    let mut builtin_tools: Vec<Arc<dyn ToolHandler>> = Vec::new();
+    for handler in builtin_handlers(&redactor, body_excerpt_max_bytes) {
+        let replay = ReplayToolHandler::from_entries(handler, tool_entries.clone())
+            .context("indexing tool entries from bundle")?;
+        builtin_tools.push(Arc::new(replay));
+    }
 
     // MCP replay: no live `McpClient` is spawned, but the agent loop
     // still needs a registered handler for every `mcp.*` tool the
@@ -157,10 +157,10 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
                     || (String::new(), serde_json::json!({})),
                     |def| (def.description.clone(), def.schema.clone()),
                 );
-            builtin_tools.push(Arc::new(ReplayToolHandler::from_entries(
-                Arc::new(ReplayMcpStubHandler::new(tool.clone(), description, schema)),
-                tool_entries.clone(),
-            )));
+            let stub = Arc::new(ReplayMcpStubHandler::new(tool.clone(), description, schema));
+            let replay = ReplayToolHandler::from_entries(stub, tool_entries.clone())
+                .context("indexing tool entries from bundle")?;
+            builtin_tools.push(Arc::new(replay));
         }
     }
 
@@ -209,13 +209,14 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     let sink_for_signal = sink.clone();
     let engine = Engine::new(sink, registry, templates, engine_config);
 
-    // RunInputs is empty: rendered prompts already include the env /
-    // secrets values they were captured with, so re-resolving here
-    // would only let drift sneak in. Templates referencing `env.*` or
-    // `secrets.*` re-render against an empty namespace at replay; for
-    // pipelines with first-turn templates that read env, the original
-    // rendered values still flow through the recorded `LlmRequest`,
-    // not through a re-render against the live process.
+    // The recorded namespaces stand in for the live env and secrets:
+    // vars come back already rendered, and secret values are the
+    // redaction placeholder, which is also what the recorded requests
+    // were keyed with.
+    let mut inputs = RunInputs::default();
+    inputs.env = bundle.run_inputs.env;
+    inputs.secrets = bundle.run_inputs.secrets;
+    inputs.rendered_vars = Some(bundle.run_inputs.vars);
     //
     // SIGINT handling mirrors `orno run`: race the engine future
     // against `ctrl_c`. Replay has no live tapes to flush and no MCP
@@ -236,7 +237,7 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
             .await;
             return Err(super::Interrupted.into());
         }
-        res = engine.run(&run_id, &pipeline, RunInputs::default()) => res?,
+        res = engine.run(&run_id, &pipeline, inputs) => res?,
     };
 
     if streaming_sink.is_broken() {
@@ -259,16 +260,16 @@ pub async fn run(bundle_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Walk every recorded LLM request's `tools` list and collect the
-/// `OrnoChatTool` definition for each MCP tool the agent loop sent
+/// Walk the tool definitions recorded on the LLM entries and collect
+/// the `OrnoChatTool` definition for each MCP tool the agent loop sent
 /// to the model. Returned in first-occurrence order so callers can
 /// reconstruct the recorded tool order verbatim.
 ///
 /// First-seen wins: every recorded iteration of an agent sends the
 /// same `tools` list, so duplicates are expected and harmless.
 ///
-/// Order matters here because `tape_key = blake3(json(LlmRequest))`
-/// and `LlmRequest.tools` serializes as a JSON array — element
+/// Order matters here because the tape key hashes the serialized
+/// `LlmRequest`, and `LlmRequest.tools` serializes as a JSON array — element
 /// position is part of the hashed bytes. A `HashMap` return type
 /// previously scrambled tool order across program runs (`HashMap`
 /// key iteration is randomized), causing every replay to miss with
@@ -279,7 +280,7 @@ fn discover_mcp_tool_definitions(llm_entries: &[TapeEntry]) -> Vec<OrnoChatTool>
     let mut out: Vec<OrnoChatTool> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for entry in llm_entries {
-        for tool in entry.req.tools.iter() {
+        for tool in &entry.tools {
             if tool.name.starts_with("mcp_") && seen.insert(tool.name.clone()) {
                 out.push(tool.clone());
             }
@@ -352,21 +353,15 @@ fn derive_server_tools(
 mod tests {
     use super::*;
     use orno_core::llm::{
-        LlmRequest, LlmResponse, OrnoChatTool,
+        LlmResponse, OrnoChatTool,
         recording::{TapeEntry, TapeOutcome},
     };
 
     fn tape_entry_with_tools(tools: Vec<OrnoChatTool>) -> TapeEntry {
         TapeEntry {
-            req: LlmRequest::from_prompt(
-                "openai".into(),
-                "gpt-5".into(),
-                "x".into(),
-                None,
-                None,
-                None,
-            )
-            .with_tools(tools),
+            key: "openai:gpt-5:x".into(),
+            seq: 0,
+            tools,
             outcome: TapeOutcome::Ok {
                 res: LlmResponse {
                     content: "ok".into(),

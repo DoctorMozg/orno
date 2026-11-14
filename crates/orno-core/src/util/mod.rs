@@ -4,7 +4,7 @@
 pub(crate) mod child_guard;
 pub mod tape;
 
-pub use tape::{TapeReader, TapeWriter};
+pub use tape::{DuplicateTapeEntry, SeqCounter, TapeFile, TapeIndex, read_tape};
 
 /// Serialize a `serde_json::Value` with object keys in alphabetic order
 /// at every nesting level. Arrays preserve their element order; scalars

@@ -1,30 +1,31 @@
-//! `RecordingTransport` — decorator that writes `(request, outcome)`
-//! pairs to an NDJSON tape while passing the call through to an inner
+//! `RecordingTransport` — decorator that writes one tape entry per call
+//! to an NDJSON tape while passing the call through to an inner
 //! transport. Pairs with [`super::ReplayTransport`] for the
 //! bounded-non-determinism guarantee in the strictness contract.
 //!
-//! Tape format: one JSON object per line with `{ "req": …, "outcome":
+//! Tape format: one JSON object per line with `{ "key", "seq", "outcome":
 //! { "kind": "ok"|"err", … } }`. Both successful responses and typed
 //! failures are recorded so a replayed run reproduces both branches of
-//! the original control flow — a transient API failure that drove a
-//! downstream branching decision in the live run replays as the same
-//! failure class without ever touching the network.
+//! the original control flow. The request body is not stored: replay
+//! only needs the key to find the response, and a full message history
+//! per entry would make tapes grow quadratically.
 //!
 //! Portable DTOs only — no `genai::*` types touch the tape, so tapes
 //! remain valid across library version bumps.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::error::LlmError;
 use crate::events::{LlmFailure, Redactor};
+use crate::util::{SeqCounter, TapeFile, canonical_json};
 
-use super::{LlmRequest, LlmResponse, LlmTransport};
+use super::{LlmRequest, LlmResponse, LlmTransport, OrnoChatTool};
 
 /// Cap on the body excerpt captured into `LlmFailure::ApiError` when a
 /// failure is recorded onto the tape. Mirrors the engine-level
@@ -37,8 +38,9 @@ const RECORDED_API_BODY_EXCERPT_BYTES: usize = 4096;
 
 pub struct RecordingTransport {
     inner: Arc<dyn LlmTransport>,
-    tape: Arc<Mutex<BufWriter<File>>>,
-    path: PathBuf,
+    tape: TapeFile,
+    seq: SeqCounter,
+    recorded_tools: Mutex<HashSet<String>>,
     redactor: Arc<Redactor>,
 }
 
@@ -47,10 +49,19 @@ pub struct RecordingTransport {
 /// re-implementing the shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TapeEntry {
-    /// The request that produced this entry. Identifies the entry on
-    /// replay via the `(provider, model, blake3(canonical_json(req)))`
-    /// key.
-    pub req: LlmRequest,
+    /// `provider:model:blake3(canonical_json(redacted request))`. The
+    /// request is redacted before hashing because replay rebuilds it
+    /// from redacted tapes and has no secrets to substitute back.
+    pub key: String,
+    /// Index of this call among the calls that share `key`, assigned
+    /// when the request started so completion order cannot reorder
+    /// identical requests on replay.
+    pub seq: u32,
+    /// Tool definitions that appeared in the request for the first time
+    /// on this tape. `orno replay` rebuilds MCP stubs from them so the
+    /// replayed request hashes to the same key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<OrnoChatTool>,
     /// Whether the call succeeded or failed, plus the recorded payload
     /// for that branch. `outcome.kind: "ok"` carries the response;
     /// `outcome.kind: "err"` carries a typed `LlmFailure`.
@@ -82,42 +93,41 @@ pub enum TapeOutcome {
     },
 }
 
+/// Tape key for `req`. `redactor` is `None` on replay, where the
+/// request already carries the redaction placeholder.
+///
+/// Canonical JSON sorts every nested object's keys so a producer whose
+/// insertion order shifts (e.g. `schemars` tool schemas) does not
+/// invalidate tapes. The full 64-char digest is kept; truncating it
+/// would narrow the keyspace for no gain.
+pub(crate) fn tape_key(req: &LlmRequest, redactor: Option<&Redactor>) -> String {
+    let mut value = serde_json::to_value(req).expect("LlmRequest serializes");
+    if let Some(redactor) = redactor {
+        redactor.redact_json(&mut value);
+    }
+    let hash = blake3::hash(canonical_json(&value).as_bytes());
+    format!("{}:{}:{}", req.provider, req.model, hash.to_hex())
+}
+
 impl RecordingTransport {
     /// Create the tape file at `path` and wrap `inner`. Parent
     /// directory must exist; the path itself must not exist —
     /// `O_EXCL` forces an explicit caller decision about reusing a
     /// stale tape.
     ///
-    /// `redactor` is applied to every tape entry before it is written
-    /// to disk. Pass `Arc::new(Redactor::default())` when recording
-    /// in a context that has no secrets (e.g. tests).
+    /// `redactor` is applied to every recorded outcome and to the
+    /// request before it is keyed. Pass `Arc::new(Redactor::default())`
+    /// when recording in a context that has no secrets (e.g. tests).
     pub fn create(
         inner: Arc<dyn LlmTransport>,
-        path: impl Into<PathBuf>,
+        path: impl Into<std::path::PathBuf>,
         redactor: Arc<Redactor>,
     ) -> Result<Self, std::io::Error> {
-        let path = path.into();
-        let file = {
-            let mut opts = OpenOptions::new();
-            // `create_new` (O_EXCL) prevents a local attacker from
-            // pre-creating a symlink at the tape path that would
-            // redirect writes elsewhere; if a stale tape sits at the
-            // path the caller must delete it before re-recording.
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Tape files capture full LLM payloads (prompts,
-                // responses, tool args) — they must not be world-
-                // readable on shared hosts.
-                opts.mode(0o600);
-            }
-            opts.open(&path)?
-        };
         Ok(Self {
             inner,
-            tape: Arc::new(Mutex::new(BufWriter::new(file))),
-            path,
+            tape: TapeFile::create(path)?,
+            seq: SeqCounter::default(),
+            recorded_tools: Mutex::new(HashSet::new()),
             redactor,
         })
     }
@@ -126,73 +136,92 @@ impl RecordingTransport {
     /// that need to round-trip through `ReplayTransport::load`.
     #[must_use]
     pub fn tape_path(&self) -> &Path {
-        &self.path
+        self.tape.path()
     }
 
     /// Flush buffered bytes to disk. Call before dropping when the
-    /// tape must survive a crash mid-run. `Drop` flushes too, but
-    /// silently — errors get lost.
+    /// tape must survive a crash mid-run.
     pub fn flush(&self) -> Result<(), std::io::Error> {
-        let mut guard = self
-            .tape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.flush()?;
-        // fsync: a `BufWriter::flush` only pushes bytes to the kernel;
-        // without `sync_all` the OS page cache can lose the tape across
-        // a power cut, breaking the bounded-non-determinism guarantee
-        // when replay runs against an apparently-flushed file.
-        guard.get_mut().sync_all()
+        self.tape.flush()
     }
 
-    /// Serialize one tape entry, redact, and write as an NDJSON line.
-    /// Failures here surface as `LlmError::Transport` rather than
-    /// hiding behind the original call's success path — a tape write
-    /// error that cannot be observed defeats the strictness guarantee.
+    /// Tool definitions in `req` that no earlier entry carried.
+    fn unseen_tools(&self, req: &LlmRequest) -> Vec<OrnoChatTool> {
+        let mut seen = self
+            .recorded_tools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        req.tools
+            .iter()
+            .filter(|tool| seen.insert(tool.name.clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// Redact the outcome and append the entry. A tape write error
+    /// surfaces as `LlmError::Transport` rather than hiding behind the
+    /// original call's success path — a tape write error that cannot be
+    /// observed defeats the strictness guarantee.
     fn write_entry(&self, entry: &TapeEntry) -> Result<(), LlmError> {
-        let mut raw_entry =
+        let mut line =
             serde_json::to_value(entry).map_err(|e| LlmError::ParseError(e.to_string()))?;
-        self.redactor.redact_json(&mut raw_entry);
-        let line =
-            serde_json::to_string(&raw_entry).map_err(|e| LlmError::ParseError(e.to_string()))?;
-        let mut guard = self.tape.lock().expect("tape mutex poisoned");
-        writeln!(*guard, "{line}").map_err(|e| LlmError::Transport(Box::new(e)))?;
-        Ok(())
+        if let Some(outcome) = line.get_mut("outcome") {
+            self.redactor.redact_json(outcome);
+        }
+        self.tape
+            .append(&line)
+            .map_err(|e| LlmError::Transport(Box::new(e)))
     }
 }
 
 #[async_trait]
 impl LlmTransport for RecordingTransport {
+    #[instrument(
+        skip(self, req),
+        fields(llm.provider = %req.provider, llm.model = %req.model),
+    )]
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
+        // The sequence number is taken before the call starts so it
+        // reflects call order, not completion order.
+        let key = tape_key(&req, Some(&self.redactor));
+        let seq = self.seq.next(&key);
+        let tools = self.unseen_tools(&req);
+
         // Capture the inner result instead of `?`-ing it so a failed
         // call still lands on the tape. The original failure is
         // re-raised to the caller after the entry has been written.
-        match self.inner.complete(req.clone()).await {
+        match self.inner.complete(req).await {
             Ok(res) => {
                 let entry = TapeEntry {
-                    req,
+                    key,
+                    seq,
+                    tools,
                     outcome: TapeOutcome::Ok { res: res.clone() },
                 };
                 self.write_entry(&entry)?;
                 Ok(res)
             },
             Err(err) => {
-                let failure = LlmFailure::from_llm_error(&err, RECORDED_API_BODY_EXCERPT_BYTES);
+                let failure = LlmFailure::from_llm_error(
+                    &err,
+                    &self.redactor,
+                    RECORDED_API_BODY_EXCERPT_BYTES,
+                );
                 let entry = TapeEntry {
-                    req,
+                    key,
+                    seq,
+                    tools,
                     outcome: TapeOutcome::Err { err: failure },
                 };
-                // Best-effort tape write: if the entry cannot be
-                // persisted (disk full, file vanished), surface the
-                // tape error rather than the original — the missing
-                // tape line is the more dangerous failure for replay.
-                // Log the original LLM error first so it is not
-                // silently lost when the tape-write failure replaces
-                // it on the wire.
+                // If the entry cannot be persisted (disk full, file
+                // vanished), surface the tape error rather than the
+                // original — the missing tape line is the more
+                // dangerous failure for replay. Log the original first
+                // so it is not lost.
                 if let Err(tape_err) = self.write_entry(&entry) {
                     tracing::warn!(
-                        original_error = ?err,
-                        "original LLM error masked by tape-write failure; see tape error below"
+                        error = ?err,
+                        "original LLM error masked by tape-write failure",
                     );
                     return Err(tape_err);
                 }
@@ -246,7 +275,7 @@ mod tests {
         rec.flush().unwrap();
         drop(rec);
 
-        let f = File::open(&path).unwrap();
+        let f = std::fs::File::open(&path).unwrap();
         let lines: Vec<String> = std::io::BufReader::new(f)
             .lines()
             .map(Result::unwrap)
@@ -254,7 +283,7 @@ mod tests {
         assert_eq!(lines.len(), 2, "one line per call");
         for line in &lines {
             let entry: TapeEntry = serde_json::from_str(line).unwrap();
-            assert_eq!(entry.req.provider, "openai");
+            assert!(entry.key.starts_with("openai:gpt-5:"), "{}", entry.key);
             match entry.outcome {
                 TapeOutcome::Ok { res } => assert!(!res.content.is_empty()),
                 TapeOutcome::Err { err } => panic!("dummy transport must not fail: {err:?}"),
@@ -496,5 +525,82 @@ mod tests {
             parsed["outcome"]["err"]["kind"], "rate_limited",
             "wire format drift — inner failure kind missing: {contents}",
         );
+    }
+
+    #[tokio::test]
+    async fn entries_store_the_key_not_the_request() {
+        // Entries used to carry the whole request, so a tape grew
+        // quadratically with the message history.
+        use crate::llm::OrnoChatMessage;
+
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
+        let rec = RecordingTransport::create(
+            Arc::new(DummyTransport),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
+        let mut req = LlmRequest::from_prompt(
+            "openai".into(),
+            "gpt-5".into(),
+            "hi".into(),
+            None,
+            None,
+            None,
+        );
+        req.messages = Arc::new(vec![OrnoChatMessage::User {
+            content: "distinctive-history-marker".into(),
+        }]);
+        rec.complete(req).await.unwrap();
+        rec.flush().unwrap();
+        drop(rec);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("distinctive-history-marker"),
+            "{contents}"
+        );
+        let entry: TapeEntry = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(entry.seq, 0);
+    }
+
+    #[tokio::test]
+    async fn tool_definitions_are_recorded_once() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("tape.ndjson");
+        let rec = RecordingTransport::create(
+            Arc::new(DummyTransport),
+            &path,
+            Arc::new(Redactor::default()),
+        )
+        .unwrap();
+        let tool = OrnoChatTool {
+            name: "mcp_fs_read".into(),
+            description: "Read".into(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        for prompt in ["one", "two"] {
+            let req = LlmRequest::from_prompt(
+                "openai".into(),
+                "gpt-5".into(),
+                prompt.into(),
+                None,
+                None,
+                None,
+            )
+            .with_tools(vec![tool.clone()]);
+            rec.complete(req).await.unwrap();
+        }
+        rec.flush().unwrap();
+        drop(rec);
+
+        let entries: Vec<TapeEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries[0].tools.len(), 1);
+        assert!(entries[1].tools.is_empty(), "already recorded");
     }
 }

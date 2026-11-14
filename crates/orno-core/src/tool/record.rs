@@ -4,45 +4,152 @@
 //! bounded-non-determinism guarantee in the strictness contract.
 //!
 //! Tape format: one JSON object per line —
-//! `{ "key": "<hex>", "content": "...", "error": null }` on success,
-//! `{ "key": "<hex>", "content": null, "error": "..." }` on failure.
+//! `{ "key": "<hex>", "seq": 0, "outcome": { "kind": "ok", "content": "..." } }`
+//! on success, with `"kind"` naming the `ToolError` class on failure
+//! (see [`ToolTapeOutcome`]).
 //!
-//! Key: `blake3( tool_name + ":" + call_id + ":" + canonical_json(args) )`.
+//! Key: `blake3( tool_name + ":" + call_id + ":" + canonical_json(redacted args) )`.
 //! Using the LLM-issued `call_id` couples the tool tape to the LLM tape
 //! so a full replay is consistent when both tapes are loaded together.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::instrument;
 
 use super::{ToolEffect, ToolHandler, ToolInvocation};
-use crate::error::ToolError;
+use crate::error::{RecoverableKind, ToolError};
 use crate::events::Redactor;
-use crate::util::canonical_json;
+use crate::util::{SeqCounter, TapeFile, canonical_json};
 
 /// One entry persisted to or loaded from the tool tape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolTapeEntry {
     /// `blake3( tool_name + ":" + call_id + ":" + args_json )` hex.
     pub key: String,
-    /// Tool return value on success. `None` when `error` is set.
-    pub content: Option<String>,
-    /// `Display` form of the `ToolError` on failure. `None` on success.
-    pub error: Option<String>,
+    /// Index of this call among the calls that share `key`, assigned
+    /// before the tool ran.
+    pub seq: u32,
+    /// Recorded result of the call.
+    pub outcome: ToolTapeOutcome,
+}
+
+/// Recorded result of one tool call, keeping the `ToolError` class so
+/// replay hands the agent loop the same recoverable-or-terminal
+/// decision it saw live. Failure messages are redacted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolTapeOutcome {
+    /// The tool returned its output.
+    Ok {
+        /// Tool return value.
+        content: String,
+    },
+    /// `ToolError::Recoverable`.
+    Recoverable {
+        /// Why the model can retry.
+        recoverable: RecoverableKind,
+        /// Text shown to the model.
+        message: String,
+    },
+    /// `ToolError::Invocation`; the source chain is flattened.
+    Invocation {
+        /// Rendered source error.
+        message: String,
+    },
+    /// `ToolError::InvalidArgs`.
+    InvalidArgs {
+        /// What was wrong with the arguments.
+        message: String,
+    },
+    /// `ToolError::StateTooLarge`.
+    StateTooLarge {
+        /// Serialized state size that was rejected.
+        bytes: usize,
+        /// Cap it exceeded.
+        cap: usize,
+    },
+    /// `ToolError::NotImplemented`.
+    NotImplemented {
+        /// The unwired feature.
+        feature: String,
+    },
+    /// `ToolError::Denied`.
+    Denied {
+        /// Why access was refused.
+        reason: String,
+    },
+}
+
+impl ToolTapeOutcome {
+    /// Capture `result`, redacting every free-text field.
+    pub(crate) fn from_result(result: &Result<String, ToolError>, redactor: &Redactor) -> Self {
+        let clean = |s: &str| redactor.redact(s).into_owned();
+        match result {
+            Ok(content) => Self::Ok {
+                content: clean(content),
+            },
+            Err(ToolError::Recoverable { kind, message, .. }) => Self::Recoverable {
+                recoverable: *kind,
+                message: clean(message),
+            },
+            Err(ToolError::Invocation { source, .. }) => Self::Invocation {
+                message: clean(&source.to_string()),
+            },
+            Err(ToolError::InvalidArgs { message, .. }) => Self::InvalidArgs {
+                message: clean(message),
+            },
+            Err(ToolError::StateTooLarge { bytes, cap, .. }) => Self::StateTooLarge {
+                bytes: *bytes,
+                cap: *cap,
+            },
+            Err(ToolError::NotImplemented { feature, .. }) => Self::NotImplemented {
+                feature: clean(feature),
+            },
+            Err(ToolError::Denied { reason }) => Self::Denied {
+                reason: clean(reason),
+            },
+        }
+    }
+
+    /// Rebuild the result for the tool called `name`.
+    pub(crate) fn into_result(self, name: &str) -> Result<String, ToolError> {
+        let name = name.to_string();
+        match self {
+            Self::Ok { content } => Ok(content),
+            Self::Recoverable {
+                recoverable,
+                message,
+            } => Err(ToolError::Recoverable {
+                name,
+                kind: recoverable,
+                message,
+            }),
+            Self::Invocation { message } => Err(ToolError::Invocation {
+                name,
+                source: Box::new(std::io::Error::other(message)),
+            }),
+            Self::InvalidArgs { message } => Err(ToolError::InvalidArgs { name, message }),
+            Self::StateTooLarge { bytes, cap } => {
+                Err(ToolError::StateTooLarge { name, bytes, cap })
+            },
+            Self::NotImplemented { feature } => Err(ToolError::NotImplemented { name, feature }),
+            Self::Denied { reason } => Err(ToolError::Denied { reason }),
+        }
+    }
 }
 
 /// Wraps any `ToolHandler`: passes every call through, then appends the
 /// result to a shared NDJSON tape. `flush()` must be called after the run
-/// because `BufWriter` may hold unflushed bytes.
+/// because the tape buffers its writes.
 pub struct RecordingToolHandler {
     inner: Arc<dyn ToolHandler>,
-    tape: Arc<Mutex<BufWriter<File>>>,
-    path: PathBuf,
+    tape: Arc<TapeFile>,
+    seq: SeqCounter,
     redactor: Arc<Redactor>,
 }
 
@@ -50,7 +157,7 @@ impl std::fmt::Debug for RecordingToolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingToolHandler")
             .field("tool", &self.inner.name())
-            .field("path", &self.path)
+            .field("path", &self.tape.path())
             .finish_non_exhaustive()
     }
 }
@@ -64,29 +171,8 @@ impl RecordingToolHandler {
         path: impl Into<PathBuf>,
         redactor: Arc<Redactor>,
     ) -> Result<Self, std::io::Error> {
-        let path = path.into();
-        let file = {
-            let mut opts = OpenOptions::new();
-            // `create_new` (O_EXCL) prevents a local attacker from
-            // pre-creating a symlink at the tape path that would
-            // redirect writes elsewhere; if a stale tape sits at the
-            // path the caller must delete it before re-recording.
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                // Tape files capture full tool args and outputs —
-                // they must not be world-readable on shared hosts.
-                opts.mode(0o600);
-            }
-            opts.open(&path)?
-        };
-        Ok(Self {
-            inner,
-            tape: Arc::new(Mutex::new(BufWriter::new(file))),
-            path,
-            redactor,
-        })
+        let tape = Arc::new(TapeFile::create(path)?);
+        Ok(Self::with_shared_tape(inner, tape, redactor))
     }
 
     /// Wrap `inner` and share an already-opened tape. Use this when
@@ -94,36 +180,26 @@ impl RecordingToolHandler {
     /// caller is responsible for flushing the tape after the run.
     pub fn with_shared_tape(
         inner: Arc<dyn ToolHandler>,
-        tape: Arc<Mutex<BufWriter<File>>>,
-        path: PathBuf,
+        tape: Arc<TapeFile>,
         redactor: Arc<Redactor>,
     ) -> Self {
         Self {
             inner,
             tape,
-            path,
+            seq: SeqCounter::default(),
             redactor,
         }
     }
 
     #[must_use]
     pub fn tape_path(&self) -> &Path {
-        &self.path
+        self.tape.path()
     }
 
     /// Flush buffered bytes to disk. Must be called before dropping to
     /// avoid silently losing the last entries.
     pub fn flush(&self) -> Result<(), std::io::Error> {
-        let mut guard = self
-            .tape
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.flush()?;
-        // fsync: a `BufWriter::flush` only pushes bytes to the kernel;
-        // without `sync_all` the OS page cache can lose the tape across
-        // a power cut, breaking the bounded-non-determinism guarantee
-        // when replay runs against an apparently-flushed file.
-        guard.get_mut().sync_all()
+        self.tape.flush()
     }
 }
 
@@ -142,37 +218,31 @@ impl ToolHandler for RecordingToolHandler {
         self.inner.effect()
     }
 
+    #[instrument(skip(self, inv, args), fields(tool.name = %self.inner.name(), call_id = %inv.call_id))]
     async fn invoke(&self, inv: ToolInvocation<'_>, args: Value) -> Result<String, ToolError> {
-        let key = tool_tape_key(self.inner.name(), inv.call_id, &args);
+        let key = tool_tape_key(self.inner.name(), inv.call_id, &args, Some(&self.redactor));
+        let seq = self.seq.next(&key);
         let result = self.inner.invoke(inv, args).await;
 
         let entry = ToolTapeEntry {
             key,
-            content: result
-                .as_ref()
-                .ok()
-                .map(|s| self.redactor.redact(s).into_owned()),
-            error: result.as_ref().err().map(ToString::to_string),
+            seq,
+            outcome: ToolTapeOutcome::from_result(&result, &self.redactor),
         };
-        let line = serde_json::to_string(&entry)
-            .unwrap_or_else(|e| format!("{{\"serialize_err\":\"{e}\"}}"));
-        {
-            let mut guard = self.tape.lock().expect("tape mutex poisoned");
-            // Record/replay is a strictness dimension, so a tape-write
-            // failure aborts the call rather than silently dropping the
-            // entry — replay would otherwise diverge.
-            if let Err(e) = writeln!(*guard, "{line}") {
-                tracing::warn!(
-                    error = %e,
-                    tool = self.inner.name(),
-                    path = %self.path.display(),
-                    "tool tape write failed — replay bundle is incomplete",
-                );
-                return Err(ToolError::Invocation {
-                    name: self.inner.name().to_string(),
-                    source: Box::new(e),
-                });
-            }
+        // Record/replay is a strictness dimension, so a tape-write
+        // failure aborts the call rather than silently dropping the
+        // entry — replay would otherwise diverge.
+        if let Err(e) = self.tape.append(&entry) {
+            tracing::warn!(
+                error = %e,
+                tool.name = self.inner.name(),
+                path = %self.tape.path().display(),
+                "tool tape write failed — replay bundle is incomplete",
+            );
+            return Err(ToolError::Invocation {
+                name: self.inner.name().to_string(),
+                source: Box::new(e),
+            });
         }
         result
     }
@@ -180,17 +250,30 @@ impl ToolHandler for RecordingToolHandler {
 
 /// Tool-tape key = `blake3( tool_name + ":" + call_id + ":" + canonical_json(args) )`.
 ///
-/// `canonical_json` sorts every nested JSON object's keys alphabetically,
-/// pinning the hash input to the args' content rather than to the
-/// insertion order of whatever produced them. This shields tapes from
-/// silent invalidation when a `schemars` (or other serde-Value) minor
-/// bump shifts key order in tool arguments.
+/// Record passes its `redactor` so the args are keyed in redacted form:
+/// replay receives them from the redacted LLM tape and has no secrets to
+/// restore, so only the redacted form is reproducible. `canonical_json`
+/// sorts every nested object's keys so the hash does not depend on the
+/// insertion order of whatever produced the args.
 ///
 /// `call_id` is provider-issued (Anthropic and `OpenAI` emit different
 /// IDs for the same logical call) so cross-provider tool-tape replay is
-/// intentionally unsupported. Document this constraint to operators in
-/// `docs/tutorials/record-replay.md`.
-pub(crate) fn tool_tape_key(tool_name: &str, call_id: &str, args: &Value) -> String {
+/// intentionally unsupported.
+pub(crate) fn tool_tape_key(
+    tool_name: &str,
+    call_id: &str,
+    args: &Value,
+    redactor: Option<&Redactor>,
+) -> String {
+    let mut redacted;
+    let args = match redactor {
+        Some(redactor) if !redactor.is_noop() => {
+            redacted = args.clone();
+            redactor.redact_json(&mut redacted);
+            &redacted
+        },
+        _ => args,
+    };
     let raw = format!("{tool_name}:{call_id}:{}", canonical_json(args));
     blake3::hash(raw.as_bytes()).to_hex().to_string()
 }
@@ -236,16 +319,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn tape_write_failure_returns_invocation_error() {
-        // `/dev/full` accepts opens but every `write` returns ENOSPC. A
-        // zero-capacity `BufWriter` forwards each byte straight to the
-        // underlying file, so the failure cannot hide in the buffer.
+        // `/dev/full` accepts opens but every `write` returns ENOSPC; an
+        // unbuffered tape keeps the failure from hiding in the buffer.
         let path = PathBuf::from("/dev/full");
-        let file = OpenOptions::new().write(true).open(&path).unwrap();
-        let tape = Arc::new(Mutex::new(BufWriter::with_capacity(0, file)));
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let tape = Arc::new(TapeFile::from_unbuffered(file, path));
         let rec = RecordingToolHandler::with_shared_tape(
             Arc::new(EchoHandler),
             tape,
-            path,
             Arc::new(Redactor::default()),
         );
 

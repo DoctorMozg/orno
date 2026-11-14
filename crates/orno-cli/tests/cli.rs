@@ -416,6 +416,76 @@ fn record_bundle_then_replay_exits_success() {
     );
 }
 
+const ENV_AND_SECRET_PIPELINE: &str = r#"
+version: 1
+vars:
+  region: "{{ env.REGION }}"
+secrets: [API_TOKEN]
+agents:
+  a:
+    model: openai/gpt-5
+    provider: openrouter
+    allowed_tools: []
+    policy:
+      max_iterations: 1
+      max_total_tokens: 1000
+      max_tool_calls: 0
+      max_subagent_depth: 0
+      allow_mutations: false
+      allow_network: false
+      on_parse_error: fail
+nodes:
+  - id: ask
+    kind: agent
+    agent: a
+    initial_prompt: "region={{ vars.region }} stage={{ env.STAGE }} token={{ secrets.API_TOKEN }}"
+"#;
+
+#[test]
+fn replay_renders_env_vars_and_secret_prompts_without_the_original_env() {
+    // `vars` and the prompt read `env.*` and `secrets.*`; replay runs in
+    // a bare environment and must still hit the recorded LLM entry,
+    // which was keyed with the secret already masked.
+    let pipeline = write_pipeline(ENV_AND_SECRET_PIPELINE);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bundle = dir.path().join("bundle.ndjson");
+
+    orno_with_dummy_transport()
+        .env("API_TOKEN", "tok-secret-value-123")
+        .args([
+            "run",
+            pipeline.path().to_str().unwrap(),
+            "-e",
+            "REGION=eu-west",
+            "-e",
+            "STAGE=prod",
+            "--record-bundle",
+            bundle.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let recorded = std::fs::read_to_string(&bundle).expect("bundle");
+    assert!(
+        !recorded.contains("tok-secret-value-123"),
+        "bundle leaks the secret: {recorded}"
+    );
+
+    let assert = orno()
+        .args(["replay", bundle.to_str().unwrap()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains(r#""type":"run_finished""#) && stdout.contains(r#""ok":true"#),
+        "replay must finish ok: {stdout}",
+    );
+    assert!(
+        stdout.contains("region=eu-west stage=prod token=***"),
+        "replayed prompt must be rendered from the recorded namespaces: {stdout}",
+    );
+}
+
 #[test]
 fn replay_missing_bundle_exits_nonzero() {
     // A non-existent bundle path is a hard error — the CLI must exit

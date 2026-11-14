@@ -264,10 +264,12 @@ pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) ->
             status_to_error(provider, model, status.as_u16(), &body)
         },
         G::RequiresApiKey { .. } | G::NoAuthData { .. } | G::NoAuthResolver { .. } => {
-            LlmError::AuthFailed {
-                provider: provider.to_string(),
-            }
+            missing_api_key(provider, None)
         },
+        G::Resolver {
+            resolver_error: genai::resolver::Error::ApiKeyEnvNotFound { env_name },
+            ..
+        } => missing_api_key(provider, Some(&env_name)),
         G::ChatResponseGeneration { cause, .. } => LlmError::ParseError(cause),
         G::NoChatResponse { .. } => {
             LlmError::ParseError("provider returned no chat response".to_string())
@@ -278,12 +280,29 @@ pub(super) fn map_genai_error(provider: &str, model: &str, err: genai::Error) ->
     }
 }
 
+/// A request that never had a credential to send. `env_name` is the
+/// variable genai looked for; otherwise the provider's conventional one.
+fn missing_api_key(provider: &str, env_name: Option<&str>) -> LlmError {
+    let hint = match env_name.or_else(|| provider_api_key_env(provider)) {
+        Some(env) => format!("set `{env}` in the environment or declare it under `secrets:`"),
+        None => "provide credentials for it".to_string(),
+    };
+    LlmError::ConfigError(format!("no API key for provider `{provider}`; {hint}"))
+}
+
+/// Providers word a bad model name differently, but all of them say
+/// "model" in the 404 body. A 404 without it is a wrong endpoint, such
+/// as a mistyped `OLLAMA_HOST`.
+fn is_model_not_found_body(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("model")
+}
+
 fn status_to_error(provider: &str, model: &str, status: u16, body: &str) -> LlmError {
     match status {
         401 | 403 => LlmError::AuthFailed {
             provider: provider.to_string(),
         },
-        404 => LlmError::ModelNotFound {
+        404 if is_model_not_found_body(body) => LlmError::ModelNotFound {
             provider: provider.to_string(),
             model: model.to_string(),
         },
@@ -520,14 +539,36 @@ mod tests {
     }
 
     #[test]
-    fn status_404_maps_to_model_not_found() {
-        match status_to_error("anthropic", "claude-9001", 404, "") {
+    fn status_404_with_model_body_maps_to_model_not_found() {
+        let body =
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: claude-9001"}}"#;
+        match status_to_error("anthropic", "claude-9001", 404, body) {
             LlmError::ModelNotFound { provider, model } => {
                 assert_eq!(provider, "anthropic");
                 assert_eq!(model, "claude-9001");
             },
             other => panic!("expected ModelNotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn status_404_without_model_body_is_an_api_error() {
+        // A wrong `OLLAMA_HOST` answers 404 from some unrelated server.
+        match status_to_error("ollama", "llama3", 404, "404 page not found") {
+            LlmError::ApiError { status, body, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(body, "404 page not found");
+            },
+            other => panic!("expected ApiError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_api_key_names_the_env_var() {
+        let msg = missing_api_key("anthropic", None).to_string();
+        assert!(msg.contains("ANTHROPIC_API_KEY"), "{msg}");
+        let msg = missing_api_key("custom", Some("MY_KEY")).to_string();
+        assert!(msg.contains("MY_KEY"), "{msg}");
     }
 
     #[test]

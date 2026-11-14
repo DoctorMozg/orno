@@ -20,6 +20,7 @@
 mod convert;
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +50,10 @@ const LLM_RETRY_MAX_ATTEMPTS: u32 = 3;
 /// worst case, leaving most of a per-node `timeout:` for productive
 /// work.
 const RETRY_BASE_DELAY_MS: u64 = 500;
+/// Ceiling on one `exec_chat` attempt. Reasoning models can think for
+/// minutes before the first byte, so this is generous; it exists to cut
+/// a connection that hangs forever, not to bound normal latency.
+const LLM_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Debug)]
 pub struct GenAiTransport {
@@ -106,17 +111,6 @@ impl LlmTransport for GenAiTransport {
             ))
         })?;
 
-        let mut chat = ChatRequest::new(vec![ChatMessage::user(req.prompt.clone())]);
-        if let Some(system) = &req.system {
-            chat = chat.with_system(system.clone());
-        }
-        for msg in req.messages.iter() {
-            chat = chat.append_message(orno_msg_to_genai(msg));
-        }
-        if !req.tools.is_empty() {
-            chat = chat.with_tools(req.tools.iter().map(orno_tool_to_genai));
-        }
-
         let mut options = ChatOptions::default();
         if let Some(t) = req.temperature {
             options = options.with_temperature(f64::from(t));
@@ -125,15 +119,15 @@ impl LlmTransport for GenAiTransport {
             options = options.with_max_tokens(max);
         }
 
-        let response =
-            exec_chat_with_retry(client, req.model.as_str(), &chat, &options, &req.provider)
-                .await?;
+        let response = exec_chat_with_retry(client, &req, &options).await?;
 
         let finish_reason = response.stop_reason.as_ref().map(|r| r.raw().to_string());
         let usage = convert_usage(&response.usage);
         let is_tool_call = matches!(response.stop_reason, Some(StopReason::ToolCall(_)));
 
         if is_tool_call {
+            // Models often explain a tool call in prose; keep it.
+            let content = response.first_text().unwrap_or_default().to_string();
             let tool_calls = response
                 .into_tool_calls()
                 .into_iter()
@@ -144,7 +138,7 @@ impl LlmTransport for GenAiTransport {
                 })
                 .collect();
             return Ok(LlmResponse {
-                content: String::new(),
+                content,
                 finish_reason,
                 usage,
                 tool_calls,
@@ -164,23 +158,38 @@ impl LlmTransport for GenAiTransport {
     }
 }
 
+fn build_chat(req: &LlmRequest) -> ChatRequest {
+    let mut chat = ChatRequest::new(vec![ChatMessage::user(req.prompt.clone())]);
+    if let Some(system) = &req.system {
+        chat = chat.with_system(system.clone());
+    }
+    for msg in req.messages.iter() {
+        chat = chat.append_message(orno_msg_to_genai(msg));
+    }
+    if !req.tools.is_empty() {
+        chat = chat.with_tools(req.tools.iter().map(orno_tool_to_genai));
+    }
+    chat
+}
+
 /// Drive `exec_chat` with bounded exponential backoff on transient
 /// failures (HTTP 429/5xx, connect/timeout transport errors). Permanent
 /// errors (auth, model-not-found, payload problems) short-circuit on
 /// the first attempt — retrying a 401 only delays the inevitable and
-/// burns the operator's rate-limit budget. Each retry clones the
-/// request because `exec_chat` consumes its `ChatRequest`; cloning is
-/// cheap relative to the network round trip we are already paying.
+/// burns the operator's rate-limit budget. `exec_chat` consumes its
+/// `ChatRequest`, so a retry rebuilds it from `req` instead of every
+/// attempt paying for a clone up front. An attempt that exceeds
+/// [`LLM_REQUEST_TIMEOUT`] is not retried.
 async fn exec_chat_with_retry(
     client: &Client,
-    model: &str,
-    chat: &ChatRequest,
+    req: &LlmRequest,
     options: &ChatOptions,
-    provider: &str,
 ) -> Result<ChatResponse, LlmError> {
+    let (provider, model) = (req.provider.as_str(), req.model.as_str());
     let mut attempt: u32 = 0;
     loop {
-        match client.exec_chat(model, chat.clone(), Some(options)).await {
+        let call = client.exec_chat(model, build_chat(req), Some(options));
+        match within(LLM_REQUEST_TIMEOUT, call).await? {
             Ok(resp) => return Ok(resp),
             Err(err) => {
                 let transient = is_transient_genai_error(&err);
@@ -203,6 +212,17 @@ async fn exec_chat_with_retry(
             },
         }
     }
+}
+
+/// Await `call`, turning a miss of `limit` into a transport failure.
+async fn within<T>(limit: Duration, call: impl Future<Output = T>) -> Result<T, LlmError> {
+    tokio::time::timeout(limit, call).await.map_err(|_| {
+        tracing::warn!(timeout_secs = limit.as_secs(), "LLM request timed out");
+        LlmError::Transport(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no response within {}s", limit.as_secs()),
+        )))
+    })
 }
 
 #[cfg(test)]
@@ -247,5 +267,37 @@ mod tests {
             matches!(err, LlmError::ConfigError(msg) if msg.contains("not-a-real-provider")),
             "expected ConfigError naming the bad provider",
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_call_maps_to_transport_failure() {
+        let err = within(
+            Duration::from_millis(20),
+            std::future::pending::<Result<(), genai::Error>>(),
+        )
+        .await
+        .expect_err("a call that never completes must time out");
+
+        match &err {
+            LlmError::Transport(source) => {
+                let io = source.downcast_ref::<std::io::Error>().expect("io error");
+                assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+            },
+            other => panic!("expected Transport, got {other:?}"),
+        }
+        assert!(matches!(
+            crate::events::LlmFailure::from_llm_error(
+                &err,
+                &crate::events::Redactor::default(),
+                64
+            ),
+            crate::events::LlmFailure::Transport { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_finishing_in_time_passes_through() {
+        let out = within(Duration::from_secs(5), async { 7 }).await.unwrap();
+        assert_eq!(out, 7);
     }
 }

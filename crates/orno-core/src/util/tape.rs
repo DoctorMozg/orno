@@ -1,135 +1,202 @@
-//! Generic NDJSON tape I/O for the LLM and tool record/replay layers.
+//! Shared NDJSON tape I/O for the LLM and tool record/replay layers.
 //!
-//! Both layers persist their entries as newline-delimited JSON: one serialized
-//! struct per line, created with `O_EXCL` so stale tapes cannot be silently
-//! overwritten, and fsynced on flush so a power cut cannot corrupt the bounded
-//! non-determinism guarantee.
-//!
-//! `TapeWriter<T>` and `TapeReader<T>` centralize that file-I/O contract.
-//! Migration of `llm/recording.rs`, `llm/replay.rs`, `tool/record.rs`, and
-//! `tool/replay.rs` to use these types is deferred — the LLM layer requires a
-//! redactor step between serialize and write, and the tool layer uses an
-//! `Arc<Mutex<BufWriter>>` for shared-tape writers across handlers; both need
-//! design work before the inlined boilerplate can be replaced.
+//! Recording appends one JSON line per entry to a [`TapeFile`]; replay
+//! loads the lines with [`read_tape`] and serves them from a
+//! [`TapeIndex`], which hands out entries per `(key, seq)` so repeated
+//! identical requests come back in the order they were made.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Append-only NDJSON tape writer. Each call to [`TapeWriter::write`]
-/// serializes one entry and appends it to the underlying `BufWriter`.
-/// Call [`TapeWriter::flush`] after the run to push buffered bytes to
-/// kernel and fsync to stable storage.
+/// Append-only tape file shared by every recorder writing to it.
 ///
-/// Created with `O_EXCL` — the path must not already exist. This
-/// prevents a pre-created symlink at the tape path from redirecting
-/// writes to an attacker-controlled location, and forces the caller
-/// to make an explicit decision when a stale tape sits at the path.
-pub struct TapeWriter<T> {
-    writer: BufWriter<File>,
+/// Created with `O_EXCL` and mode 0600: a pre-planted symlink cannot
+/// redirect the writes, a stale tape is never silently reused, and the
+/// captured payloads are not readable by other local users. A poisoned
+/// lock is recovered everywhere; the worst case is one torn line, which
+/// the replay loader rejects with its line number.
+pub struct TapeFile {
+    writer: Mutex<BufWriter<File>>,
     path: PathBuf,
-    _phantom: PhantomData<T>,
 }
 
-// `BufWriter<File>` does not implement `Debug`, so derive cannot cover this.
-impl<T> std::fmt::Debug for TapeWriter<T> {
+// `BufWriter<File>` has no `Debug`, so derive cannot cover this.
+impl std::fmt::Debug for TapeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TapeWriter")
+        f.debug_struct("TapeFile")
             .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
 
-impl<T: Serialize> TapeWriter<T> {
-    /// Create a new tape at `path`, failing if the file already exists.
-    pub fn create(path: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
+impl TapeFile {
+    /// Create a new tape at `path`, failing if the path already exists.
+    pub fn create(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
         let mut opts = OpenOptions::new();
-        // O_EXCL: prevent symlink races and stale-tape silent reuse.
         opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            // Tape files capture full request/response payloads —
-            // they must not be world-readable on shared hosts.
             opts.mode(0o600);
         }
         let file = opts.open(&path)?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: Mutex::new(BufWriter::new(file)),
             path,
-            _phantom: PhantomData,
         })
     }
 
-    /// Path the tape is being written to. Primarily useful for tests
-    /// that need to round-trip through a [`TapeReader`].
+    /// Wrap an already-open file with no buffering, so a failing write
+    /// device surfaces on the first `append`.
+    #[cfg(test)]
+    pub(crate) fn from_unbuffered(file: File, path: PathBuf) -> Self {
+        Self {
+            writer: Mutex::new(BufWriter::with_capacity(0, file)),
+            path,
+        }
+    }
+
+    /// Path the tape is being written to.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Serialize `entry` and append it as a single NDJSON line.
-    pub fn write(&mut self, entry: &T) -> Result<(), std::io::Error> {
+    /// Serialize `entry` and append it as one line. Serialization
+    /// happens before the lock is taken, so a failing entry never
+    /// leaves a partial line behind.
+    pub fn append<T: Serialize>(&self, entry: &T) -> std::io::Result<()> {
         let line = serde_json::to_string(entry)
             .map_err(|e| std::io::Error::other(format!("tape serialize failed: {e}")))?;
-        writeln!(self.writer, "{line}")
+        writeln!(self.lock(), "{line}")
     }
 
-    /// Flush buffered bytes to kernel and fsync to stable storage.
-    ///
-    /// A plain `BufWriter::flush` pushes bytes to the OS page cache but
-    /// does not guarantee durability across a power cut. `sync_all` closes
-    /// that gap so replay always sees a fully-written tape.
-    pub fn flush(&mut self) -> Result<(), std::io::Error> {
-        self.writer.flush()?;
-        self.writer.get_mut().sync_all()
+    /// Flush buffered bytes and fsync. `BufWriter::flush` only reaches
+    /// the page cache, which a power cut can lose.
+    pub fn flush(&self) -> std::io::Result<()> {
+        let mut writer = self.lock();
+        writer.flush()?;
+        writer.get_mut().sync_all()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BufWriter<File>> {
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// NDJSON tape reader. Loads all entries up-front from a tape file,
-/// parsing each line into `T`. A corrupt line surfaces as a structured
-/// error that names the file path and the 1-indexed line number so
-/// operators can identify exactly which entry is broken.
-///
-/// Entries are returned as a flat `Vec<T>` — the caller is responsible
-/// for any keying, deduplication, or FIFO-per-key indexing it needs.
-pub struct TapeReader<T> {
-    _phantom: PhantomData<T>,
-}
-
-impl<T: DeserializeOwned> TapeReader<T> {
-    /// Load all entries from `path`. Returns the parsed entries in file
-    /// order. Blank lines are skipped; any non-blank line that fails to
-    /// parse produces an `Err` naming the file and the 1-indexed line
-    /// number.
-    pub fn load(path: impl AsRef<Path>) -> Result<Vec<T>, std::io::Error> {
-        let path = path.as_ref();
-        let path_disp = path.display().to_string();
-        let file = File::open(path)?;
-        let mut entries = Vec::new();
-        for (lineno, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let entry: T = serde_json::from_str(&line)
-                .map_err(|e| std::io::Error::other(format!("{path_disp}:{}: {e}", lineno + 1)))?;
-            entries.push(entry);
+/// Load every entry of a tape file in file order. Blank lines are
+/// skipped; a line that fails to parse yields an error naming the file
+/// and the 1-indexed line.
+pub fn read_tape<T: DeserializeOwned>(path: impl AsRef<Path>) -> std::io::Result<Vec<T>> {
+    let path = path.as_ref();
+    let file = File::open(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    let mut entries = Vec::new();
+    for (idx, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
         }
-        Ok(entries)
+        let entry = serde_json::from_str(&line)
+            .map_err(|e| std::io::Error::other(format!("{}:{}: {e}", path.display(), idx + 1)))?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Recording side: numbers the calls made with each key so replay can
+/// tell identical requests apart even when completion order differs
+/// from call order.
+#[derive(Debug, Default)]
+pub struct SeqCounter {
+    next: Mutex<HashMap<String, u32>>,
+}
+
+impl SeqCounter {
+    /// Take the next sequence number for `key`, starting at 0.
+    pub fn next(&self, key: &str) -> u32 {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = next.entry(key.to_string()).or_insert(0);
+        let seq = *slot;
+        *slot += 1;
+        seq
+    }
+}
+
+/// Two tape entries claimed the same `(key, seq)` slot.
+#[derive(Debug, thiserror::Error)]
+#[error("duplicate tape entry for key `{key}` seq {seq}")]
+pub struct DuplicateTapeEntry {
+    /// Key shared by both entries.
+    pub key: String,
+    /// Sequence number shared by both entries.
+    pub seq: u32,
+}
+
+/// Replay side: entries indexed by `(key, seq)`. The n-th call with a
+/// key takes the entry recorded with seq n, and every entry is served
+/// at most once.
+#[derive(Debug)]
+pub struct TapeIndex<V> {
+    state: Mutex<IndexState<V>>,
+}
+
+#[derive(Debug)]
+struct IndexState<V> {
+    entries: HashMap<(String, u32), V>,
+    next: HashMap<String, u32>,
+}
+
+impl<V> TapeIndex<V> {
+    /// Index `(key, seq, value)` triples; a repeated `(key, seq)` is an error.
+    pub fn new(
+        entries: impl IntoIterator<Item = (String, u32, V)>,
+    ) -> Result<Self, DuplicateTapeEntry> {
+        let mut map = HashMap::new();
+        for (key, seq, value) in entries {
+            if map.contains_key(&(key.clone(), seq)) {
+                return Err(DuplicateTapeEntry { key, seq });
+            }
+            map.insert((key, seq), value);
+        }
+        Ok(Self {
+            state: Mutex::new(IndexState {
+                entries: map,
+                next: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Take the entry for the next call made with `key`, or `None` when
+    /// the tape holds no entry for that call.
+    pub fn take(&self, key: &str) -> Option<V> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = state.next.entry(key.to_string()).or_insert(0);
+        let seq = *slot;
+        *slot += 1;
+        state.entries.remove(&(key.to_string(), seq))
+    }
+
+    /// Number of entries not yet served.
+    pub fn remaining(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .len()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use tempfile::TempDir;
 
     use super::*;
@@ -140,48 +207,34 @@ mod tests {
         value: u32,
     }
 
-    fn tmp_path(dir: &TempDir) -> PathBuf {
-        dir.path().join("tape.ndjson")
+    fn entry(key: &str, value: u32) -> Entry {
+        Entry {
+            key: key.into(),
+            value,
+        }
     }
 
     #[test]
     fn round_trip_preserves_order() {
         let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-
-        let entries = vec![
-            Entry {
-                key: "a".into(),
-                value: 1,
-            },
-            Entry {
-                key: "b".into(),
-                value: 2,
-            },
-            Entry {
-                key: "c".into(),
-                value: 3,
-            },
-        ];
-
-        let mut writer = TapeWriter::create(&path).unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let tape = TapeFile::create(&path).unwrap();
+        let entries = vec![entry("a", 1), entry("b", 2), entry("c", 3)];
         for e in &entries {
-            writer.write(e).unwrap();
+            tape.append(e).unwrap();
         }
-        writer.flush().unwrap();
+        tape.flush().unwrap();
 
-        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
-        assert_eq!(loaded, entries);
+        assert_eq!(read_tape::<Entry>(&path).unwrap(), entries);
     }
 
     #[test]
     fn create_fails_when_file_exists() {
         let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        // Pre-create the file so the second open must fail.
+        let path = dir.path().join("tape.ndjson");
         std::fs::write(&path, b"").unwrap();
 
-        let err = TapeWriter::<Entry>::create(&path).unwrap_err();
+        let err = TapeFile::create(&path).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
@@ -190,88 +243,68 @@ mod tests {
     fn create_sets_mode_0o600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        let mut w = TapeWriter::<Entry>::create(&path).unwrap();
-        w.flush().unwrap();
-        let perm = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(
-            perm.mode() & 0o777,
-            0o600,
-            "tape file must not be world-readable"
-        );
+        let path = dir.path().join("tape.ndjson");
+        TapeFile::create(&path).unwrap().flush().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "tape file must not be world-readable");
     }
 
     #[test]
-    fn load_skips_blank_lines() {
+    fn read_skips_blank_lines_and_names_corrupt_line() {
         let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        let line = serde_json::to_string(&Entry {
-            key: "x".into(),
-            value: 7,
-        })
-        .unwrap();
-        std::fs::write(&path, format!("{line}\n\n{line}\n")).unwrap();
+        let path = dir.path().join("tape.ndjson");
+        let good = serde_json::to_string(&entry("ok", 0)).unwrap();
+        std::fs::write(&path, format!("{good}\n\n{good}\nnot-json\n")).unwrap();
 
-        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
-        assert_eq!(loaded.len(), 2);
+        let err = read_tape::<Entry>(&path).unwrap_err().to_string();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(":4:"), "{err}");
     }
 
     #[test]
-    fn load_reports_path_and_lineno_on_corrupt_entry() {
-        let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        let good = serde_json::to_string(&Entry {
-            key: "ok".into(),
-            value: 0,
-        })
-        .unwrap();
-        std::fs::write(&path, format!("{good}\nnot-json\n")).unwrap();
-
-        let err = TapeReader::<Entry>::load(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains(path.display().to_string().as_str()),
-            "error should name the tape file: {msg}"
-        );
-        assert!(
-            msg.contains(":2:"),
-            "error should include 1-indexed line number: {msg}"
-        );
-    }
-
-    #[test]
-    fn flush_on_empty_writer_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        let mut writer = TapeWriter::<Entry>::create(&path).unwrap();
-        writer.flush().unwrap();
-        let loaded: Vec<Entry> = TapeReader::load(&path).unwrap();
-        assert!(loaded.is_empty());
-    }
-
-    #[test]
-    fn write_surfaces_serialize_failure_with_named_error() {
-        // Regression for the `serde_json::to_string -> map_err` branch in
-        // `write`. A type that always fails to serialize must surface as a
-        // `std::io::Error` whose payload mentions "tape serialize failed", so
-        // operators see the failure cause rather than a bare `Other` kind.
+    fn append_surfaces_serialize_failure_without_writing() {
         struct FailSer;
         impl Serialize for FailSer {
             fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
                 Err(serde::ser::Error::custom("deliberate failure"))
             }
         }
-
         let dir = TempDir::new().unwrap();
-        let path = tmp_path(&dir);
-        let mut writer = TapeWriter::<FailSer>::create(&path).unwrap();
-        let err = writer
-            .write(&FailSer)
-            .expect_err("serialize failure must propagate as io::Error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("tape serialize failed"),
-            "error must name the wrapping context, got {msg:?}",
-        );
+        let path = dir.path().join("tape.ndjson");
+        let tape = TapeFile::create(&path).unwrap();
+
+        let err = tape.append(&FailSer).unwrap_err();
+        assert!(err.to_string().contains("tape serialize failed"), "{err}");
+        tape.flush().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn index_serves_entries_by_call_order_not_file_order() {
+        // Recorded in completion order: the second call finished first.
+        let index = TapeIndex::new([
+            ("k".to_string(), 1, "second"),
+            ("k".to_string(), 0, "first"),
+        ])
+        .unwrap();
+
+        assert_eq!(index.take("k"), Some("first"));
+        assert_eq!(index.take("k"), Some("second"));
+        assert_eq!(index.take("k"), None);
+        assert_eq!(index.take("other"), None);
+    }
+
+    #[test]
+    fn index_rejects_duplicate_slot() {
+        let err = TapeIndex::new([("k".to_string(), 0, 1), ("k".to_string(), 0, 2)]).unwrap_err();
+        assert_eq!((err.key.as_str(), err.seq), ("k", 0));
+    }
+
+    #[test]
+    fn seq_counter_numbers_each_key_independently() {
+        let counter = SeqCounter::default();
+        assert_eq!(counter.next("a"), 0);
+        assert_eq!(counter.next("a"), 1);
+        assert_eq!(counter.next("b"), 0);
     }
 }
