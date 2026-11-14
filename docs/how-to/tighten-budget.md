@@ -197,7 +197,7 @@ nodes:
 
 Why separate? Wall-clock is an executor concern, not an agent-loop concern. Shell nodes can time out too, so the field lives on the node, not the policy.
 
-A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. The deadline wraps the whole node, so it also cuts off an LLM call or tool call still in flight, and it kills a shell node's process group.
+A timeout fires `Event::NodeTimedOut` and ends the node with `ok: false`. The deadline wraps the whole node, so it also cuts off an LLM call or tool call still in flight, and it kills a shell node's process group. A timed-out shell node still reports the tail of its stderr in `failure.stderr_tail`.
 
 ## Step 7: Counting denied calls
 

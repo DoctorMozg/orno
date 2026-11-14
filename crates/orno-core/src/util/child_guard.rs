@@ -31,7 +31,7 @@ pub(crate) struct Capture {
     pub total: usize,
 }
 
-/// Everything [`ChildGuard::run_capped`] observed about a finished child.
+/// Everything [`ChildGuard::run_capped_within`] observed about a finished child.
 #[derive(Debug)]
 pub(crate) struct Collected {
     pub status: ExitStatus,
@@ -94,16 +94,9 @@ impl ChildGuard {
     }
 
     /// Drive the child to completion, capturing at most `cap` bytes per
-    /// output stream. Dropping the returned future kills the process group.
-    pub(crate) async fn run_capped(self, cap: usize) -> std::io::Result<Collected> {
-        match self.run_capped_within(cap, None).await? {
-            Finished::Exited(collected) => Ok(collected),
-            Finished::TimedOut { .. } => unreachable!("no time limit was set"),
-        }
-    }
-
-    /// Like [`Self::run_capped`], but kills the process group once `limit`
-    /// elapses and hands back whatever the child had written by then.
+    /// output stream. With a `limit`, the process group is killed once it
+    /// elapses and the prefix captured so far comes back. Dropping the
+    /// returned future kills the process group.
     pub(crate) async fn run_capped_within(
         mut self,
         cap: usize,

@@ -14,6 +14,7 @@ pub use registry::NodeRegistry;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,10 @@ pub struct ShellNodeRequest {
     /// See `ShellNode::env` for the security rationale.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The node's `timeout:`, set by the scheduler so the executor can kill
+    /// the child itself and keep what it captured before the deadline.
+    #[serde(skip)]
+    pub timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +177,7 @@ pub fn render_request(
                 args,
                 stdin,
                 env,
+                timeout: None,
             }))
         },
     }

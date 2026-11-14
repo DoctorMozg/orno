@@ -639,7 +639,7 @@ async fn shell_node_timeout_fires_and_emits_node_timed_out_and_failure() {
         })
         .expect("NodeFinished must carry a failure");
     assert!(
-        matches!(failure, NodeFailure::TimedOut { limit_secs: 1 }),
+        matches!(failure, NodeFailure::TimedOut { limit_secs: 1, .. }),
         "failure must classify as TimedOut(1): {failure:?}",
     );
 
@@ -651,6 +651,69 @@ async fn shell_node_timeout_fires_and_emits_node_timed_out_and_failure() {
         })
         .expect("RunFinished must be present");
     assert_eq!(failed_nodes, vec!["slow".to_string()]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shell_node_timeout_keeps_partial_output() {
+    use crate::node::shell::ShellExecutor;
+
+    let pipeline = pipeline_of(vec![Node {
+        id: "slow".to_string(),
+        kind: NodeKind::Shell(ShellNode {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo stuck-on-step-3 1>&2; sleep 10".to_string(),
+            ],
+            stdin: None,
+            env: BTreeMap::new(),
+        }),
+        needs: Vec::new(),
+        timeout: Some(1),
+    }]);
+    let sink = Arc::new(InMemorySink::new());
+    let mut reg = NodeRegistry::new();
+    reg.register("shell", Arc::new(ShellExecutor::default()));
+    let engine = Engine::new(
+        sink.clone(),
+        Arc::new(reg),
+        Arc::new(TemplateEngine::new()),
+        EngineConfig::default(),
+    );
+
+    let started = std::time::Instant::now();
+    engine
+        .run("run_test", &pipeline, RunInputs::default())
+        .await
+        .expect("engine::run returns Ok even when a node times out");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "timeout must not wait for the sleep"
+    );
+
+    let envelopes = sink.snapshot();
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter(|e| matches!(e.event, Event::NodeTimedOut { .. }))
+            .count(),
+        1,
+        "exactly one NodeTimedOut"
+    );
+    let failure = envelopes
+        .iter()
+        .find_map(|e| match &e.event {
+            Event::NodeFinished { failure, .. } => failure.clone(),
+            _ => None,
+        })
+        .expect("NodeFinished must carry a failure");
+    match failure {
+        NodeFailure::TimedOut {
+            limit_secs: 1,
+            stderr_tail: Some(tail),
+        } => assert_eq!(tail, "stuck-on-step-3\n"),
+        other => panic!("expected TimedOut with stderr_tail: {other:?}"),
+    }
 }
 
 #[tokio::test]

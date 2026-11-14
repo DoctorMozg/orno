@@ -89,7 +89,7 @@ The `failure.kind` is a snake_case discriminator. The full set:
 - **`iteration_limit_exceeded`**: the agent loop hit `max_iterations`. Tighten the prompt or raise the limit.
 - **`budget_exceeded`**: the agent loop hit `max_total_tokens` or `max_tool_calls`. `budget_kind` is `tokens` or `tool_calls`. See [tighten-budget](tighten-budget.md).
 - **`tool_denied`**: reserved. Effect-class denials are fed back to the model and surface as `tool_denied` events, not as a node failure.
-- **`timed_out`**: wall-clock deadline reached (`limit_secs`). Check the `timeout:` field on the node.
+- **`timed_out`**: wall-clock deadline reached (`limit_secs`). Check the `timeout:` field on the node. For a shell node, `stderr_tail` shows the last thing the command printed before it was killed.
 
 For LLM-specific failures, the run also emits `Event::LlmRequestFailed`, paired with the failed `LlmRequestStarted`:
 

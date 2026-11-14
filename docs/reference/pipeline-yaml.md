@@ -246,7 +246,7 @@ Array of `Node` entries. Each node:
 - `id: string`: required. Must be unique within the pipeline and match `[A-Za-z_][A-Za-z0-9_]*`, so `nodes.<id>` is writable in templates.
 - `kind: agent | shell`: required. Determines which fields follow.
 - `needs: [string]`: optional. Ids of nodes this node depends on. Drives DAG scheduling.
-- `timeout: integer`: optional per-node wall-clock cap in seconds, greater than zero (`timeout: 0` is rejected). This is the only wall-clock limit, and there is none on the agent policy. When elapsed, the node is cancelled and `Event::NodeTimedOut` fires, and `node_finished.failure` carries `kind: timed_out`.
+- `timeout: integer`: optional per-node wall-clock cap in seconds, greater than zero (`timeout: 0` is rejected). This is the only wall-clock limit, and there is none on the agent policy. When elapsed, the node is cancelled and `Event::NodeTimedOut` fires, and `node_finished.failure` carries `kind: timed_out`. A shell node's process group is killed and the failure keeps the `stderr_tail` it wrote up to that point.
 
 ### `kind: agent`
 

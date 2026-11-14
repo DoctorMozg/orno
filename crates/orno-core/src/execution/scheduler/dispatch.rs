@@ -14,6 +14,10 @@ use crate::pipeline::schema::NodeKind;
 
 use super::{Engine, RunState};
 
+/// Extra time the scheduler allows a shell executor past the node deadline
+/// to kill the process group and drain its pipes before dropping it.
+const SHELL_TIMEOUT_BACKSTOP_GRACE: Duration = Duration::from_secs(2);
+
 /// Result of `Engine::dispatch_node`. Invariant: `failure.is_some()` iff
 /// `!ok`.
 pub(super) struct DispatchOutcome {
@@ -84,7 +88,24 @@ impl Engine {
             },
         };
 
+        let started = std::time::Instant::now();
         match self.execute(run, node, &exec, req).await {
+            Ok(resp) if shell_timed_out(&resp) => {
+                let limit = node.timeout.unwrap_or_default();
+                self.on_timed_out(run, node, limit, started).await;
+                let stderr_tail = resp.output.get("stderr").and_then(Value::as_str).map(|s| {
+                    run.redactor
+                        .redact_bounded(s, self.config.max_output_bytes, Keep::Tail)
+                });
+                DispatchOutcome {
+                    ok: false,
+                    failure: Some(NodeFailure::TimedOut {
+                        limit_secs: limit,
+                        stderr_tail,
+                    }),
+                    output: Some(resp.output),
+                }
+            },
             Ok(resp) if node_response_ok(&node.kind, &resp) => DispatchOutcome::ok(resp.output),
             Ok(resp) => self.on_payload_failure(node, kind, resp, &run.redactor),
             Err(outcome) => outcome,
@@ -98,35 +119,27 @@ impl Engine {
         run: &RunState<'_>,
         node: &crate::pipeline::Node,
         exec: &Arc<dyn NodeExecutor>,
-        req: NodeRequest,
+        mut req: NodeRequest,
     ) -> Result<NodeResponse, DispatchOutcome> {
         let kind = kind_str(&node.kind);
         let started = std::time::Instant::now();
         let result = match node.timeout {
             Some(limit) => {
+                // A shell executor enforces the deadline itself so it can keep
+                // the captured output; the outer timeout is only a backstop.
+                let mut outer = Duration::from_secs(limit);
+                if let NodeRequest::Shell(shell) = &mut req {
+                    shell.timeout = Some(outer);
+                    outer += SHELL_TIMEOUT_BACKSTOP_GRACE;
+                }
                 let call = exec.execute(run.run_id, &node.id, req);
-                match tokio::time::timeout(Duration::from_secs(limit), call).await {
+                match tokio::time::timeout(outer, call).await {
                     Ok(inner) => inner,
                     Err(_elapsed) => {
-                        let elapsed_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        self.sink
-                            .record(Event::NodeTimedOut {
-                                run_id: run.run_id.to_string(),
-                                node_id: node.id.clone(),
-                                limit_secs: limit,
-                                elapsed_ms,
-                            })
-                            .await;
-                        tracing::warn!(
-                            node.id = %node.id,
-                            node.kind = kind,
-                            limit_secs = limit,
-                            elapsed_ms,
-                            "node exceeded wall-clock budget",
-                        );
+                        self.on_timed_out(run, node, limit, started).await;
                         return Err(DispatchOutcome::failed(NodeFailure::TimedOut {
                             limit_secs: limit,
+                            stderr_tail: None,
                         }));
                     },
                 }
@@ -135,6 +148,31 @@ impl Engine {
         };
 
         result.map_err(|err| self.executor_failure(node, kind, &err, &run.redactor))
+    }
+
+    async fn on_timed_out(
+        &self,
+        run: &RunState<'_>,
+        node: &crate::pipeline::Node,
+        limit: u64,
+        started: std::time::Instant,
+    ) {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.sink
+            .record(Event::NodeTimedOut {
+                run_id: run.run_id.to_string(),
+                node_id: node.id.clone(),
+                limit_secs: limit,
+                elapsed_ms,
+            })
+            .await;
+        tracing::warn!(
+            node.id = %node.id,
+            node.kind = kind_str(&node.kind),
+            limit_secs = limit,
+            elapsed_ms,
+            "node exceeded wall-clock budget",
+        );
     }
 
     fn executor_failure(
@@ -235,6 +273,12 @@ fn render_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         current = src.source();
     }
     out
+}
+
+/// A shell executor that hit the node deadline returns its captured output
+/// flagged `timed_out` instead of an exit status.
+fn shell_timed_out(resp: &NodeResponse) -> bool {
+    resp.output.get("timed_out").and_then(Value::as_bool) == Some(true)
 }
 
 /// Classify a successful `NodeResponse` against the originating node kind.

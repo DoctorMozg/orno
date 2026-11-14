@@ -126,7 +126,7 @@ Emitted when a node's `timeout:` budget elapses before the executor returns.
 }
 ```
 
-Paired with a subsequent `node_finished { ok: false, failure: { kind: "timed_out", limit_secs } }`.
+Paired with a subsequent `node_finished { ok: false, failure: { kind: "timed_out", limit_secs } }`. For a shell node the failure also carries `stderr_tail`, the redacted tail of what the command wrote to stderr before it was killed.
 
 ### `node_output_truncated`
 
@@ -437,7 +437,7 @@ Carried on `node_finished.failure` exactly when `ok: false`. Internally tagged o
 | `iteration_limit_exceeded`| `max_iterations: int`                                   | Agent reached `max_iterations` without converging on a `stop` finish reason.                                                         |
 | `budget_exceeded`         | `budget_kind: "tokens" \| "tool_calls"`                 | Running budget breached.                                                                                                             |
 | `tool_denied`             | `tool_name: string`, `reason: string`                   | Reserved for future strict-mode use. Today, denials are non-terminal and fed back to the model.                                      |
-| `timed_out`               | `limit_secs: int`                                       | Node did not return before its `timeout:` elapsed. Paired with the preceding `node_timed_out` envelope.                              |
+| `timed_out`               | `limit_secs: int`, `stderr_tail: string?` (shell only)   | Node did not return before its `timeout:` elapsed. Paired with the preceding `node_timed_out` envelope.                              |
 
 The field is `node_kind` (not `kind`) on `no_executor_registered`, and `budget_kind` on `budget_exceeded`, because `kind` is the serde tag discriminator on `NodeFailure` itself.
 

@@ -37,6 +37,9 @@ once the first tagged release ships.
   (default 30).
 - Each LLM request attempt is cut off after 5 minutes and surfaces as a
   transport failure; a timed-out attempt is not retried.
+- A shell node that hits its `timeout:` keeps the output it captured:
+  `failure.stderr_tail` on the `timed_out` failure shows what it printed
+  last.
 
 ### Changed
 

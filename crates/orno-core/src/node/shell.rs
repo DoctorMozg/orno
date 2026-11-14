@@ -21,7 +21,7 @@ use tracing::{instrument, warn};
 
 use crate::error::NodeError;
 use crate::events::{Event, EventSink};
-use crate::util::child_guard::{Capture, ChildGuard, Collected};
+use crate::util::child_guard::{Capture, ChildGuard, Collected, Finished};
 
 use super::{NodeExecutor, NodeRequest, NodeResponse, ShellNodeRequest};
 
@@ -122,6 +122,7 @@ impl NodeExecutor for ShellExecutor {
             args,
             stdin,
             env,
+            timeout,
         }) = req
         else {
             return Err(NodeError::Execution {
@@ -163,35 +164,40 @@ impl NodeExecutor for ShellExecutor {
             source: Box::new(e),
         };
         let cap = self.cap;
-        let Collected {
-            status,
-            stdout:
-                Capture {
-                    bytes: stdout_buf,
-                    total: stdout_total,
-                },
-            stderr:
-                Capture {
-                    bytes: stderr_buf,
-                    total: stderr_total,
-                },
-            stdin_error,
-        } = ChildGuard::spawn(&mut cmd, stdin)
+        let finished = ChildGuard::spawn(&mut cmd, stdin)
             .map_err(to_node_err)?
-            .run_capped(cap)
+            .run_capped_within(cap, timeout)
             .await
             .map_err(to_node_err)?;
-
-        // A broken pipe is expected whenever the child exits before
-        // consuming everything (e.g. `head`); the exit code tells the
-        // real story.
-        match stdin_error {
-            Some(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
-                warn!(node.id = %id, "child closed stdin before full payload written");
+        let (status, stdout, stderr) = match finished {
+            Finished::Exited(Collected {
+                status,
+                stdout,
+                stderr,
+                stdin_error,
+            }) => {
+                // A broken pipe is expected whenever the child exits before
+                // consuming everything (e.g. `head`); the exit code tells the
+                // real story.
+                match stdin_error {
+                    Some(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+                        warn!(node.id = %id, "child closed stdin before full payload written");
+                    },
+                    Some(err) => warn!(node.id = %id, error = %err, "stdin writer failed"),
+                    None => {},
+                }
+                (Some(status), stdout, stderr)
             },
-            Some(err) => warn!(node.id = %id, error = %err, "stdin writer failed"),
-            None => {},
-        }
+            Finished::TimedOut { stdout, stderr } => (None, stdout, stderr),
+        };
+        let Capture {
+            bytes: stdout_buf,
+            total: stdout_total,
+        } = stdout;
+        let Capture {
+            bytes: stderr_buf,
+            total: stderr_total,
+        } = stderr;
 
         // Emit one envelope per truncated stream. The cap is reported
         // alongside the captured total so a downstream tool can
@@ -213,6 +219,21 @@ impl NodeExecutor for ShellExecutor {
         // practice — at most one is `Some` per terminated process —
         // but the JSON emits both keys uniformly so downstream
         // templates can pattern-match without a presence check.
+        let Some(status) = status else {
+            // The scheduler turns `timed_out` into `NodeTimedOut`; the
+            // captured prefix still lands in the context.
+            warn!(node.id = %id, "shell node timed out; returning captured output");
+            return Ok(NodeResponse {
+                node_id: id.to_string(),
+                output: json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exit_code": null,
+                    "signal": null,
+                    "timed_out": true,
+                }),
+            });
+        };
         let exit_code: Option<i64> = status.code().map(i64::from);
         let signal: Option<i32> = signal_from_status(status);
 
@@ -307,6 +328,7 @@ mod tests {
             args: vec!["hi".to_string()],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "test_node", req).await.unwrap();
@@ -331,6 +353,7 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec
@@ -385,6 +408,7 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let err = exec
@@ -409,6 +433,7 @@ mod tests {
             args: Vec::new(),
             stdin: Some("hello over stdin\n".to_string()),
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "cat_node", req).await.unwrap();
@@ -429,6 +454,7 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "cat_node", req).await.unwrap();
@@ -451,6 +477,7 @@ mod tests {
             args: Vec::new(),
             stdin: Some(payload.clone()),
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "big", req).await.unwrap();
@@ -476,6 +503,7 @@ mod tests {
             args: vec!["-c".to_string(), "4".to_string()],
             stdin: Some("A".repeat(256 * 1024)),
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "head_node", req).await.unwrap();
@@ -504,6 +532,7 @@ mod tests {
             args: vec!["-c".to_string(), "yes A | head -c 65536".to_string()],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "noisy", req).await.unwrap();
@@ -560,6 +589,7 @@ mod tests {
             ],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "both", req).await.unwrap();
@@ -594,6 +624,7 @@ mod tests {
             args: vec!["small payload".to_string()],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let resp = exec.execute("run_test", "small", req).await.unwrap();
@@ -619,6 +650,7 @@ mod tests {
             args: vec!["does not matter".to_string()],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
 
         let err = exec
@@ -641,6 +673,7 @@ mod tests {
             args: vec!["-c".to_string(), script],
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         })
     }
 
@@ -668,10 +701,45 @@ mod tests {
 
         let exec = ShellExecutor::default();
         let run = exec.execute("run_test", "slow", sh_node(script));
-        // Mirrors the scheduler's node `timeout:`, which drops the future.
+        // Mirrors the scheduler's backstop, which drops the future.
         let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), run).await;
         assert!(timed_out.is_err(), "node should still be running");
 
+        let pid = read_pid_file(&pid_file).await;
+        assert!(
+            wait_until_gone(pid).await,
+            "grandchild {pid} survived the timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_timeout_returns_captured_output_and_kills_the_group() {
+        use crate::util::child_guard::test_support::{read_pid_file, wait_until_gone};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let script = format!(
+            "echo partial-out; echo partial-err 1>&2; sleep 100 & echo $! > {}; wait",
+            pid_file.display()
+        );
+        let NodeRequest::Shell(mut req) = sh_node(script) else {
+            unreachable!()
+        };
+        req.timeout = Some(std::time::Duration::from_secs(1));
+
+        let exec = ShellExecutor::default();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            exec.execute("run_test", "slow", NodeRequest::Shell(req)),
+        )
+        .await
+        .expect("executor must enforce its own deadline")
+        .unwrap();
+
+        assert_eq!(resp.output["timed_out"], json!(true));
+        assert_eq!(resp.output["stdout"], json!("partial-out\n"));
+        assert_eq!(resp.output["stderr"], json!("partial-err\n"));
+        assert_eq!(resp.output["exit_code"], json!(null));
         let pid = read_pid_file(&pid_file).await;
         assert!(
             wait_until_gone(pid).await,

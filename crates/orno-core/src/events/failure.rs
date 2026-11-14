@@ -94,11 +94,15 @@ pub enum NodeFailure {
     /// available for future strict-mode use.
     ToolDenied { tool_name: String, reason: String },
     /// The node did not return before `Node.timeout` elapsed.
-    /// `limit_secs` echoes the declared budget. The preceding
-    /// `Event::NodeTimedOut` envelope carries the measured
-    /// `elapsed_ms`; this variant stays minimal so `NodeFailure`
-    /// keeps its one-cause-per-variant shape.
-    TimedOut { limit_secs: u64 },
+    /// `limit_secs` echoes the declared budget; the preceding
+    /// `Event::NodeTimedOut` envelope carries the measured `elapsed_ms`.
+    /// A shell node also reports the tail of the stderr it wrote before
+    /// it was killed, bounded and redacted like `NodePayloadFailure`.
+    TimedOut {
+        limit_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stderr_tail: Option<String>,
+    },
 }
 
 /// Why an LLM transport call failed. Carried on

@@ -314,6 +314,7 @@ mod tests {
             args: Vec::new(),
             stdin: None,
             env: BTreeMap::new(),
+            timeout: None,
         });
         let err = exec
             .execute("run_test", "n", req)
