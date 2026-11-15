@@ -7,10 +7,6 @@ use crate::llm::OrnoChatMessage;
 /// Approximate byte cost of one message. Content strings dominate; the
 /// fixed per-variant overhead is ignored to keep the estimate cheap.
 fn estimated_message_bytes(msg: &OrnoChatMessage) -> usize {
-    #[expect(
-        unreachable_patterns,
-        reason = "OrnoChatMessage is #[non_exhaustive]; the catch-all handles future variants"
-    )]
     match msg {
         OrnoChatMessage::User { content } | OrnoChatMessage::Assistant { content } => content.len(),
         OrnoChatMessage::ToolCalls { calls } => calls
@@ -18,7 +14,6 @@ fn estimated_message_bytes(msg: &OrnoChatMessage) -> usize {
             .map(|c| c.fn_name.len() + c.fn_arguments.to_string().len())
             .sum(),
         OrnoChatMessage::ToolResult { call_id, content } => call_id.len() + content.len(),
-        _ => 0,
     }
 }
 
