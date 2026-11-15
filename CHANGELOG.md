@@ -5,6 +5,19 @@ All notable changes to orno are recorded here. The format follows
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once the first tagged release ships.
 
+## Unreleased
+
+### Fixed
+
+- The self-review dogfood pipeline diffs against the PR's base commit from
+  the event payload, so a re-run after merge reviews the PR's own change
+  instead of an empty diff.
+- The dogfood workflow skips the review when the PR has no changes against
+  its base, rather than posting a `VERDICT: PASS` for nothing.
+- Large PR diffs are capped at 60 000 bytes (generated `Cargo.lock` and
+  `*.ndjson` left out) with an explicit truncation marker, so the review
+  degrades to a partial one instead of exceeding the token budget.
+
 ## 0.3.0 - 2026-11-15
 
 ### Security

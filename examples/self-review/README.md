@@ -1,8 +1,14 @@
 # `self-review` — pipeline that reviews its own pull requests
 
 A single-agent pipeline that reads a trusted rubric, runs `git diff` against
-`origin/master`, asks Claude Sonnet 4.5 (via OpenRouter) to produce a
+the PR's base commit, asks Claude Sonnet 4.5 (via OpenRouter) to produce a
 markdown review, and posts the review as a PR comment via `gh`.
+
+The diff body skips `Cargo.lock` and recorded `*.ndjson` bundles and is cut
+at `vars.max_diff_bytes` (60 000) so the prompt fits the agent's token
+budget. A truncated diff ends with a `[diff truncated: ...]` line, and the
+agent `Read`s the files it could not see and marks the review as partial.
+The workflow skips the review when the PR has no changes against its base.
 
 This example backs the `dogfood-self-review` GitHub Actions workflow under
 `.github/workflows/dogfood-self-review.yml`. The workflow is the canonical
@@ -33,6 +39,7 @@ Set on the calling workflow step (`env:`):
 | -------------- | ------------------------------------------------------------ |
 | `PR_NUMBER`    | Pull-request number, used for comment posting                |
 | `PR_REPO`      | Absolute path to the PR-head checkout — agent's `roots[0]`   |
+| `PR_BASE_SHA`  | The PR's base commit; the diff is `PR_BASE_SHA...HEAD`       |
 | `TRUSTED_ROOT` | Absolute path to the trusted-master checkout                 |
 | `GH_REPO`      | `owner/name` for `gh pr comment --repo`                      |
 | `GH_TOKEN`     | Token for `gh`, inherited by the `post_comment` shell child  |
@@ -48,6 +55,7 @@ Provided via `--secrets-file`:
 ```bash
 export PR_NUMBER=482
 export PR_REPO=$(pwd)
+export PR_BASE_SHA=$(git merge-base origin/master HEAD)
 export TRUSTED_ROOT=$(pwd)
 export GH_REPO=DoctorMozg/orno
 export GH_TOKEN="$(gh auth token)"
