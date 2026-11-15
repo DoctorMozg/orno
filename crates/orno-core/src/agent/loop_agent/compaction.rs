@@ -146,10 +146,8 @@ fn summary_prompt(task: &str, evicted: &[OrnoChatMessage]) -> String {
         "The agent's task:\n<task>\n{task}\n</task>\n\nEarlier turns, oldest first:\n<turns>\n"
     );
     for msg in evicted {
-        #[expect(
-            unreachable_patterns,
-            reason = "OrnoChatMessage is #[non_exhaustive]; the catch-all handles future variants"
-        )]
+        // No catch-all: a new message kind must fail to compile here
+        // rather than vanish from the summary.
         match msg {
             OrnoChatMessage::User { content } => {
                 let _ = writeln!(out, "USER:\n{content}\n");
@@ -169,7 +167,6 @@ fn summary_prompt(task: &str, evicted: &[OrnoChatMessage]) -> String {
             OrnoChatMessage::ToolResult { call_id, content } => {
                 let _ = writeln!(out, "TOOL RESULT {call_id}:\n{content}\n");
             },
-            _ => {},
         }
     }
     out.push_str("</turns>\n\nWrite the summary of these turns.");
