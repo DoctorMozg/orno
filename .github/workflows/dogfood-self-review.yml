@@ -131,7 +131,8 @@ jobs:
         # The reviewer agent ends its report with `VERDICT: PASS` or
         # `VERDICT: FAIL`. FAIL marks this check failing so the PR cannot
         # merge until the author addresses findings (or pushes a commit
-        # that earns a PASS).
+        # that earns a PASS). Markdown decoration around the line
+        # (`## VERDICT: PASS`, `**VERDICT: PASS**`) is stripped first.
         run: |
           set -euo pipefail
           verdict_file="${{ github.workspace }}/pr-head/.orno-self-review.md"
@@ -139,7 +140,7 @@ jobs:
             echo "::error::self-review verdict file not produced"
             exit 1
           fi
-          last_line=$(tail -n1 "$verdict_file")
+          last_line=$(tail -n1 "$verdict_file" | sed -E 's/^[#*[:space:]]+//; s/[*[:space:]]+$//')
           case "$last_line" in
             "VERDICT: PASS")
               echo "self-review: PASS"
