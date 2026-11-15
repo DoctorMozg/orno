@@ -1,7 +1,8 @@
 //! Real MCP server integration test using `@modelcontextprotocol/server-filesystem`.
 //!
-//! These tests are gated behind `#[ignore]` — they require Node.js and an npm
-//! package install that is not guaranteed in CI. Run them explicitly with:
+//! These tests are gated behind `#[ignore]` — they require Node.js 24+ (the
+//! pinned server's `engines` floor) and an npm package install that is not
+//! guaranteed in CI. Run them explicitly with:
 //!
 //!   cargo test -p orno-core --test `mcp_real` -- --ignored
 //!
@@ -11,6 +12,20 @@
 
 use orno_core::mcp::{McpClient, RmcpClient};
 use orno_core::pipeline::schema::McpStdioConfig;
+
+/// Pinned so a new upstream release cannot change the server under test.
+const FILESYSTEM_SERVER_PACKAGE: &str = "@modelcontextprotocol/server-filesystem@2.3.0";
+
+/// Show debug tracing in the test output, so a failed handshake carries the
+/// server's stderr lines that `RmcpClient` forwards at debug level.
+fn init_test_tracing() {
+    drop(
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init(),
+    );
+}
 
 fn npx_available() -> bool {
     std::process::Command::new("npx")
@@ -24,7 +39,7 @@ fn filesystem_server_config(allowed_dir: &str) -> McpStdioConfig {
         command: vec![
             "npx".to_string(),
             "-y".to_string(),
-            "@modelcontextprotocol/server-filesystem".to_string(),
+            FILESYSTEM_SERVER_PACKAGE.to_string(),
             allowed_dir.to_string(),
         ],
         env: std::collections::BTreeMap::new(),
@@ -35,6 +50,7 @@ fn filesystem_server_config(allowed_dir: &str) -> McpStdioConfig {
 #[tokio::test]
 #[ignore = "requires Node.js + @modelcontextprotocol/server-filesystem; run with --ignored"]
 async fn real_filesystem_server_initialize_returns_tools() {
+    init_test_tracing();
     if !npx_available() {
         eprintln!("skipping: npx not available");
         return;
@@ -67,6 +83,7 @@ async fn real_filesystem_server_initialize_returns_tools() {
 #[tokio::test]
 #[ignore = "requires Node.js + @modelcontextprotocol/server-filesystem; run with --ignored"]
 async fn real_filesystem_server_list_directory() {
+    init_test_tracing();
     if !npx_available() {
         eprintln!("skipping: npx not available");
         return;

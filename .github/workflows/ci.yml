@@ -126,11 +126,14 @@ jobs:
           toolchain: '1.95'
       - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          # The pinned @modelcontextprotocol/server-filesystem needs node >= 24.
+          node-version: '24'
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - run: cargo test -p orno-core --locked --test mcp_real -- --ignored
+      # Serial: two parallel `npx -y` cold installs of the same package race
+      # on the npx cache and one server can exit before the handshake.
+      - run: cargo test -p orno-core --locked --test mcp_real -- --ignored --test-threads=1
 
   coverage:
     name: coverage
