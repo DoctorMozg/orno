@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=../../schemas/pipeline.schema.json
 # Self-review pipeline. Loads a trusted review rubric, collects the PR diff
-# against `origin/master`, asks one bounded agent to produce a markdown
-# review, persists the verdict, and posts it as a PR comment.
+# against the PR's recorded base commit, asks one bounded agent to produce a
+# markdown review, persists the verdict, and posts it as a PR comment.
 #
 # Trust model
 # -----------
@@ -25,6 +25,7 @@
 # ---------------------------------
 #   PR_NUMBER     — pull-request number being reviewed
 #   PR_REPO       — absolute path to the PR-head checkout (`roots` for Read)
+#   PR_BASE_SHA   — the PR's base commit; the diff is `PR_BASE_SHA...HEAD`
 #   TRUSTED_ROOT  — absolute path to the trusted-master checkout
 #   GH_REPO       — owner/name string for `gh pr comment --repo`
 #
@@ -46,13 +47,19 @@ vars:
   pr_repo: "{{ env.PR_REPO }}"
   trusted_root: "{{ env.TRUSTED_ROOT }}"
   gh_repo: "{{ env.GH_REPO }}"
-  base_ref: origin/master
+  # The event's base commit, not the live master tip: a re-run after merge
+  # would otherwise diff against a master that already contains the PR.
+  base_ref: "{{ env.PR_BASE_SHA }}"
+  # Diffs above this many bytes are cut so the prompt fits the token budget,
+  # which every agent turn re-spends on the full history.
+  max_diff_bytes: "60000"
   guidelines_path: "{{ env.TRUSTED_ROOT }}/examples/self-review/guidelines.md"
   verdict_path: "{{ env.PR_REPO }}/.orno-self-review.md"
 
 pass_env:
   - PR_NUMBER
   - PR_REPO
+  - PR_BASE_SHA
   - TRUSTED_ROOT
   - GH_REPO
 
@@ -97,14 +104,27 @@ nodes:
       - "{{ vars.guidelines_path }}"
 
   - id: collect_diff
+    # Inputs reach the script as positional args, never spliced into it.
+    # Generated files stay in the file list but out of the capped diff body.
     kind: shell
-    command: git
+    command: sh
     args:
-      - "-C"
+      - "-c"
+      - |
+        set -eu
+        diff=$(git -C "$1" diff --unified=3 "$2...HEAD" -- . \
+          ':(exclude)Cargo.lock' ':(exclude)*.ndjson')
+        total=$(printf '%s' "$diff" | wc -c)
+        if [ "$total" -le "$3" ]; then
+          printf '%s\n' "$diff"
+        else
+          printf '%s' "$diff" | head -c "$3"
+          printf '\n[diff truncated: first %s of %s bytes shown]\n' "$3" "$total"
+        fi
+      - "collect_diff"
       - "{{ vars.pr_repo }}"
-      - "diff"
-      - "--unified=3"
-      - "{{ vars.base_ref }}...HEAD"
+      - "{{ vars.base_ref }}"
+      - "{{ vars.max_diff_bytes }}"
 
   - id: collect_files
     kind: shell
@@ -142,6 +162,10 @@ nodes:
       Use `Read` with paths under `{{ vars.pr_repo }}` for any file you want
       to inspect beyond the diff hunks. The repo root is your jail; the
       trusted-rubric path is outside it and not readable.
+
+      If the diff ends with a `[diff truncated: ...]` line, review the part
+      shown, `Read` the most important files from the list above that it
+      leaves out, and state in the report that the review is partial.
 
       Now produce the markdown review per the rubric. Reply with the report
       as your final assistant message — no extra text. The last line must be

@@ -55,15 +55,6 @@ jobs:
           fetch-depth: 0
           path: pr-head
 
-      - name: Resolve origin/master in PR head
-        # `fetch-depth: 0` already brings full history, but the remote
-        # tracking ref has to exist for `git diff origin/master...HEAD`
-        # to resolve when checkout sets HEAD to the PR commit.
-        working-directory: pr-head
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin master:refs/remotes/origin/master
-
       - name: Detect bootstrap (pipeline not yet on master)
         # The trust model fetches pipeline.yaml from trusted-master so a
         # malicious PR cannot rewrite reviewer policy. That breaks for the
@@ -82,8 +73,25 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Write secrets file
+      - name: Detect empty diff
+        # A PR with nothing to review (or a re-run after the base already
+        # absorbed it) must not post a PASS that reads as an approval.
+        id: empty
         if: steps.bootstrap.outputs.skip != 'true'
+        working-directory: pr-head
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "${PR_BASE_SHA}...HEAD"; then
+            echo "::notice::no changes between ${PR_BASE_SHA} and the PR head — skipping self-review"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write secrets file
+        if: steps.bootstrap.outputs.skip != 'true' && steps.empty.outputs.skip != 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -95,7 +103,7 @@ jobs:
             > "${RUNNER_TEMP}/orno-secrets.env"
 
       - name: Run self-review
-        if: steps.bootstrap.outputs.skip != 'true'
+        if: steps.bootstrap.outputs.skip != 'true' && steps.empty.outputs.skip != 'true'
         # Pinned to a released tag — never `@master`. Building orno from a
         # PR commit would let a malicious PR patch the runtime to bypass
         # bounded-effects enforcement. The pinned tag isolates the supply
@@ -104,6 +112,9 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_REPO: ${{ github.workspace }}/pr-head
+          # Diff base from the event payload, so a re-run after merge still
+          # reviews the PR's own change rather than the live master tip.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           TRUSTED_ROOT: ${{ github.workspace }}/trusted-master
           GH_REPO: ${{ github.repository }}
           # GH_TOKEN is declared under the pipeline's `secrets:`; orno reads
@@ -116,7 +127,7 @@ jobs:
           secrets-file: ${{ runner.temp }}/orno-secrets.env
 
       - name: Enforce verdict
-        if: steps.bootstrap.outputs.skip != 'true'
+        if: steps.bootstrap.outputs.skip != 'true' && steps.empty.outputs.skip != 'true'
         # The reviewer agent ends its report with `VERDICT: PASS` or
         # `VERDICT: FAIL`. FAIL marks this check failing so the PR cannot
         # merge until the author addresses findings (or pushes a commit
@@ -144,5 +155,5 @@ jobs:
           esac
 
       - name: Cleanup secrets file
-        if: always() && steps.bootstrap.outputs.skip != 'true'
+        if: always() && steps.bootstrap.outputs.skip != 'true' && steps.empty.outputs.skip != 'true'
         run: rm -f "${RUNNER_TEMP}/orno-secrets.env"
