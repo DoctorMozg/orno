@@ -3,7 +3,7 @@ use crate::error::LlmError;
 use crate::error::ToolError;
 use crate::llm::LlmTransport;
 use crate::llm::{LlmRequest, LlmResponse, OrnoChatMessage};
-use crate::pipeline::{AgentPolicy, OnParseError};
+use crate::pipeline::{AgentPolicy, OnHistoryOverflow, OnParseError};
 use crate::tool::ToolHandler;
 use crate::tool::net_guard::HostResolver;
 use crate::tool::{ToolEffect, ToolInvocation};
@@ -53,6 +53,7 @@ pub(super) fn policy() -> AgentPolicy {
         on_parse_error: OnParseError::Fail,
         roots: Vec::new(),
         max_message_history_bytes: None,
+        on_history_overflow: OnHistoryOverflow::Truncate,
         unconfined_shell: false,
     }
 }
@@ -180,6 +181,7 @@ pub(super) struct RecordingScriptedTransport {
     pub(super) max_tokens_seen: Mutex<Vec<Option<u32>>>,
     pub(super) messages_seen: Mutex<Vec<Vec<OrnoChatMessage>>>,
     pub(super) systems_seen: Mutex<Vec<Option<String>>>,
+    pub(super) prompts_seen: Mutex<Vec<String>>,
 }
 
 impl RecordingScriptedTransport {
@@ -189,7 +191,15 @@ impl RecordingScriptedTransport {
             max_tokens_seen: Mutex::new(Vec::new()),
             messages_seen: Mutex::new(Vec::new()),
             systems_seen: Mutex::new(Vec::new()),
+            prompts_seen: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(super) fn prompts_seen(&self) -> Vec<String> {
+        self.prompts_seen
+            .lock()
+            .expect("RecordingScriptedTransport mutex poisoned")
+            .clone()
     }
 
     pub(super) fn systems_seen(&self) -> Vec<Option<String>> {
@@ -225,6 +235,10 @@ impl LlmTransport for RecordingScriptedTransport {
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")
             .push(req.system.as_deref().map(str::to_string));
+        self.prompts_seen
+            .lock()
+            .expect("RecordingScriptedTransport mutex poisoned")
+            .push(req.prompt.to_string());
         self.messages_seen
             .lock()
             .expect("RecordingScriptedTransport mutex poisoned")

@@ -14,6 +14,7 @@
 //! `mod.rs` owns the struct and tests, `policy.rs` the effect gate and
 //! parse retry, `run.rs` the loop.
 
+mod compaction;
 mod history;
 pub(crate) mod policy;
 mod run;
@@ -143,6 +144,7 @@ mod tests {
     mod arc_invariant;
     mod events;
     mod helpers;
+    mod history_compaction;
     mod parse_retry;
     mod strictness_effects;
     mod strictness_iteration;

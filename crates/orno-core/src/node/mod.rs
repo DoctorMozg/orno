@@ -222,7 +222,7 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use crate::pipeline::schema::{AgentNode, OnParseError, ShellNode};
+    use crate::pipeline::schema::{AgentNode, OnHistoryOverflow, OnParseError, ShellNode};
 
     fn default_policy() -> AgentPolicy {
         AgentPolicy {
@@ -239,6 +239,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            on_history_overflow: OnHistoryOverflow::Truncate,
             unconfined_shell: false,
         }
     }

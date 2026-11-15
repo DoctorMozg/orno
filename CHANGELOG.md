@@ -7,6 +7,21 @@ once the first tagged release ships.
 
 ## Unreleased
 
+### Added
+
+- `on_history_overflow: summarize` in an agent's policy. When the history
+  goes over `max_message_history_bytes`, the oldest turns are summarized by
+  the agent's own model instead of dropped. The summary call is charged to
+  `max_total_tokens` and recorded for replay. `truncate` stays the default.
+- `history_compacted` event, emitted whenever the history cap removes turns,
+  with the strategy, the number of messages removed and the size before and
+  after.
+
+### Changed
+
+- The self-review reviewer caps its history at 150 000 bytes, so re-sent
+  tool output stays inside its token budget.
+
 ### Fixed
 
 - The self-review dogfood pipeline diffs against the PR's base commit from

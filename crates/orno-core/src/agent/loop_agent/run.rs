@@ -42,16 +42,16 @@ enum Turn {
 }
 
 /// Inputs fixed for the whole `run` plus the history that grows with it.
-struct RunState<'a> {
-    run_id: &'a str,
-    node_id: &'a str,
-    req: &'a AgentRequest,
+pub(super) struct RunState<'a> {
+    pub(super) run_id: &'a str,
+    pub(super) node_id: &'a str,
+    pub(super) req: &'a AgentRequest,
     state_buffer: &'a Mutex<Value>,
     declared_tools: Arc<Vec<OrnoChatTool>>,
     wire_to_yaml: HashMap<String, String>,
     prompt_excerpt: String,
     system_excerpt: Option<String>,
-    history: History,
+    pub(super) history: History,
     budget: Arc<BudgetScope>,
 }
 
@@ -201,16 +201,18 @@ impl LoopAgent {
         }
         // After every result is in, so a multi-call turn is never cut
         // between a call and its result.
-        if let Some(cap) = st.req.policy.max_message_history_bytes {
-            st.history.enforce_cap(cap);
-        }
+        self.compact_history(st).await?;
         Ok(Turn::Continue)
     }
 
-    fn build_llm_request(st: &RunState<'_>) -> Result<LlmRequest, AgentError> {
-        // Ask for what is left on the tightest limit up the chain. A spent
-        // budget fails here, before an uncapped, billable call.
-        let max_tokens = match st.budget.tokens_remaining() {
+    /// Completion cap for the next call: what is left on the tightest limit
+    /// up the chain, lowered to `ceiling` when one is given. A spent budget
+    /// fails here, before an uncapped, billable call.
+    pub(super) fn completion_cap(
+        st: &RunState<'_>,
+        ceiling: Option<u32>,
+    ) -> Result<Option<u32>, AgentError> {
+        let remaining = match st.budget.tokens_remaining() {
             None => None,
             Some(0) => {
                 return Err(AgentError::BudgetExceeded {
@@ -219,6 +221,14 @@ impl LoopAgent {
             },
             Some(remaining) => Some(u32::try_from(remaining).unwrap_or(u32::MAX)),
         };
+        Ok(match (remaining, ceiling) {
+            (Some(r), Some(c)) => Some(r.min(c)),
+            (r, c) => r.or(c),
+        })
+    }
+
+    fn build_llm_request(st: &RunState<'_>) -> Result<LlmRequest, AgentError> {
+        let max_tokens = Self::completion_cap(st, None)?;
         Ok(LlmRequest {
             provider: Arc::clone(&st.req.provider),
             model: Arc::clone(&st.req.model),
@@ -231,11 +241,26 @@ impl LoopAgent {
         })
     }
 
-    /// Emits the started/received (or failed) event pair around the call.
     async fn request_llm(&self, st: &RunState<'_>) -> Result<LlmResponse, AgentError> {
-        let req = st.req;
         let llm_req = Self::build_llm_request(st)?;
+        self.send_llm(
+            st,
+            llm_req,
+            st.prompt_excerpt.clone(),
+            st.system_excerpt.clone(),
+        )
+        .await
+    }
 
+    /// Emits the started/received (or failed) event pair around the call.
+    pub(super) async fn send_llm(
+        &self,
+        st: &RunState<'_>,
+        llm_req: LlmRequest,
+        prompt_excerpt: String,
+        system_excerpt: Option<String>,
+    ) -> Result<LlmResponse, AgentError> {
+        let req = st.req;
         self.config
             .sink
             .record(Event::LlmRequestStarted {
@@ -243,8 +268,8 @@ impl LoopAgent {
                 node_id: st.node_id.to_string(),
                 provider: req.provider.to_string(),
                 model: req.model.to_string(),
-                prompt_excerpt: st.prompt_excerpt.clone(),
-                system_excerpt: st.system_excerpt.clone(),
+                prompt_excerpt,
+                system_excerpt,
             })
             .await;
 
@@ -285,7 +310,10 @@ impl LoopAgent {
         Ok(response)
     }
 
-    fn charge_usage(st: &RunState<'_>, response: &LlmResponse) -> Result<(), AgentError> {
+    pub(super) fn charge_usage(
+        st: &RunState<'_>,
+        response: &LlmResponse,
+    ) -> Result<(), AgentError> {
         if let Some(usage) = &response.usage {
             st.budget
                 .charge_tokens(u64::from(usage.total_tokens))

@@ -6,7 +6,7 @@ use crate::agent::loop_agent::{LoopAgent, LoopAgentConfig};
 use crate::error::AgentError;
 use crate::events::{BudgetKind, Event, EventSink, InMemorySink, Redactor};
 use crate::llm::{LlmResponse, LlmTransport, OrnoChatToolCall, Usage, dummy::ScriptedTransport};
-use crate::pipeline::{AgentConfig, AgentPolicy, OnParseError};
+use crate::pipeline::{AgentConfig, AgentPolicy, OnHistoryOverflow, OnParseError};
 use crate::tool::ToolHandler;
 use std::sync::{Arc, Weak};
 
@@ -99,6 +99,7 @@ fn child_agent_config() -> AgentConfig {
             roots: Vec::new(),
             on_parse_error: OnParseError::Fail,
             max_message_history_bytes: None,
+            on_history_overflow: OnHistoryOverflow::Truncate,
             unconfined_shell: false,
         },
     }

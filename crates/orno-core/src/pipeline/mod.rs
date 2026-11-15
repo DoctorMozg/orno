@@ -8,5 +8,5 @@ pub mod template;
 
 pub use schema::{
     AgentConfig, AgentNode, AgentPolicy, McpAuthConfig, McpHttpConfig, McpServerConfig,
-    McpStdioConfig, Node, NodeKind, OnParseError, Pipeline, ShellNode,
+    McpStdioConfig, Node, NodeKind, OnHistoryOverflow, OnParseError, Pipeline, ShellNode,
 };
