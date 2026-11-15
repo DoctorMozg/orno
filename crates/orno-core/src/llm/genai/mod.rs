@@ -234,6 +234,7 @@ mod tests {
             on_parse_error: crate::pipeline::OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            on_history_overflow: crate::pipeline::OnHistoryOverflow::Truncate,
             unconfined_shell: false,
         }
     }

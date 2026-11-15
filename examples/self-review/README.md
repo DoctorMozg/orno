@@ -28,8 +28,10 @@ pipeline shape.
 - **`pass_env:`** to pull workflow inputs into the template namespace.
 - **`secrets:`** with auto-discovery — the LLM transport finds
   `OPENROUTER_API_KEY` automatically when `provider: openrouter`.
-- **Process-env inheritance** — `gh pr comment` reads `GH_TOKEN` from the
-  shell child's inherited env without orno templating it.
+- **A secret scoped to one node** — the shell executor clears the inherited
+  env, so `GH_TOKEN` reaches only `post_comment`, through that node's `env:`
+  map as `{{ secrets.GH_TOKEN }}`. Declaring it under `secrets:` also redacts
+  it from every event and log.
 
 ## Inputs
 
@@ -42,13 +44,13 @@ Set on the calling workflow step (`env:`):
 | `PR_BASE_SHA`  | The PR's base commit; the diff is `PR_BASE_SHA...HEAD`       |
 | `TRUSTED_ROOT` | Absolute path to the trusted-master checkout                 |
 | `GH_REPO`      | `owner/name` for `gh pr comment --repo`                      |
-| `GH_TOKEN`     | Token for `gh`, inherited by the `post_comment` shell child  |
 
-Provided via `--secrets-file`:
+Secrets, read from the process env or from `--secrets-file`:
 
-| Name                 | Purpose                                       |
-| -------------------- | --------------------------------------------- |
-| `OPENROUTER_API_KEY` | Auto-discovered by the LLM transport          |
+| Name                 | Purpose                                                        |
+| -------------------- | -------------------------------------------------------------- |
+| `OPENROUTER_API_KEY` | Auto-discovered by the LLM transport                           |
+| `GH_TOKEN`           | Token for `gh`, passed only to `post_comment` via its `env:` map |
 
 ## Run live
 

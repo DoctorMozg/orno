@@ -137,7 +137,7 @@ mod tests {
 
     use crate::pipeline::schema::{
         AgentConfig, AgentPolicy, McpHttpConfig, McpServerConfig, McpStdioConfig, Node, NodeKind,
-        OnParseError, Pipeline, ShellNode,
+        OnHistoryOverflow, OnParseError, Pipeline, ShellNode,
     };
 
     fn shell_node(id: &str, needs: &[&str]) -> Node {
@@ -293,6 +293,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            on_history_overflow: OnHistoryOverflow::Truncate,
             unconfined_shell: false,
         }
     }
@@ -612,6 +613,34 @@ mod tests {
                 );
             },
             (other, expected) => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::summarize_without_cap(OnHistoryOverflow::Summarize, None, true)]
+    #[case::summarize_with_cap(OnHistoryOverflow::Summarize, Some(1000), false)]
+    #[case::truncate_without_cap(OnHistoryOverflow::Truncate, None, false)]
+    fn summarize_needs_a_history_cap(
+        #[case] strategy: OnHistoryOverflow,
+        #[case] cap: Option<usize>,
+        #[case] rejected: bool,
+    ) {
+        let mut policy = base_policy(false, false);
+        policy.on_history_overflow = strategy;
+        policy.max_message_history_bytes = cap;
+        let mut p = pipeline(vec![shell_node("n", &[])]);
+        p.agents.insert(
+            "summarizer".to_string(),
+            agent_config_with_policy(Vec::new(), policy),
+        );
+
+        match validate(&p) {
+            Err(PipelineError::Validation(msg)) if rejected => assert!(
+                msg.contains("`summarizer`") && msg.contains("max_message_history_bytes"),
+                "error should name the agent and the missing cap: {msg}",
+            ),
+            Ok(()) if !rejected => {},
+            other => panic!("expected rejected={rejected}, got {other:?}"),
         }
     }
 

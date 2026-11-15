@@ -291,4 +291,24 @@ pub enum Event {
         /// re-reading the run config.
         cap_bytes: u64,
     },
+    /// Emitted when an agent's conversation history went over
+    /// `max_message_history_bytes` and the oldest turns were removed.
+    /// `strategy` echoes the policy's `on_history_overflow`
+    /// (`"truncate"` or `"summarize"`). With `"summarize"`, the
+    /// summary call's own `llm_request_started` / `llm_response_received`
+    /// pair comes just before this envelope, and `bytes_after` includes
+    /// the summary. Sizes are the loop's byte estimate of the history,
+    /// not provider tokens.
+    HistoryCompacted {
+        run_id: String,
+        node_id: String,
+        strategy: String,
+        /// Messages removed from the history, a summary they were
+        /// folded into not subtracted.
+        evicted_messages: u64,
+        bytes_before: u64,
+        bytes_after: u64,
+        /// The `max_message_history_bytes` that fired.
+        cap_bytes: u64,
+    },
 }

@@ -278,19 +278,24 @@ pub struct AgentPolicy {
     /// value of that variable.
     #[serde(default)]
     pub roots: Vec<std::path::PathBuf>,
-    /// Soft cap on the approximate byte size of the accumulated
-    /// conversation history (sum of content lengths across all
-    /// `OrnoChatMessage` variants). When the history exceeds this
-    /// threshold after a push, the loop evicts the oldest messages
-    /// until the history is back under the cap, always retaining the
-    /// two most recent messages so the model sees at least one
-    /// request-response round.
+    /// Soft cap on the approximate byte size of the conversation history
+    /// (content lengths of every message; the prompt and system prompt are
+    /// not counted). Checked once per turn, after all of the turn's tool
+    /// results are in. When the history is over the cap, the loop removes
+    /// the oldest whole turns, never separating a tool call from its
+    /// results and always keeping the newest turn, so a single turn larger
+    /// than the cap stays. `on_history_overflow` decides whether the
+    /// removed turns are dropped or summarized.
     ///
     /// `None` disables the cap (not recommended for long-running agents).
     /// The default (4 MiB) is generous enough for normal tool-call loops
     /// and tight enough to prevent multi-gigabyte prompt payloads.
     #[serde(default = "default_max_message_history_bytes")]
     pub max_message_history_bytes: Option<usize>,
+    /// What happens to the turns removed by `max_message_history_bytes`.
+    /// Defaults to `truncate`.
+    #[serde(default)]
+    pub on_history_overflow: OnHistoryOverflow,
     /// Acknowledges that `Bash` escapes `allowed_domains` and `roots`:
     /// a shell can open any connection and touch any path orno cannot
     /// see. Pipeline validation rejects an agent that lists `Bash`
@@ -314,6 +319,33 @@ pub enum OnParseError {
     /// Feed the parse error back as a tool-result message and loop once
     /// more. Further parse errors terminate.
     RetryOnce,
+}
+
+/// What the loop does with the turns it removes to keep the history
+/// under `max_message_history_bytes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OnHistoryOverflow {
+    /// Drop the oldest turns until the history fits the cap.
+    #[default]
+    Truncate,
+    /// Drop the oldest turns until the history fits half the cap, ask the
+    /// agent's model to summarize them, and put the summary (at most an
+    /// eighth of the cap) at the start of the history. The summary call is
+    /// charged to the token budget and recorded like any other LLM call.
+    Summarize,
+}
+
+impl OnHistoryOverflow {
+    /// The YAML spelling, as carried on the `history_compacted` event.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Truncate => "truncate",
+            Self::Summarize => "summarize",
+        }
+    }
 }
 
 /// MCP server declaration. Two transports in v0.1: stdio subprocess and

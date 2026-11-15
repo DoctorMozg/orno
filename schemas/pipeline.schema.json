@@ -133,7 +133,7 @@
           "minimum": 0
         },
         "max_message_history_bytes": {
-          "description": "Soft cap on the approximate byte size of the accumulated\nconversation history (sum of content lengths across all\n`OrnoChatMessage` variants). When the history exceeds this\nthreshold after a push, the loop evicts the oldest messages\nuntil the history is back under the cap, always retaining the\ntwo most recent messages so the model sees at least one\nrequest-response round.\n\n`None` disables the cap (not recommended for long-running agents).\nThe default (4 MiB) is generous enough for normal tool-call loops\nand tight enough to prevent multi-gigabyte prompt payloads.",
+          "description": "Soft cap on the approximate byte size of the conversation history\n(content lengths of every message; the prompt and system prompt are\nnot counted). Checked once per turn, after all of the turn's tool\nresults are in. When the history is over the cap, the loop removes\nthe oldest whole turns, never separating a tool call from its\nresults and always keeping the newest turn, so a single turn larger\nthan the cap stays. `on_history_overflow` decides whether the\nremoved turns are dropped or summarized.\n\n`None` disables the cap (not recommended for long-running agents).\nThe default (4 MiB) is generous enough for normal tool-call loops\nand tight enough to prevent multi-gigabyte prompt payloads.",
           "type": [
             "integer",
             "null"
@@ -166,6 +166,11 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "on_history_overflow": {
+          "description": "What happens to the turns removed by `max_message_history_bytes`.\nDefaults to `truncate`.",
+          "$ref": "#/$defs/OnHistoryOverflow",
+          "default": "truncate"
         },
         "on_parse_error": {
           "$ref": "#/$defs/OnParseError"
@@ -443,6 +448,21 @@
             "kind",
             "id"
           ]
+        }
+      ]
+    },
+    "OnHistoryOverflow": {
+      "description": "What the loop does with the turns it removes to keep the history\nunder `max_message_history_bytes`.",
+      "oneOf": [
+        {
+          "description": "Drop the oldest turns until the history fits the cap.",
+          "type": "string",
+          "const": "truncate"
+        },
+        {
+          "description": "Drop the oldest turns until the history fits half the cap, ask the\nagent's model to summarize them, and put the summary (at most an\neighth of the cap) at the start of the history. The summary call is\ncharged to the token budget and recorded like any other LLM call.",
+          "type": "string",
+          "const": "summarize"
         }
       ]
     },

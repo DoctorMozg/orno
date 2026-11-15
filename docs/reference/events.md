@@ -260,6 +260,33 @@ Emitted when a tool call is denied by the policy gate (mutation/network/context-
 
 Non-terminal. The loop continues with the denial fed back to the model. Always paired with a `tool_call_recorded` carrying the same denial string.
 
+### `history_compacted`
+
+Emitted when an agent's conversation history went over `max_message_history_bytes` and the loop removed its oldest turns.
+
+```json
+{
+  "type": "history_compacted",
+  "run_id": "run_...",
+  "node_id": "review",
+  "strategy": "summarize",
+  "evicted_messages": 6,
+  "bytes_before": 152340,
+  "bytes_after": 81210,
+  "cap_bytes": 150000
+}
+```
+
+| Field              | Type    | Meaning                                                                                       |
+| ------------------ | ------- | --------------------------------------------------------------------------------------------- |
+| `strategy`         | string  | The agent's `on_history_overflow`: `"truncate"` or `"summarize"`.                             |
+| `evicted_messages` | integer | Messages removed from the history. With `"summarize"` they were folded into one summary message. |
+| `bytes_before`     | integer | Estimated history size before compaction.                                                     |
+| `bytes_after`      | integer | Estimated history size after compaction, the summary included.                                |
+| `cap_bytes`        | integer | The `max_message_history_bytes` that fired.                                                   |
+
+Sizes are the loop's byte estimate of message content, not provider tokens. With `"summarize"`, the summary call's own `llm_request_started` and `llm_response_received` come just before this envelope, and its usage counts against `max_total_tokens`. A failed summary call emits `llm_request_failed` and fails the node with no `history_compacted`.
+
 ## Subagent events
 
 ### `subagent_started`

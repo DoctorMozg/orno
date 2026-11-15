@@ -297,7 +297,7 @@ fn effect_from_policy(policy: &AgentPolicy) -> ToolEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::OnParseError;
+    use crate::pipeline::{OnHistoryOverflow, OnParseError};
 
     fn policy(allow_mutations: bool, allow_network: bool) -> AgentPolicy {
         AgentPolicy {
@@ -314,6 +314,7 @@ mod tests {
             on_parse_error: OnParseError::Fail,
             roots: Vec::new(),
             max_message_history_bytes: None,
+            on_history_overflow: OnHistoryOverflow::Truncate,
             unconfined_shell: false,
         }
     }

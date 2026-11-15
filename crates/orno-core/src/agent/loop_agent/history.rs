@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
-
 use crate::llm::OrnoChatMessage;
 
 /// Approximate byte cost of one message. Content strings dominate; the
@@ -51,19 +49,20 @@ impl History {
         Arc::make_mut(&mut self.messages).push(msg);
     }
 
-    /// Drop the oldest units until the estimate fits `cap`. A unit is a
-    /// `ToolCalls` message with all of its `ToolResult`s, or any other
-    /// message alone, because providers reject a result whose call is gone.
-    /// The newest unit always stays so the model sees the latest turn.
-    pub(super) fn enforce_cap(&mut self, cap: usize) {
-        if self.bytes <= cap {
-            return;
-        }
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Remove and return the oldest units until the estimate fits
+    /// `target`. A unit is a `ToolCalls` message with all of its
+    /// `ToolResult`s, or any other message alone, because providers reject
+    /// a result whose call is gone. The newest unit always stays so the
+    /// model sees the latest turn.
+    pub(super) fn evict_to(&mut self, target: usize) -> Vec<OrnoChatMessage> {
         let msgs = &self.messages;
         let mut evict = 0usize;
-        let mut freed = 0usize;
         let mut remaining = self.bytes;
-        while remaining > cap {
+        while remaining > target {
             let unit_len = unit_len(&msgs[evict..]);
             if evict + unit_len >= msgs.len() {
                 break;
@@ -73,20 +72,19 @@ impl History {
                 .map(estimated_message_bytes)
                 .sum();
             evict += unit_len;
-            freed += unit_bytes;
             remaining = remaining.saturating_sub(unit_bytes);
         }
         if evict == 0 {
-            return;
+            return Vec::new();
         }
-        Arc::make_mut(&mut self.messages).drain(..evict);
-        self.bytes -= freed;
-        warn!(
-            cap_bytes = cap,
-            current_bytes = self.bytes,
-            evicted_messages = evict,
-            "message history truncated to stay within cap",
-        );
+        self.bytes = remaining;
+        Arc::make_mut(&mut self.messages).drain(..evict).collect()
+    }
+
+    /// Put `msg` before every other message.
+    pub(super) fn push_front(&mut self, msg: OrnoChatMessage) {
+        self.bytes = self.bytes.saturating_add(estimated_message_bytes(&msg));
+        Arc::make_mut(&mut self.messages).insert(0, msg);
     }
 }
 
@@ -143,7 +141,7 @@ mod tests {
         turn(&mut history, &["a1", "a2", "a3"], 100);
         turn(&mut history, &["b1", "b2", "b3"], 100);
         turn(&mut history, &["c1", "c2", "c3"], 100);
-        history.enforce_cap(cap);
+        history.evict_to(cap);
 
         let msgs = history.snapshot();
         assert_eq!(msgs.len(), expected_len);
@@ -167,7 +165,7 @@ mod tests {
         let mut history = History::new();
         turn(&mut history, &["a1", "a2"], 100);
         turn(&mut history, &["b1", "b2"], 100);
-        history.enforce_cap(250);
+        history.evict_to(250);
 
         let fresh: usize = history.snapshot().iter().map(estimated_message_bytes).sum();
         assert_eq!(history.bytes, fresh);

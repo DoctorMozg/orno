@@ -206,7 +206,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::pipeline::schema::{
-        AgentConfig, AgentNode, AgentPolicy, Node, NodeKind, OnParseError, Pipeline, ShellNode,
+        AgentConfig, AgentNode, AgentPolicy, Node, NodeKind, OnHistoryOverflow, OnParseError,
+        Pipeline, ShellNode,
     };
 
     fn shell_node(id: &str, needs: &[&str]) -> Node {
@@ -255,6 +256,7 @@ mod tests {
                 on_parse_error: OnParseError::Fail,
                 roots: Vec::new(),
                 max_message_history_bytes: None,
+                on_history_overflow: OnHistoryOverflow::Truncate,
                 unconfined_shell: false,
             },
         }

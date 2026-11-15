@@ -92,6 +92,10 @@ agents:
       roots:
         - "{{ vars.pr_repo }}"
       on_parse_error: retry_once
+      # About 40k tokens of tool history per request, on top of the diff in
+      # the prompt, so 30 iterations of re-sent history stay inside the
+      # token budget.
+      max_message_history_bytes: 150000
 
 nodes:
   - id: load_guidelines

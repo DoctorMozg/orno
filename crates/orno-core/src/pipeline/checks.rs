@@ -12,7 +12,7 @@ use crate::tool::builtin_effect;
 use crate::tool::net_guard::{is_blocked_ip, literal_ip};
 
 use super::graph::DepGraph;
-use super::schema::{AgentConfig, McpServerConfig, Node, NodeKind, Pipeline};
+use super::schema::{AgentConfig, McpServerConfig, Node, NodeKind, OnHistoryOverflow, Pipeline};
 use super::template::{TemplateEngine, looks_templated};
 
 /// Check an MCP server declaration after its templates were rendered.
@@ -173,6 +173,14 @@ fn validate_budgets(name: &str, config: &AgentConfig, errors: &mut Vec<String>) 
     if policy.max_tool_calls == 0 && !config.allowed_tools.is_empty() {
         errors.push(format!(
             "agent `{name}`: max_tool_calls is 0 but agent has allowed_tools"
+        ));
+    }
+    if policy.on_history_overflow == OnHistoryOverflow::Summarize
+        && policy.max_message_history_bytes.is_none()
+    {
+        errors.push(format!(
+            "agent `{name}`: on_history_overflow is `summarize` but \
+             max_message_history_bytes is null, so the history never overflows"
         ));
     }
 }
